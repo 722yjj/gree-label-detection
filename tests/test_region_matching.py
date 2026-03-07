@@ -11,7 +11,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from layout_region_comparison import (
+from label_detection.matching.layout import (
     normalize_coordinates,
     calculate_iou,
     match_regions,

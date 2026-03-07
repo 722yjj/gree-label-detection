@@ -1,12 +1,11 @@
-"""
-统一配置模块
+"""Project-wide configuration."""
 
-集中管理项目中各模块共用的配置项，避免散落在各文件中的硬编码。
-
-STATUS: main
-"""
-
+from pathlib import Path
 import os
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SAMPLES_DIR = PROJECT_ROOT / "samples"
 
 # ==================== Ollama / VLM 配置 ====================
 OLLAMA_API_BASE = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
@@ -41,7 +40,10 @@ MATCH_COST_THRESHOLD = float(os.getenv("MATCH_COST_THRESHOLD", "0.6"))
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
 
 # ==================== 输出目录 ====================
-DEFAULT_OUTPUT_DIR = os.getenv("DEFAULT_OUTPUT_DIR", "results/unified")
+DEFAULT_OUTPUT_DIR = os.getenv(
+    "DEFAULT_OUTPUT_DIR",
+    str(PROJECT_ROOT / "results" / "unified"),
+)
 
 # ==================== 图形比对配置 ====================
 # 是否默认启用 VLM 进行图形比对
@@ -54,5 +56,11 @@ VLM_CANVAS_SIZE = int(os.getenv("VLM_CANVAS_SIZE", "512"))
 VLM_MAX_RETRIES = int(os.getenv("VLM_MAX_RETRIES", "2"))
 
 # ==================== 样例文件 ====================
-DEFAULT_PDF_PATH = "600004075219-01.pdf"
-DEFAULT_TARGET_PATH = "test.jpg"
+DEFAULT_PDF_PATH = os.getenv(
+    "DEFAULT_PDF_PATH",
+    str(SAMPLES_DIR / "pdfs" / "600004075219-01.pdf"),
+)
+DEFAULT_TARGET_PATH = os.getenv(
+    "DEFAULT_TARGET_PATH",
+    str(SAMPLES_DIR / "images" / "test.jpg"),
+)

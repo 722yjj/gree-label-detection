@@ -14,10 +14,14 @@ import base64
 import re
 import requests
 import numpy as np
-import cv2
 from typing import Dict, Optional
 
-from config import (
+try:
+    import cv2
+except ImportError:  # pragma: no cover - exercised only in minimal test environments
+    cv2 = None
+
+from label_detection.core.config import (
     OLLAMA_API_BASE,
     OLLAMA_MODEL,
     VLM_TIMEOUT,
@@ -25,6 +29,12 @@ from config import (
     VLM_CANVAS_SIZE,
     VLM_MAX_RETRIES,
 )
+
+
+def _require_cv2():
+    if cv2 is None:
+        raise ImportError("OpenCV 未安装，无法执行图像对比")
+    return cv2
 
 
 class VLMComparator:
@@ -105,7 +115,8 @@ class VLMComparator:
 
     def _image_to_base64(self, image: np.ndarray) -> str:
         """将 OpenCV 图像转换为 base64 编码"""
-        _, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        cv2_lib = _require_cv2()
+        _, buffer = cv2_lib.imencode(".jpg", image, [cv2_lib.IMWRITE_JPEG_QUALITY, 95])
         return base64.b64encode(buffer).decode("utf-8")
 
     def _standardize_crop(self, crop: np.ndarray) -> np.ndarray:
@@ -118,18 +129,19 @@ class VLMComparator:
         Returns:
             标准化后的图像 (VLM_CANVAS_SIZE x VLM_CANVAS_SIZE)
         """
+        cv2_lib = _require_cv2()
         target_size = VLM_CANVAS_SIZE
 
         # 前景检测：灰度阈值 + 轮廓包围盒
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
-        _, binary = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
+        gray = cv2_lib.cvtColor(crop, cv2_lib.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+        _, binary = cv2_lib.threshold(gray, 240, 255, cv2_lib.THRESH_BINARY_INV)
 
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2_lib.findContours(binary, cv2_lib.RETR_EXTERNAL, cv2_lib.CHAIN_APPROX_SIMPLE)
 
         if contours:
             # 合并所有轮廓的包围盒
             all_points = np.vstack(contours)
-            x, y, w, h = cv2.boundingRect(all_points)
+            x, y, w, h = cv2_lib.boundingRect(all_points)
             # 加 padding 避免裁剪过紧
             pad = max(5, int(min(w, h) * 0.05))
             x = max(0, x - pad)
@@ -145,7 +157,7 @@ class VLMComparator:
         scale = target_size / max(h, w)
         new_w = int(w * scale)
         new_h = int(h * scale)
-        resized = cv2.resize(cropped_fg, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        resized = cv2_lib.resize(cropped_fg, (new_w, new_h), interpolation=cv2_lib.INTER_AREA)
 
         # 创建白色画布并居中放置
         canvas = np.ones((target_size, target_size, 3), dtype=np.uint8) * 255
@@ -170,6 +182,7 @@ class VLMComparator:
         Returns:
             拼接画布 (VLM_CANVAS_SIZE x VLM_CANVAS_SIZE*2+20)
         """
+        cv2_lib = _require_cv2()
         size = VLM_CANVAS_SIZE
         sep_width = 20
 
@@ -183,15 +196,15 @@ class VLMComparator:
 
         # 分隔线
         sep_x = size
-        cv2.line(canvas, (sep_x + sep_width // 2, 0), (sep_x + sep_width // 2, canvas_h), (180, 180, 180), 2)
+        cv2_lib.line(canvas, (sep_x + sep_width // 2, 0), (sep_x + sep_width // 2, canvas_h), (180, 180, 180), 2)
 
         # 放置图像
         canvas[40:40+size, 0:size] = std_template
         canvas[40:40+size, size+sep_width:size+sep_width+size] = std_target
 
         # 添加标题
-        cv2.putText(canvas, "Template", (size // 2 - 40, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
-        cv2.putText(canvas, "Target", (size + sep_width + size // 2 - 30, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+        cv2_lib.putText(canvas, "Template", (size // 2 - 40, 30), cv2_lib.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+        cv2_lib.putText(canvas, "Target", (size + sep_width + size // 2 - 30, 30), cv2_lib.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
 
         return canvas
 
@@ -423,6 +436,7 @@ class VLMComparator:
         对比两个区域（与 layout_region_comparison.py 接口兼容）
         """
         import os
+        cv2_lib = _require_cv2()
 
         x1, y1, x2, y2 = [int(v) for v in template_box]
         template_crop = template_img[y1:y2, x1:x2]
@@ -445,17 +459,17 @@ class VLMComparator:
 
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
-            cv2.imwrite(
+            cv2_lib.imwrite(
                 os.path.join(output_dir, f"vlm_region_{pair_idx}_template.jpg"),
                 template_crop,
             )
-            cv2.imwrite(
+            cv2_lib.imwrite(
                 os.path.join(output_dir, f"vlm_region_{pair_idx}_target.jpg"),
                 target_crop,
             )
             # 保存标准化拼接画布供调试
             canvas = self._create_comparison_canvas(template_crop, target_crop)
-            cv2.imwrite(
+            cv2_lib.imwrite(
                 os.path.join(output_dir, f"vlm_region_{pair_idx}_canvas.jpg"),
                 canvas,
             )

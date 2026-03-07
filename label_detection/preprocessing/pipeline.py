@@ -10,8 +10,8 @@ import cv2
 import numpy as np
 import os
 
-from preprocessing.border import find_black_border, crop_to_border
-from preprocessing.perspective import detect_and_correct_perspective
+from .border import crop_to_border, find_black_border
+from .perspective import detect_and_correct_perspective
 
 
 def preprocess_template(template_path, output_dir="results/preprocessed"):

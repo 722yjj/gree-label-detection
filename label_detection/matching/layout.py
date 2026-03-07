@@ -11,36 +11,39 @@
 STATUS: main
 """
 
-import cv2
-import numpy as np
-import os
 import json
-from typing import List, Dict, Tuple, Optional
-from skimage.metrics import structural_similarity as ssim
-from paddlex import create_predictor
+import os
+from typing import Dict, List, Tuple
+
+import numpy as np
 
 from scipy.optimize import linear_sum_assignment
 
 # 导入公共模块
-from config import (
+from label_detection.core.config import (
     LAYOUT_DETECTION_THRESHOLD,
-    DEFAULT_TARGET_PATH,
     MATCH_WEIGHT_CENTER,
     MATCH_WEIGHT_AREA,
     MATCH_WEIGHT_ASPECT,
     MATCH_WEIGHT_IOU,
     MATCH_COST_THRESHOLD,
 )
-from extract_lable import extract_red_box_info
-from preprocessing import (
-    find_black_border,
-    crop_to_border,
-    preprocess_target,
-)
 
 
 # 创建 PP-DocLayoutV3 预测器（全局复用）
 _layout_predictor = None
+
+
+def _require_cv2():
+    import cv2
+
+    return cv2
+
+
+def _get_ssim():
+    from skimage.metrics import structural_similarity as ssim
+
+    return ssim
 
 
 def get_layout_predictor(threshold: float = None):
@@ -49,6 +52,8 @@ def get_layout_predictor(threshold: float = None):
     if threshold is None:
         threshold = LAYOUT_DETECTION_THRESHOLD
     if _layout_predictor is None:
+        from paddlex import create_predictor
+
         print("[模型] 初始化 PP-DocLayoutV3 预测器...")
         _layout_predictor = create_predictor(model_name="PP-DocLayoutV3", threshold=threshold)
     return _layout_predictor
@@ -266,6 +271,7 @@ def align_images_sift(img1: np.ndarray, img2: np.ndarray) -> Tuple[np.ndarray, b
     Returns:
         (aligned_img2, success): 对齐后的 img2 和是否成功
     """
+    cv2 = _require_cv2()
     gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY) if len(img1.shape) == 3 else img1
     gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY) if len(img2.shape) == 3 else img2
     
@@ -333,6 +339,7 @@ def extract_main_contours(img: np.ndarray) -> List[np.ndarray]:
     Returns:
         主要轮廓列表
     """
+    cv2 = _require_cv2()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
     
     # 二值化
@@ -367,6 +374,7 @@ def compare_contours_hu(contour1: np.ndarray, contour2: np.ndarray) -> float:
     Returns:
         相似度分数 (0-1)，越高越相似
     """
+    cv2 = _require_cv2()
     # cv2.matchShapes 返回值越小越相似
     # 使用方法 I1（基于 Hu 矩）
     distance = cv2.matchShapes(contour1, contour2, cv2.CONTOURS_MATCH_I1, 0)
@@ -389,6 +397,8 @@ def _compute_traditional_score(
 
     只做 SIFT 对齐 + Hu 矩 + SSIM，不保存中间结果。
     """
+    cv2 = _require_cv2()
+    ssim = _get_ssim()
     x1, y1, x2, y2 = [int(v) for v in box1]
     crop1 = img1[y1:y2, x1:x2]
     x1, y1, x2, y2 = [int(v) for v in box2]
@@ -462,11 +472,13 @@ def compare_region_pair(
     Returns:
         对比结果字典
     """
+    cv2 = _require_cv2()
+    ssim = _get_ssim()
     # ===== VLM 对比模式 =====
     if use_vlm:
         vlm_result = None
         try:
-            from vlm_comparator import get_vlm_comparator
+            from label_detection.services.vlm_service import get_vlm_comparator
             comparator = get_vlm_comparator(model_name=vlm_model)
             vlm_result = comparator.compare_region_pair(
                 img1, img2, box1, box2,
@@ -655,6 +667,9 @@ def preprocess_template_image(template_path: str, output_dir: str = "results/lay
     """
     预处理模板图片：检测黑框，去除黑框外白边，裁剪到黑框内部
     """
+    cv2 = _require_cv2()
+    from label_detection.preprocessing import crop_to_border, find_black_border
+
     os.makedirs(output_dir, exist_ok=True)
 
     print("\n[预处理] 处理模板图片...")
@@ -685,6 +700,7 @@ def draw_regions(img: np.ndarray, regions: List[Dict], color: Tuple = (0, 255, 0
     """
     在图像上绘制检测到的区域
     """
+    cv2 = _require_cv2()
     result = img.copy()
     for i, region in enumerate(regions):
         x1, y1, x2, y2 = [int(v) for v in region["coordinate"]]
@@ -714,6 +730,10 @@ def run_layout_comparison(
     Returns:
         对比结果字典
     """
+    cv2 = _require_cv2()
+    from label_detection.extraction.pdf import extract_red_box_info
+    from label_detection.preprocessing import preprocess_target
+
     os.makedirs(output_dir, exist_ok=True)
     
     print("=" * 60)
@@ -736,7 +756,11 @@ def run_layout_comparison(
     
     # 1.1 从 PDF 提取模板图片
     print("\n[1.1] 从 PDF 提取模板图片...")
-    template_raw_path = extract_red_box_info(pdf_path, target_dpi=300)
+    template_raw_path = extract_red_box_info(
+        pdf_path,
+        target_dpi=300,
+        output_dir=os.path.join(output_dir, "template_assets"),
+    )
     if not template_raw_path:
         return {"success": False, "error": "无法从 PDF 提取模板图片"}
     
@@ -919,19 +943,3 @@ def run_layout_comparison(
     print(f"\n结果已保存: {result_json_path}")
     
     return results
-
-
-if __name__ == "__main__":
-    # 测试运行
-    pdf_path = "600004075219-01.pdf"
-    target_path = DEFAULT_TARGET_PATH
-
-    result = run_layout_comparison(pdf_path, target_path)
-    
-    if result["success"]:
-        print("\n\n" + "=" * 60)
-        print("输出文件列表:")
-        print("=" * 60)
-        output_dir = result["output_dir"]
-        for f in sorted(os.listdir(output_dir)):
-            print(f"  - {f}")

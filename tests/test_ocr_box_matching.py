@@ -3,7 +3,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ocr_box_matching import find_matching_ocr_boxes, normalize_text_for_match
+from label_detection.matching.ocr import (
+    find_matching_ocr_boxes,
+    normalize_text_for_match,
+)
 
 
 class TestNormalizeTextForMatch:

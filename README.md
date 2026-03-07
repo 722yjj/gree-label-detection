@@ -10,23 +10,23 @@
 
 ## 模块结构
 
-```
+```text
 project/
-├── unified_detection.py      # 🔹 唯一主入口
-├── schemas.py                # 公共数据模型 (AirConditionerLabel)
-├── config.py                 # 统一配置
-├── extract_lable.py          # PDF 模板图片提取
-├── preprocessing/            # 图像预处理
-│   ├── border.py             #   边框检测与裁剪
-│   ├── perspective.py        #   透视矫正
-│   └── pipeline.py           #   预处理流水线
-├── services/                 # 公共服务
-│   ├── ocr_service.py        #   PaddleOCR 封装
-│   └── vlm_service.py        #   Qwen3-VL (Ollama) 封装
-├── layout_region_comparison.py  # PP-DocLayoutV3 区域检测与比对
-├── vlm_comparator.py         # VLM 比对兼容接口
-├── mask_text_regions.py      # 文字区域掩盖工具
-└── (实验脚本，标记为 experimental/deprecated)
+├── unified_detection.py          # 🔹 唯一主入口
+├── label_detection/              # 正式业务包
+│   ├── core/                     # 配置与兼容层
+│   ├── extraction/               # PDF 模板提取
+│   ├── matching/                 # OCR / 区域匹配逻辑
+│   ├── models/                   # 数据模型
+│   ├── preprocessing/            # 图像预处理
+│   ├── services/                 # OCR / VLM 服务封装
+│   └── workflows/                # 主流程编排
+├── samples/                      # 示例输入文件
+│   ├── images/
+│   ├── pdfs/
+│   └── spreadsheets/
+├── tests/                        # 单元测试
+└── results/                      # 运行输出
 ```
 
 ## 环境依赖
@@ -55,13 +55,14 @@ ollama pull qwen3-vl:8b  # 下载模型
 ## 运行方式
 
 ```bash
-python unified_detection.py --pdf 600004075219-01.pdf --target test.jpg
+python unified_detection.py --pdf samples/pdfs/600004075219-01.pdf --target samples/images/test.jpg
 ```
 
 ### 参数说明
 
-- `--pdf`：模板 PDF 文件路径（默认：`600004075219-01.pdf`）
-- `--target`：实拍标签图片路径（默认：`test.jpg`）
+- `--pdf`：模板 PDF 文件路径（默认：`samples/pdfs/600004075219-01.pdf`）
+- `--target`：实拍标签图片路径（默认：`samples/images/test.jpg`）
+- `--output-dir`：结果输出目录（默认：`results/unified/`）
 
 ## 输出说明
 
@@ -78,7 +79,7 @@ python unified_detection.py --pdf 600004075219-01.pdf --target test.jpg
 
 ## 配置
 
-可通过环境变量或修改 `config.py` 调整：
+可通过环境变量或修改 `label_detection/core/config.py` 调整：
 
 - `OLLAMA_API_BASE`：Ollama 服务地址（默认 `http://localhost:11434`）
 - `OLLAMA_MODEL`：VLM 模型名称（默认 `qwen3-vl:8b`）

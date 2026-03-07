@@ -1,18 +1,11 @@
-"""
-统一 OCR 服务模块
-
-封装 PaddleOCR 引擎的初始化与调用，提供懒加载和全局复用。
-
-STATUS: main
-"""
-
-import os
 import logging
-from typing import Tuple, List
+import os
+from typing import TYPE_CHECKING, List, Tuple
 
-from paddleocr import PaddleOCR
+from label_detection.core.config import OCR_LANG, OCR_USE_ANGLE_CLS
 
-from config import OCR_LANG, OCR_USE_ANGLE_CLS
+if TYPE_CHECKING:
+    from paddleocr import PaddleOCR
 
 # 禁用 PaddleOCR 的大量调试日志
 os.environ["PPOCR_KEY_VALUE_CACHE_HEIGHT"] = "False"
@@ -22,10 +15,12 @@ logging.getLogger("ppocr").setLevel(logging.ERROR)
 _ocr_engine = None
 
 
-def get_ocr_engine() -> PaddleOCR:
+def get_ocr_engine() -> "PaddleOCR":
     """获取或初始化 OCR 引擎（全局单例）"""
     global _ocr_engine
     if _ocr_engine is None:
+        from paddleocr import PaddleOCR
+
         print("正在初始化 PaddleOCR...")
         _ocr_engine = PaddleOCR(use_angle_cls=OCR_USE_ANGLE_CLS, lang=OCR_LANG)
     return _ocr_engine

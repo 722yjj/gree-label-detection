@@ -1,0 +1,1 @@
+"""Label detection package."""

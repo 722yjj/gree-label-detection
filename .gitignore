@@ -19,8 +19,8 @@ results/
 output/
 *.jpg
 *.png
-!600004075219-01_page1.png
-!test.jpg
+!samples/
+!samples/**
 
 # Excel 结果
 llm-results*.xlsx

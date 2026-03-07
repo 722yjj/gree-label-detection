@@ -14,7 +14,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from services.vlm_service import VLMComparator
+from label_detection.services.vlm_service import VLMComparator
 
 
 class TestErrorHandling:
