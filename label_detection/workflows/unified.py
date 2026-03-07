@@ -32,7 +32,7 @@ from label_detection.matching.layout import (
     draw_regions,
 )
 from label_detection.matching.ocr import find_matching_ocr_boxes
-from label_detection.models.schema import AirConditionerLabel
+from label_detection.schema import AirConditionerLabel
 from label_detection.preprocessing.border import crop_to_border, find_black_border
 from label_detection.preprocessing.pipeline import preprocess_target
 from label_detection.services.ocr_service import get_ocr_with_boxes

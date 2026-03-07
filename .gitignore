@@ -10,6 +10,8 @@ build/
 
 # 模型缓存
 models/
+!label_detection/models/
+!label_detection/models/**
 *.onnx
 *.pdmodel
 *.pdiparams
