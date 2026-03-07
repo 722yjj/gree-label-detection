@@ -1,0 +1,26 @@
+Model
+/I
+SPLIT AIR CONDITIONER INDOOR UNIT
+Rated Voltage
+Rated Frequency
+Cooling Capacity
+220-240V~ 
+51Hz 
+3250W
+Add: West Jinji Rd, Qianshan, Zhuhai, Guangdong, China, 519070
+Sound 
+Pressure 
+Level(H) 
+37dB(A) 
+Manufactured Date 
+                  1999.09 
+GREE ELECTRIC APPLIANCES,INC.OF ZHUHAI
+600004078454
+GWH12ACBXB-K3NNA1B
+Heating Capacity 
+3490W 
+Air Flow Volume 
+590m
+3/h 
+Weight 
+8.5kg

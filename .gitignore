@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 模型缓存
+models/
+*.onnx
+*.pdmodel
+*.pdiparams
+
+# 结果与中间文件
+results/
+output/
+*.jpg
+*.png
+!600004075219-01_page1.png
+!test.jpg
+
+# Excel 结果
+llm-results*.xlsx
+
+# 环境配置
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
