@@ -2,7 +2,7 @@
 基于 PP-DocLayoutV3 的区域检测对比脚本
 
 流程：
-1. 预处理：模板 PDF 提取 + 实拍图片裁剪（与 unified_detection.py 相同）
+1. 预处理：模板 PDF 提取 + 实拍图片裁剪（与 main.py 相同）
 2. 区域检测：使用 PP-DocLayoutV3 检测 image 类型区域
 3. 区域匹配：根据位置匹配模板和实拍的对应区域
 4. 区域对比：对每对匹配区域进行 SSIM 相似度计算
@@ -749,7 +749,7 @@ def run_layout_comparison(
         "comparison_results": [],
     }
     
-    # ========== Step 1: 预处理（与 unified_detection.py 相同）==========
+    # ========== Step 1: 预处理（与 main.py 相同）==========
     print("\n" + "=" * 40)
     print("Step 1: 预处理")
     print("=" * 40)
