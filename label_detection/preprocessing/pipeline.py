@@ -60,7 +60,7 @@ def preprocess_target(target_path, output_dir="results/preprocessed", template_i
 
     策略：
     0. 如果提供模板图片，先尝试四角点透视矫正（一步完成矫正+裁剪）
-    1. 如果透视矫正失败，回退到原有的边框检测裁剪逻辑
+    1. 如果透视矫正失败，回退到黑框检测和边缘检测裁剪逻辑
 
     Args:
         target_path: 目标图片路径
@@ -89,7 +89,7 @@ def preprocess_target(target_path, output_dir="results/preprocessed", template_i
             cv2.imwrite(output_path, corrected)
             return corrected, None, None
         else:
-            print("  透视矫正失败，回退到边框检测...")
+            print("  透视矫正失败，回退到黑框检测和边缘检测...")
 
     ih, iw = target.shape[:2]
 
@@ -119,32 +119,6 @@ def preprocess_target(target_path, output_dir="results/preprocessed", template_i
             border = (x, y, w, h)
             method_used = "黑框检测"
             print(f"    ✓ 检测到黑框: x={x}, y={y}, w={w}, h={h} (占比: {area_ratio:.2%})")
-
-    # ===== 方法2: 颜色分割 =====
-    if border is None:
-        print("  尝试方法2: 颜色分割（浅色标签检测）...")
-
-        hsv = cv2.cvtColor(target, cv2.COLOR_BGR2HSV)
-
-        lower = np.array([0, 0, 150])
-        upper = np.array([180, 80, 255])
-        mask = cv2.inRange(hsv, lower, upper)
-
-        kernel = np.ones((7, 7), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            x, y, w, h = cv2.boundingRect(largest)
-            area_ratio = (w * h) / (iw * ih)
-
-            if 0.3 < area_ratio < 0.99:
-                border = (x, y, w, h)
-                method_used = "颜色分割"
-                print(f"    ✓ 检测到标签区域: x={x}, y={y}, w={w}, h={h} (占比: {area_ratio:.2%})")
 
     # ===== 方法3: 边缘检测 =====
     if border is None:

@@ -6,9 +6,10 @@
 STATUS: main
 """
 
+import os
+
 import cv2
 import numpy as np
-import os
 
 
 def order_points(pts):
@@ -17,31 +18,159 @@ def order_points(pts):
     """
     rect = np.zeros((4, 2), dtype=np.float32)
 
-    # 左上点的 x+y 最小，右下点的 x+y 最大
     s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]  # 左上
-    rect[2] = pts[np.argmax(s)]  # 右下
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
 
-    # 右上点的 y-x 最小，左下点的 y-x 最大
     diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]  # 右上
-    rect[3] = pts[np.argmax(diff)]  # 左下
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
 
     return rect
 
 
+def _template_aspect_ratio(template):
+    """返回模板宽高比，用于过滤明显错误的候选区域。"""
+    if template is None or template.size == 0:
+        return None
+
+    th, tw = template.shape[:2]
+    if th == 0 or tw == 0:
+        return None
+
+    return tw / float(th)
+
+
+def _contour_to_quad(contour):
+    """将轮廓尽量转换成四边形。"""
+    if contour is None or len(contour) < 4:
+        return None
+
+    perimeter = cv2.arcLength(contour, True)
+    if perimeter <= 0:
+        return None
+
+    approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
+    if len(approx) == 4:
+        return approx.reshape(4, 2).astype(np.float32)
+
+    rect = cv2.minAreaRect(contour)
+    box = cv2.boxPoints(rect).astype(np.float32)
+    if cv2.contourArea(box) <= 0:
+        return None
+
+    return box
+
+
+def _score_quad(quad, contour_area, image_shape, template_ratio):
+    """
+    对候选四边形打分。
+
+    评分目标：
+    1. 尽量接近模板长宽比
+    2. 轮廓在四边形中填充充分，避免只取到零散文字
+    3. 避免直接选中整张图边缘
+    """
+    ih, iw = image_shape[:2]
+    image_area = float(iw * ih)
+
+    quad = order_points(quad.astype(np.float32))
+    quad_area = abs(cv2.contourArea(quad))
+    if quad_area <= 0:
+        return None
+
+    area_ratio = quad_area / image_area
+    if area_ratio < 0.03 or area_ratio > 0.98:
+        return None
+
+    width_top = np.linalg.norm(quad[1] - quad[0])
+    width_bottom = np.linalg.norm(quad[2] - quad[3])
+    height_left = np.linalg.norm(quad[3] - quad[0])
+    height_right = np.linalg.norm(quad[2] - quad[1])
+
+    max_width = max(width_top, width_bottom)
+    max_height = max(height_left, height_right)
+    if max_width < 30 or max_height < 30:
+        return None
+
+    aspect_ratio = max_width / max(max_height, 1.0)
+    if aspect_ratio < 1.0 or aspect_ratio > 12.0:
+        return None
+
+    fill_ratio = contour_area / quad_area
+    if fill_ratio < 0.35:
+        return None
+
+    if template_ratio is not None:
+        aspect_gap = abs(np.log(aspect_ratio / template_ratio))
+        if aspect_gap > np.log(2.8):
+            return None
+        aspect_score = max(0.0, 1.4 - aspect_gap)
+    else:
+        aspect_score = 0.8
+
+    x, y, w, h = cv2.boundingRect(quad.astype(np.int32))
+    touch_count = (
+        int(x <= 5)
+        + int(y <= 5)
+        + int(x + w >= iw - 5)
+        + int(y + h >= ih - 5)
+    )
+    edge_penalty = {0: 0.0, 1: 0.1, 2: 0.4, 3: 1.0, 4: 1.5}.get(touch_count, 1.5)
+
+    area_score = 1.0 - min(abs(area_ratio - 0.35) / 0.35, 1.0)
+    fill_score = min(fill_ratio, 1.0)
+    score = aspect_score * 2.0 + area_score + fill_score - edge_penalty
+
+    return {
+        "corners": quad,
+        "score": score,
+        "area_ratio": area_ratio,
+        "aspect_ratio": aspect_ratio,
+    }
+
+
+def _find_best_candidate(mask, image_shape, template_ratio, method_name):
+    """从当前掩码中挑选最像标签主体的四边形。"""
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    image_area = float(image_shape[0] * image_shape[1])
+    best = None
+
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:20]:
+        contour_area = cv2.contourArea(contour)
+        if contour_area / image_area < 0.003:
+            continue
+
+        quad = _contour_to_quad(contour)
+        if quad is None:
+            continue
+
+        candidate = _score_quad(quad, contour_area, image_shape, template_ratio)
+        if candidate is None:
+            continue
+
+        candidate["method"] = method_name
+        if best is None or candidate["score"] > best["score"]:
+            best = candidate
+
+    return best
+
+
 def detect_and_correct_perspective(target, template, output_dir=None):
     """
-    检测标签四角点并进行透视矫正
+    检测标签四角点并进行透视矫正。
 
-    算法：
-    1. 检测标签区域轮廓（黑框或浅色区域）
-    2. 多边形近似得到四角点
-    3. 透视变换矫正为水平矩形
+    当前策略：
+    1. 方法1：聚合深色前景（文字、边框、条码），找出最像标签主体的四边形
+    2. 方法3：边缘检测后提取候选四边形
+    3. 结合模板长宽比对候选区域打分，避免直接选中整张图或外部背景
 
     Args:
         target: 目标图片 (BGR)
-        template: 模板图片 (BGR)，用于确定目标尺寸
+        template: 模板图片 (BGR)，用于提供标签长宽比参考
         output_dir: 输出目录
 
     Returns:
@@ -52,112 +181,82 @@ def detect_and_correct_perspective(target, template, output_dir=None):
 
     h, w = target.shape[:2]
     gray = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY)
+    template_ratio = _template_aspect_ratio(template)
 
-    corners = None
-    method_used = None
+    candidates = []
 
-    # ===== 方法1: 检测黑色边框 =====
-    print("  尝试方法1: 黑框检测...")
-    _, thresh_black = cv2.threshold(gray, 60, 255, cv2.THRESH_BINARY_INV)
-    kernel = np.ones((5, 5), np.uint8)
-    thresh_black = cv2.morphologyEx(thresh_black, cv2.MORPH_CLOSE, kernel)
-
-    contours, _ = cv2.findContours(
-        thresh_black, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    # ===== 方法1: 聚合深色前景 =====
+    print("  尝试方法1: 深色区域聚合...")
+    _, dark_mask = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+    close_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (max(15, w // 35), max(15, h // 35))
+    )
+    dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, close_kernel)
+    dark_mask = cv2.dilate(
+        dark_mask,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, w // 180), max(3, h // 180))),
+        iterations=1,
     )
 
-    if contours:
-        largest = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(largest)
-        area_ratio = area / (w * h)
-
-        if 0.3 < area_ratio < 0.99:
-            epsilon = 0.02 * cv2.arcLength(largest, True)
-            approx = cv2.approxPolyDP(largest, epsilon, True)
-
-            if len(approx) == 4:
-                corners = approx.reshape(4, 2)
-                method_used = "黑框检测"
-                print(f"    ✓ 检测到四角点 (占比: {area_ratio:.2%})")
-
-    # ===== 方法2: 检测浅色标签区域 =====
-    if corners is None:
-        print("  尝试方法2: 浅色区域检测...")
-        hsv = cv2.cvtColor(target, cv2.COLOR_BGR2HSV)
-
-        lower = np.array([0, 0, 150])
-        upper = np.array([180, 80, 255])
-        mask = cv2.inRange(hsv, lower, upper)
-
-        kernel = np.ones((7, 7), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    candidate = _find_best_candidate(
+        dark_mask, target.shape, template_ratio, "深色区域聚合"
+    )
+    if candidate is not None:
+        candidates.append(candidate)
+        print(
+            f"    ✓ 找到候选四边形 (占比: {candidate['area_ratio']:.2%}, "
+            f"得分: {candidate['score']:.2f})"
         )
-
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(largest)
-            area_ratio = area / (w * h)
-
-            if 0.3 < area_ratio < 0.99:
-                epsilon = 0.02 * cv2.arcLength(largest, True)
-                approx = cv2.approxPolyDP(largest, epsilon, True)
-
-                if len(approx) == 4:
-                    corners = approx.reshape(4, 2)
-                    method_used = "浅色区域检测"
-                    print(f"    ✓ 检测到四角点 (占比: {area_ratio:.2%})")
 
     # ===== 方法3: 边缘检测 =====
-    if corners is None:
-        print("  尝试方法3: 边缘检测...")
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        edges = cv2.Canny(blur, 30, 100)
+    print("  尝试方法3: 边缘检测...")
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    edge_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (max(7, w // 80), max(7, h // 80))
+    )
+    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, edge_kernel)
+    edges = cv2.dilate(edges, edge_kernel, iterations=1)
 
-        kernel = np.ones((5, 5), np.uint8)
-        edges = cv2.dilate(edges, kernel, iterations=2)
-
-        contours, _ = cv2.findContours(
-            edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    candidate = _find_best_candidate(edges, target.shape, template_ratio, "边缘检测")
+    if candidate is not None:
+        candidates.append(candidate)
+        print(
+            f"    ✓ 找到候选四边形 (占比: {candidate['area_ratio']:.2%}, "
+            f"得分: {candidate['score']:.2f})"
         )
 
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            area = cv2.contourArea(largest)
-            area_ratio = area / (w * h)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        cv2.imwrite(os.path.join(output_dir, "target_method1_mask.jpg"), dark_mask)
+        cv2.imwrite(os.path.join(output_dir, "target_method3_edges.jpg"), edges)
 
-            if 0.3 < area_ratio < 0.95:
-                epsilon = 0.02 * cv2.arcLength(largest, True)
-                approx = cv2.approxPolyDP(largest, epsilon, True)
-
-                if len(approx) == 4:
-                    corners = approx.reshape(4, 2)
-                    method_used = "边缘检测"
-                    print(f"    ✓ 检测到四角点 (占比: {area_ratio:.2%})")
-
-    # 如果没有检测到四角点
-    if corners is None:
+    if not candidates:
         print("  ⚠ 未能检测到四角点，跳过透视矫正")
         return target, False
 
+    best = max(candidates, key=lambda item: item["score"])
+    ordered_corners = best["corners"]
+    method_used = best["method"]
     print(f"  使用方法: {method_used}")
 
-    # 排序角点
-    ordered_corners = order_points(corners.astype(np.float32))
-
-    # 计算目标矩形尺寸
     width_top = np.linalg.norm(ordered_corners[1] - ordered_corners[0])
     width_bottom = np.linalg.norm(ordered_corners[2] - ordered_corners[3])
     height_left = np.linalg.norm(ordered_corners[3] - ordered_corners[0])
     height_right = np.linalg.norm(ordered_corners[2] - ordered_corners[1])
 
-    max_width = int(max(width_top, width_bottom))
-    max_height = int(max(height_left, height_right))
+    max_width = max(1, int(round(max(width_top, width_bottom))))
+    max_height = max(1, int(round(max(height_left, height_right))))
 
-    # 目标点（水平矩形）
+    if template_ratio is not None:
+        detected_ratio = max_width / float(max_height)
+        if detected_ratio >= template_ratio:
+            max_height = max(1, int(round(max_width / template_ratio)))
+        else:
+            max_width = max(1, int(round(max_height * template_ratio)))
+
     dst_points = np.array(
         [
             [0, 0],
@@ -168,10 +267,7 @@ def detect_and_correct_perspective(target, template, output_dir=None):
         dtype=np.float32,
     )
 
-    # 计算透视变换矩阵
     M = cv2.getPerspectiveTransform(ordered_corners, dst_points)
-
-    # 应用透视变换
     corrected = cv2.warpPerspective(
         target,
         M,
@@ -183,10 +279,7 @@ def detect_and_correct_perspective(target, template, output_dir=None):
 
     print(f"  ✓ 透视矫正完成，输出尺寸: {corrected.shape[:2]}")
 
-    # 保存中间结果
     if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
         debug_img = target.copy()
         for i, pt in enumerate(ordered_corners):
             cv2.circle(debug_img, tuple(pt.astype(int)), 10, (0, 0, 255), -1)
