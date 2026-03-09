@@ -6,6 +6,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from label_detection.extraction.text import (
     count_populated_fields,
     extract_compact_spec_from_text,
+    find_missing_fields,
+    find_suspicious_fields,
+    merge_compact_sources,
+    needs_compact_llm,
 )
 from label_detection.schema import (
     LABEL_KIND_COMPACT,
@@ -62,3 +66,51 @@ class TestExtractCompactSpecFromText:
         assert extracted["refrigerant"] == "R32"
         assert extracted["barcode"] == "600001076226"
         assert count_populated_fields(extracted) == 7
+
+    def test_missing_fields_trigger_llm_for_compact_label(self):
+        extracted = {
+            "model_number": "GWH24AGD-K6DNA1C/I(WIFI)",
+            "net_weight": None,
+            "gross_weight": "16kg",
+            "color": "White",
+            "connection_pipes": '1/5"/1/2"',
+            "refrigerant": "R31",
+            "barcode": "600001076226",
+        }
+        fields = CompactSpecLabel.model_fields.keys()
+
+        assert find_missing_fields(extracted, fields) == ["net_weight"]
+        assert find_suspicious_fields(extracted, fields) == [
+            "connection_pipes",
+            "refrigerant",
+        ]
+        assert needs_compact_llm(extracted, fields) is True
+
+    def test_merge_prefers_llm_for_visual_short_fields(self):
+        rule_data = {
+            "model_number": "GWH24AGD-K6DNA1C/I(WIFI)",
+            "net_weight": None,
+            "gross_weight": "16kg",
+            "color": "White",
+            "connection_pipes": '1/5"/1/2"',
+            "refrigerant": "R31",
+            "barcode": "600001076226",
+        }
+        llm_data = {
+            "model_number": "GWH24AGD-K6DNA1C/I(WIFI)",
+            "net_weight": "14kg",
+            "gross_weight": "16.5kg",
+            "color": "White",
+            "connection_pipes": '1/4"/1/2"',
+            "refrigerant": "R32",
+            "barcode": "600001076226",
+        }
+
+        merged = merge_compact_sources(rule_data, llm_data, CompactSpecLabel.model_fields.keys())
+
+        assert merged["model_number"] == "GWH24AGD-K6DNA1C/I(WIFI)"
+        assert merged["barcode"] == "600001076226"
+        assert merged["net_weight"] == "14kg"
+        assert merged["gross_weight"] == "16.5kg"
+        assert merged["connection_pipes"] == '1/4"/1/2"'
+        assert merged["refrigerant"] == "R32"

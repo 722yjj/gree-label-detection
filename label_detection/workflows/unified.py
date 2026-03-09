@@ -29,6 +29,10 @@ from label_detection.extraction.pdf import extract_red_box_info
 from label_detection.extraction.text import (
     count_populated_fields,
     extract_compact_spec_from_text,
+    find_missing_fields,
+    merge_compact_sources,
+    needs_compact_llm,
+    find_suspicious_fields,
 )
 from label_detection.matching.layout import (
     detect_layout_regions,
@@ -160,7 +164,7 @@ def _extract_structured_from_text(
     label_kind: str,
     model_cls: Type[BaseModel],
     ocr_text: str,
-) -> Optional[BaseModel]:
+) -> Optional[Dict[str, object]]:
     if label_kind != LABEL_KIND_COMPACT:
         return None
 
@@ -169,7 +173,7 @@ def _extract_structured_from_text(
         return None
 
     print(f"    [规则提取] 紧凑标签命中 {count_populated_fields(extracted)} 个字段")
-    return model_cls(**extracted)
+    return extracted
 
 
 def run_llm_extraction(
@@ -200,8 +204,16 @@ def run_llm_extraction(
     llm = get_llm()
     b64_img = encode_image(image_path)
     rule_based = _extract_structured_from_text(label_kind, model_cls, ocr_text)
-    if rule_based is not None:
-        return rule_based
+    if label_kind == LABEL_KIND_COMPACT and rule_based is not None:
+        field_names = list(model_cls.model_fields.keys())
+        if not needs_compact_llm(rule_based, field_names):
+            return model_cls(**rule_based)
+        missing = find_missing_fields(rule_based, field_names)
+        suspicious = find_suspicious_fields(rule_based, field_names)
+        print(
+            "    [规则提取] 转 LLM 补洞/校正: "
+            f"missing={missing}, suspicious={suspicious}"
+        )
 
     final_prompt = _build_extraction_prompt(label_kind, ocr_text)
 
@@ -235,6 +247,17 @@ def run_llm_extraction(
             if json_match:
                 res_dict = json_module.loads(json_match.group())
                 data = model_cls(**res_dict)
+                if label_kind == LABEL_KIND_COMPACT and rule_based is not None:
+                    merged = merge_compact_sources(
+                        rule_based,
+                        data.model_dump(),
+                        model_cls.model_fields.keys(),
+                    )
+                    print(
+                        "    [规则+LLM] 合并后字段数: "
+                        f"{count_populated_fields(merged)}"
+                    )
+                    return model_cls(**merged)
                 return data
             else:
                 print(f"    ⚠ 第 {attempt+1} 次尝试: 未找到 JSON，重试...")
@@ -246,6 +269,9 @@ def run_llm_extraction(
             continue
 
     # 所有重试都失败，返回空数据
+    if label_kind == LABEL_KIND_COMPACT and rule_based is not None:
+        print("    [规则提取] LLM 补洞失败，回退规则结果")
+        return model_cls(**rule_based)
     print(f"    ✗ LLM 提取失败，使用空数据")
     return model_cls()
 

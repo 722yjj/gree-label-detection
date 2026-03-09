@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Dict
+from typing import Dict, Iterable
 
 
 def _clean_match(value: str | None) -> str | None:
@@ -58,3 +58,135 @@ def extract_compact_spec_from_text(ocr_text: object) -> Dict[str, str | None]:
 
 def count_populated_fields(data: Dict[str, object]) -> int:
     return sum(1 for value in data.values() if value not in (None, "", "None"))
+
+
+COMMON_PIPE_SIZES = {
+    "1/4",
+    "3/8",
+    "1/2",
+    "5/8",
+    "3/4",
+    "7/8",
+    "1",
+    "1-1/8",
+    "1-3/8",
+}
+
+COMMON_REFRIGERANTS = {
+    "R22",
+    "R32",
+    "R134A",
+    "R290",
+    "R410A",
+    "R407C",
+    "R417A",
+    "R454B",
+    "R600A",
+}
+
+
+def _normalize_compact_value(field_name: str, value: object) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    text = re.sub(r"\s+", "", text)
+    if field_name in {"net_weight", "gross_weight"}:
+        return text.lower()
+    return text.upper()
+
+
+def is_suspicious_compact_field(field_name: str, value: object) -> bool:
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if not text:
+        return True
+
+    normalized = _normalize_compact_value(field_name, text)
+    if field_name == "model_number":
+        return len(normalized) < 10
+    if field_name in {"net_weight", "gross_weight"}:
+        return re.fullmatch(r"\d+(?:\.\d+)?kg", normalized) is None
+    if field_name == "color":
+        return re.fullmatch(r"[A-Za-z]+", text) is None
+    if field_name == "barcode":
+        digits = re.sub(r"\D+", "", text)
+        return len(digits) < 10
+    if field_name == "refrigerant":
+        return normalized not in COMMON_REFRIGERANTS
+    if field_name == "connection_pipes":
+        parts = re.findall(r"\d+\s*/\s*\d+", text)
+        if len(parts) < 2:
+            return True
+        normalized_parts = {part.replace(" ", "") for part in parts}
+        return any(part not in COMMON_PIPE_SIZES for part in normalized_parts)
+    return False
+
+
+def find_missing_fields(
+    data: Dict[str, object],
+    field_names: Iterable[str],
+) -> list[str]:
+    return [
+        field_name
+        for field_name in field_names
+        if data.get(field_name) in (None, "", "None")
+    ]
+
+
+def find_suspicious_fields(
+    data: Dict[str, object],
+    field_names: Iterable[str],
+) -> list[str]:
+    return [
+        field_name
+        for field_name in field_names
+        if data.get(field_name) not in (None, "", "None")
+        and is_suspicious_compact_field(field_name, data.get(field_name))
+    ]
+
+
+def needs_compact_llm(
+    extracted: Dict[str, object],
+    field_names: Iterable[str],
+) -> bool:
+    return bool(
+        find_missing_fields(extracted, field_names)
+        or find_suspicious_fields(extracted, field_names)
+    )
+
+
+def merge_compact_sources(
+    rule_data: Dict[str, object],
+    llm_data: Dict[str, object],
+    field_names: Iterable[str],
+) -> Dict[str, object]:
+    """
+    Merge OCR-rule extraction with image-based LLM extraction.
+
+    Anchors like `model_number` and `barcode` prefer OCR/regex when present.
+    For visually short fields, prefer LLM when it provides a plausible value.
+    """
+    merged: Dict[str, object] = {}
+    anchor_fields = {"model_number", "barcode"}
+
+    for field_name in field_names:
+        rule_val = rule_data.get(field_name)
+        llm_val = llm_data.get(field_name)
+        rule_ok = rule_val not in (None, "", "None") and not is_suspicious_compact_field(
+            field_name, rule_val
+        )
+        llm_ok = llm_val not in (None, "", "None") and not is_suspicious_compact_field(
+            field_name, llm_val
+        )
+
+        if field_name in anchor_fields:
+            merged[field_name] = rule_val if rule_ok or llm_val in (None, "", "None") else llm_val
+            if merged[field_name] in (None, "", "None"):
+                merged[field_name] = rule_val or llm_val
+            continue
+
+        if llm_ok:
+            merged[field_name] = llm_val
+        elif rule_ok:
+            merged[field_name] = rule_val
+        else:
+            merged[field_name] = llm_val or rule_val
+
+    return merged
