@@ -451,6 +451,153 @@ def match_regions(
     return matched_pairs, unmatched1, unmatched2
 
 
+def _box_center_size(box: Sequence[float]) -> Tuple[float, float, float, float]:
+    x1, y1, x2, y2 = [float(v) for v in box]
+    width = max(1e-6, x2 - x1)
+    height = max(1e-6, y2 - y1)
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    return cx, cy, width, height
+
+
+def denormalize_coordinates(box: Sequence[float], img_shape: Tuple[int, int]) -> List[float]:
+    """Map a normalized [x1, y1, x2, y2] box back to pixel space."""
+    h, w = img_shape
+    return [
+        float(box[0]) * w,
+        float(box[1]) * h,
+        float(box[2]) * w,
+        float(box[3]) * h,
+    ]
+
+
+def clip_box_to_image(box: Sequence[float], img_shape: Tuple[int, int], min_size: int = 8) -> List[int] | None:
+    """Clip a box into image bounds and reject degenerate results."""
+    h, w = img_shape
+    x1 = int(round(max(0.0, min(float(box[0]), w - 1))))
+    y1 = int(round(max(0.0, min(float(box[1]), h - 1))))
+    x2 = int(round(max(0.0, min(float(box[2]), w))))
+    y2 = int(round(max(0.0, min(float(box[3]), h))))
+
+    if x2 <= x1:
+        x2 = min(w, x1 + min_size)
+    if y2 <= y1:
+        y2 = min(h, y1 + min_size)
+
+    if x2 - x1 < min_size or y2 - y1 < min_size:
+        return None
+
+    return [x1, y1, x2, y2]
+
+
+def estimate_region_foreground_ratio(image: np.ndarray, box: Sequence[float]) -> float:
+    """
+    Estimate how much non-white content exists inside a region.
+
+    Used to reject projected boxes that land on blank background.
+    """
+    clipped = clip_box_to_image(box, image.shape[:2], min_size=4)
+    if clipped is None:
+        return 0.0
+
+    x1, y1, x2, y2 = clipped
+    crop = image[y1:y2, x1:x2]
+    if crop.size == 0:
+        return 0.0
+
+    if crop.ndim == 3:
+        gray = crop.mean(axis=2)
+    else:
+        gray = crop.astype(float)
+
+    foreground = gray < 245
+    return float(foreground.mean())
+
+
+def infer_corresponding_region(
+    source_region: Dict,
+    source_shape: Tuple[int, int],
+    target_shape: Tuple[int, int],
+    matched_pairs: Sequence[Tuple[int, int, float]],
+    template_regions: Sequence[Dict],
+    target_regions: Sequence[Dict],
+    source_side: str,
+) -> Dict | None:
+    """
+    Infer the missing region on the opposite image using normalized geometry.
+
+    When matched pairs exist, use them to estimate center offset and width/height
+    scale between the two aligned images. Otherwise fall back to direct normalized
+    projection.
+    """
+    if source_side not in {"template", "target"}:
+        raise ValueError(f"Unsupported source_side: {source_side}")
+
+    source_box_norm = normalize_coordinates(source_region["coordinate"], source_shape)
+    src_cx, src_cy, src_w, src_h = _box_center_size(source_box_norm)
+
+    if source_side == "template":
+        matched_source_regions = template_regions
+        matched_target_regions = target_regions
+        src_idx_in_pair = 0
+        tgt_idx_in_pair = 1
+    else:
+        matched_source_regions = target_regions
+        matched_target_regions = template_regions
+        src_idx_in_pair = 1
+        tgt_idx_in_pair = 0
+
+    dx_values: List[float] = []
+    dy_values: List[float] = []
+    w_scales: List[float] = []
+    h_scales: List[float] = []
+
+    for pair in matched_pairs:
+        src_match = matched_source_regions[pair[src_idx_in_pair]]
+        tgt_match = matched_target_regions[pair[tgt_idx_in_pair]]
+
+        src_norm = normalize_coordinates(src_match["coordinate"], source_shape)
+        tgt_norm = normalize_coordinates(tgt_match["coordinate"], target_shape)
+
+        match_src_cx, match_src_cy, match_src_w, match_src_h = _box_center_size(src_norm)
+        match_tgt_cx, match_tgt_cy, match_tgt_w, match_tgt_h = _box_center_size(tgt_norm)
+
+        dx_values.append(match_tgt_cx - match_src_cx)
+        dy_values.append(match_tgt_cy - match_src_cy)
+        w_scales.append(match_tgt_w / max(match_src_w, 1e-6))
+        h_scales.append(match_tgt_h / max(match_src_h, 1e-6))
+
+    dx = float(np.median(dx_values)) if dx_values else 0.0
+    dy = float(np.median(dy_values)) if dy_values else 0.0
+    width_scale = float(np.clip(np.median(w_scales), 0.5, 1.8)) if w_scales else 1.0
+    height_scale = float(np.clip(np.median(h_scales), 0.5, 1.8)) if h_scales else 1.0
+
+    target_cx = src_cx + dx
+    target_cy = src_cy + dy
+    target_w = src_w * width_scale
+    target_h = src_h * height_scale
+
+    inferred_norm = [
+        target_cx - target_w / 2.0,
+        target_cy - target_h / 2.0,
+        target_cx + target_w / 2.0,
+        target_cy + target_h / 2.0,
+    ]
+    inferred_box = denormalize_coordinates(inferred_norm, target_shape)
+    clipped_box = clip_box_to_image(inferred_box, target_shape)
+    if clipped_box is None:
+        return None
+
+    inferred_region = {
+        "label": source_region.get("label", "image"),
+        "score": 0.0,
+        "coordinate": clipped_box,
+        "inferred": True,
+        "inferred_from": source_side,
+    }
+    return inferred_region
+
+
 def align_images_sift(img1: np.ndarray, img2: np.ndarray) -> Tuple[np.ndarray, bool]:
     """
     使用 SIFT 特征点对齐两张图像
@@ -912,6 +1059,8 @@ def draw_regions(img: np.ndarray, regions: List[Dict], color: Tuple = (0, 255, 0
         x1, y1, x2, y2 = [int(v) for v in region["coordinate"]]
         cv2.rectangle(result, (x1, y1), (x2, y2), color, 2)
         label = f"{region['label']}({region['score']:.2f})"
+        if region.get("inferred"):
+            label = f"{label}:inferred"
         if region.get("skip_reason"):
             label = f"{label}:{region['skip_reason']}"
         cv2.putText(result, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)

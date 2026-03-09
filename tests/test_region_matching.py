@@ -13,10 +13,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from label_detection.matching.layout import (
     normalize_coordinates,
+    denormalize_coordinates,
     calculate_iou,
     match_regions,
     _compute_match_cost,
     split_barcode_regions,
+    infer_corresponding_region,
 )
 
 
@@ -99,6 +101,37 @@ class TestComputeMatchCost:
         box2 = [50, 50, 150, 150]
         cost = _compute_match_cost(box1, box2, (100, 100), (200, 200))
         assert cost < 0.1
+
+
+class TestCoordinateProjection:
+    def test_denormalize_coordinates(self):
+        box = denormalize_coordinates([0.1, 0.2, 0.4, 0.5], (200, 100))
+        assert box == pytest.approx([10.0, 40.0, 40.0, 100.0])
+
+    def test_infer_corresponding_region_with_matched_offset(self):
+        template_regions = [
+            {"coordinate": [20, 20, 60, 60], "label": "image", "score": 0.9},
+        ]
+        target_regions = [
+            {"coordinate": [30, 30, 70, 70], "label": "image", "score": 0.9},
+            {"coordinate": [110, 40, 150, 80], "label": "image", "score": 0.9},
+        ]
+        matched_pairs = [(0, 0, 0.05)]
+
+        inferred = infer_corresponding_region(
+            target_regions[1],
+            (200, 200),
+            (200, 200),
+            matched_pairs,
+            template_regions,
+            target_regions,
+            source_side="target",
+        )
+
+        assert inferred is not None
+        assert inferred["inferred"] is True
+        assert inferred["inferred_from"] == "target"
+        assert inferred["coordinate"] == [100, 30, 140, 70]
 
 
 class TestMatchRegions:
