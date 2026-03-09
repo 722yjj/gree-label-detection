@@ -13,7 +13,8 @@ STATUS: main
 
 import json
 import os
-from typing import Dict, List, Tuple
+import re
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
@@ -106,6 +107,196 @@ def extract_regions_by_type(regions: List[Dict], region_type: str = "image") -> 
         筛选后的区域列表
     """
     return [r for r in regions if r["label"] == region_type]
+
+
+def _poly_to_bbox(poly: object) -> List[float]:
+    """Convert an OCR polygon / bbox into a simple [x1, y1, x2, y2] box."""
+    arr = np.asarray(poly, dtype=float)
+    if arr.size == 4 and arr.ndim == 1:
+        x1, y1, x2, y2 = arr.tolist()
+        return [float(x1), float(y1), float(x2), float(y2)]
+
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 2)
+
+    xs = arr[:, 0]
+    ys = arr[:, 1]
+    return [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
+
+
+def _box_area(box: Sequence[float]) -> float:
+    return max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1]))
+
+
+def _intersection_area(box1: Sequence[float], box2: Sequence[float]) -> float:
+    x1 = max(float(box1[0]), float(box2[0]))
+    y1 = max(float(box1[1]), float(box2[1]))
+    x2 = min(float(box1[2]), float(box2[2]))
+    y2 = min(float(box1[3]), float(box2[3]))
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    return (x2 - x1) * (y2 - y1)
+
+
+def _collect_region_ocr_texts(
+    region_box: Sequence[float],
+    ocr_boxes: Sequence[Tuple[object, str, float]] | None,
+    min_overlap: float = 0.35,
+) -> List[str]:
+    """Collect OCR texts that substantially overlap the region."""
+    if not ocr_boxes:
+        return []
+
+    matched_texts: List[str] = []
+    for box_info in ocr_boxes:
+        if len(box_info) < 2:
+            continue
+        text = str(box_info[1] or "").strip()
+        if not text:
+            continue
+
+        ocr_box = _poly_to_bbox(box_info[0])
+        ocr_area = _box_area(ocr_box)
+        if ocr_area <= 1:
+            continue
+
+        overlap = _intersection_area(region_box, ocr_box)
+        if overlap / ocr_area >= min_overlap:
+            matched_texts.append(text)
+
+    return matched_texts
+
+
+def _compute_barcode_texture(crop: np.ndarray) -> Dict[str, float]:
+    """Measure simple stripe-like texture features for barcode detection."""
+    if crop.size == 0:
+        return {
+            "transition_density": 0.0,
+            "dark_column_ratio": 0.0,
+            "vertical_bias": 0.0,
+        }
+
+    if crop.ndim == 3:
+        gray = crop.mean(axis=2).astype(np.float32)
+    else:
+        gray = crop.astype(np.float32)
+
+    if gray.shape[0] < 8 or gray.shape[1] < 8:
+        return {
+            "transition_density": 0.0,
+            "dark_column_ratio": 0.0,
+            "vertical_bias": 0.0,
+        }
+
+    threshold = float(np.clip(gray.mean() - gray.std() * 0.15, 80.0, 215.0))
+    binary = gray < threshold
+
+    column_dark = binary.mean(axis=0)
+    row_dark = binary.mean(axis=1)
+    dark_columns = column_dark > 0.18
+    dark_rows = row_dark > 0.18
+
+    column_transitions = np.abs(np.diff(dark_columns.astype(np.int8))).sum()
+    row_transitions = np.abs(np.diff(dark_rows.astype(np.int8))).sum()
+
+    transition_density = float(column_transitions / max(1, dark_columns.size - 1))
+    dark_column_ratio = float(dark_columns.mean())
+    vertical_bias = float(transition_density / max(0.02, row_transitions / max(1, dark_rows.size - 1)))
+
+    return {
+        "transition_density": transition_density,
+        "dark_column_ratio": dark_column_ratio,
+        "vertical_bias": vertical_bias,
+    }
+
+
+def detect_barcode_region(
+    region: Dict,
+    image: np.ndarray,
+    ocr_boxes: Sequence[Tuple[object, str, float]] | None = None,
+) -> Tuple[bool, Dict[str, object]]:
+    """
+    Detect whether a layout region is a barcode-like area.
+
+    Heuristics combine:
+    - OCR overlap with long digit runs
+    - dense vertical stripe texture
+    - typical wide, low-height barcode geometry
+    """
+    img_h, img_w = image.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in region["coordinate"]]
+    x1 = max(0, min(x1, img_w))
+    x2 = max(0, min(x2, img_w))
+    y1 = max(0, min(y1, img_h))
+    y2 = max(0, min(y2, img_h))
+
+    crop = image[y1:y2, x1:x2]
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+    aspect_ratio = width / max(1.0, height)
+    height_ratio = height / max(1.0, img_h)
+    center_y_ratio = ((y1 + y2) / 2.0) / max(1.0, img_h)
+
+    texts = _collect_region_ocr_texts([x1, y1, x2, y2], ocr_boxes)
+    digit_runs = [re.sub(r"\D+", "", text) for text in texts]
+    longest_digits = max((digits for digits in digit_runs), key=len, default="")
+    has_long_digits = len(longest_digits) >= 10
+    has_barcode_token = any("barcode" in str(text).lower() for text in texts)
+
+    texture = _compute_barcode_texture(crop)
+    stripe_like = (
+        aspect_ratio >= 1.6
+        and texture["transition_density"] >= 0.18
+        and 0.10 <= texture["dark_column_ratio"] <= 0.85
+        and texture["vertical_bias"] >= 1.4
+    )
+    strong_texture_barcode = (
+        aspect_ratio >= 2.2
+        and height_ratio <= 0.38
+        and center_y_ratio >= 0.40
+        and texture["transition_density"] >= 0.30
+        and texture["vertical_bias"] >= 2.2
+        and texture["dark_column_ratio"] >= 0.12
+    )
+
+    is_barcode = (
+        (has_long_digits and stripe_like and height_ratio <= 0.50)
+        or (has_barcode_token and stripe_like)
+        or strong_texture_barcode
+    )
+
+    return is_barcode, {
+        "barcode_digits": longest_digits or None,
+        "aspect_ratio": float(aspect_ratio),
+        "height_ratio": float(height_ratio),
+        "transition_density": texture["transition_density"],
+        "dark_column_ratio": texture["dark_column_ratio"],
+        "vertical_bias": texture["vertical_bias"],
+        "ocr_texts": texts,
+    }
+
+
+def split_barcode_regions(
+    regions: Sequence[Dict],
+    image: np.ndarray,
+    ocr_boxes: Sequence[Tuple[object, str, float]] | None = None,
+) -> Tuple[List[Dict], List[Dict]]:
+    """Split layout regions into comparable regions and skipped barcode regions."""
+    comparable: List[Dict] = []
+    skipped: List[Dict] = []
+
+    for idx, region in enumerate(regions):
+        region_copy = dict(region)
+        region_copy.setdefault("original_idx", idx)
+        is_barcode, meta = detect_barcode_region(region_copy, image, ocr_boxes)
+        if is_barcode:
+            region_copy["skip_reason"] = "barcode"
+            region_copy["barcode_hint"] = meta
+            skipped.append(region_copy)
+        else:
+            comparable.append(region_copy)
+
+    return comparable, skipped
 
 
 def calculate_iou(box1: List[float], box2: List[float]) -> float:
@@ -711,6 +902,8 @@ def draw_regions(img: np.ndarray, regions: List[Dict], color: Tuple = (0, 255, 0
         x1, y1, x2, y2 = [int(v) for v in region["coordinate"]]
         cv2.rectangle(result, (x1, y1), (x2, y2), color, 2)
         label = f"{region['label']}({region['score']:.2f})"
+        if region.get("skip_reason"):
+            label = f"{label}:{region['skip_reason']}"
         cv2.putText(result, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
     return result
 
@@ -738,6 +931,7 @@ def run_layout_comparison(
     cv2 = _require_cv2()
     from label_detection.extraction.pdf import extract_red_box_info
     from label_detection.preprocessing import preprocess_target
+    from label_detection.services.ocr_service import get_ocr_with_boxes
 
     os.makedirs(output_dir, exist_ok=True)
     
@@ -803,13 +997,42 @@ def run_layout_comparison(
     target_all_regions = detect_layout_regions(target_preprocessed_path, detection_threshold)
     target_regions = extract_regions_by_type(target_all_regions, region_type)
     print(f"  检测到 {len(target_all_regions)} 个区域，其中 {region_type} 类型 {len(target_regions)} 个")
-    
+
+    skipped_template_regions: List[Dict] = []
+    skipped_target_regions: List[Dict] = []
+    if region_type == "image":
+        _, template_boxes = get_ocr_with_boxes(template_path)
+        _, target_boxes = get_ocr_with_boxes(target_preprocessed_path)
+        template_regions, skipped_template_regions = split_barcode_regions(
+            template_regions,
+            template_cropped,
+            template_boxes,
+        )
+        target_regions, skipped_target_regions = split_barcode_regions(
+            target_regions,
+            target_cropped,
+            target_boxes,
+        )
+        print(
+            "  条码过滤后: "
+            f"模板保留 {len(template_regions)} / 跳过 {len(skipped_template_regions)}, "
+            f"实拍保留 {len(target_regions)} / 跳过 {len(skipped_target_regions)}"
+        )
+
     results["template_regions"] = template_regions
     results["target_regions"] = target_regions
+    results["template_regions_total_count"] = len(extract_regions_by_type(template_all_regions, region_type))
+    results["target_regions_total_count"] = len(extract_regions_by_type(target_all_regions, region_type))
+    results["skipped_template_regions"] = skipped_template_regions
+    results["skipped_target_regions"] = skipped_target_regions
     
     # 保存检测可视化
     template_vis = draw_regions(template_cropped, template_regions, (0, 255, 0))
     target_vis = draw_regions(target_cropped, target_regions, (0, 255, 0))
+    if skipped_template_regions:
+        template_vis = draw_regions(template_vis, skipped_template_regions, (0, 165, 255))
+    if skipped_target_regions:
+        target_vis = draw_regions(target_vis, skipped_target_regions, (0, 165, 255))
     cv2.imwrite(os.path.join(output_dir, "template_regions.jpg"), template_vis)
     cv2.imwrite(os.path.join(output_dir, "target_regions.jpg"), target_vis)
     
@@ -896,6 +1119,8 @@ def run_layout_comparison(
     print(f"\n🖼️ 区域检测:")
     print(f"   - 模板 {region_type} 区域: {len(template_regions)} 个")
     print(f"   - 实拍 {region_type} 区域: {len(target_regions)} 个")
+    if skipped_template_regions or skipped_target_regions:
+        print(f"   - 条码跳过: 模板 {len(skipped_template_regions)} / 实拍 {len(skipped_target_regions)}")
     
     print(f"\n🔗 区域匹配:")
     print(f"   - 成功匹配: {total_pairs} 对")

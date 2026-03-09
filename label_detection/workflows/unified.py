@@ -40,6 +40,7 @@ from label_detection.matching.layout import (
     match_regions,
     compare_region_pair,
     draw_regions,
+    split_barcode_regions,
 )
 from label_detection.matching.ocr import find_matching_ocr_boxes
 from label_detection.schema import LABEL_KIND_COMPACT, get_label_model, infer_label_kind
@@ -451,12 +452,37 @@ def run_unified_detection(pdf_path, target_image_path, output_dir=DEFAULT_OUTPUT
     target_all_regions = detect_layout_regions(target_preprocessed_path)
     target_regions = extract_regions_by_type(target_all_regions, "image")
 
-    print(f"  - 模板图片区域: {len(template_regions)} 个 (总检测 {len(template_all_regions)})")
-    print(f"  - 实拍图片区域: {len(target_regions)} 个 (总检测 {len(target_all_regions)})")
+    skipped_template_regions: List[Dict] = []
+    skipped_target_regions: List[Dict] = []
+    template_regions, skipped_template_regions = split_barcode_regions(
+        template_regions,
+        template_cropped,
+        template_boxes,
+    )
+    target_regions, skipped_target_regions = split_barcode_regions(
+        target_regions,
+        target_cropped,
+        target_boxes,
+    )
+
+    print(
+        "  - 模板图片区域: "
+        f"{len(template_regions)} 个可比对 / {len(skipped_template_regions)} 个条码跳过 "
+        f"(总检测 {len(template_all_regions)})"
+    )
+    print(
+        "  - 实拍图片区域: "
+        f"{len(target_regions)} 个可比对 / {len(skipped_target_regions)} 个条码跳过 "
+        f"(总检测 {len(target_all_regions)})"
+    )
 
     # 保存区域检测可视化
     template_vis = draw_regions(template_cropped, template_regions)
     target_vis = draw_regions(target_cropped, target_regions)
+    if skipped_template_regions:
+        template_vis = draw_regions(template_vis, skipped_template_regions, color=(0, 165, 255))
+    if skipped_target_regions:
+        target_vis = draw_regions(target_vis, skipped_target_regions, color=(0, 165, 255))
     cv2.imwrite(os.path.join(graphic_output_dir, "template_regions_detected.jpg"), template_vis)
     cv2.imwrite(os.path.join(graphic_output_dir, "target_regions_detected.jpg"), target_vis)
 
@@ -514,8 +540,12 @@ def run_unified_detection(pdf_path, target_image_path, output_dir=DEFAULT_OUTPUT
             print(f"      对比出错: {e}")
 
     results["graphic_comparison"] = {
+        "template_regions_total_count": len(extract_regions_by_type(template_all_regions, "image")),
+        "target_regions_total_count": len(extract_regions_by_type(target_all_regions, "image")),
         "template_regions_count": len(template_regions),
         "target_regions_count": len(target_regions),
+        "skipped_template_regions": skipped_template_regions,
+        "skipped_target_regions": skipped_target_regions,
         "matched_count": len(matched_pairs),
         "comparison_results": comparison_results,
         "region_type": "image"
@@ -615,6 +645,8 @@ def run_unified_detection(pdf_path, target_image_path, output_dir=DEFAULT_OUTPUT
 
     print(f"\n🖼️ 图形比较 (基于区域):")
     print(f"   - 检测区域数: 模板 {len(template_regions)} / 实拍 {len(target_regions)}")
+    if skipped_template_regions or skipped_target_regions:
+        print(f"   - 条码跳过: 模板 {len(skipped_template_regions)} / 实拍 {len(skipped_target_regions)}")
     print(f"   - 成功匹配: {len(matched_pairs)} 对")
 
     # 统计分为三类

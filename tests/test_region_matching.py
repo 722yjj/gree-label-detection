@@ -16,6 +16,7 @@ from label_detection.matching.layout import (
     calculate_iou,
     match_regions,
     _compute_match_cost,
+    split_barcode_regions,
 )
 
 
@@ -210,3 +211,45 @@ class TestMatchRegions:
         _, _, cost = matched[0]
         assert isinstance(cost, float)
         assert 0 < cost < 1  # 代价应在合理范围
+
+
+class TestBarcodeRegionFilter:
+    def _make_region(self, x1, y1, x2, y2):
+        return {"coordinate": [x1, y1, x2, y2], "label": "image", "score": 0.9}
+
+    def test_barcode_region_is_skipped(self):
+        img = np.full((220, 320, 3), 255, dtype=np.uint8)
+        for x in range(165, 285, 6):
+            img[95:160, x : x + 3] = 0
+
+        region = self._make_region(150, 80, 300, 190)
+        ocr_boxes = [
+            (
+                np.array([[165, 160], [285, 160], [285, 180], [165, 180]], dtype=np.float32),
+                "600001076226",
+                0.99,
+            )
+        ]
+
+        comparable, skipped = split_barcode_regions([region], img, ocr_boxes)
+        assert comparable == []
+        assert len(skipped) == 1
+        assert skipped[0]["skip_reason"] == "barcode"
+        assert skipped[0]["barcode_hint"]["barcode_digits"] == "600001076226"
+
+    def test_plain_graphic_region_is_kept(self):
+        img = np.full((220, 320, 3), 255, dtype=np.uint8)
+        img[70:150, 40:250] = 0
+
+        region = self._make_region(30, 60, 260, 160)
+        ocr_boxes = [
+            (
+                np.array([[45, 90], [240, 90], [240, 120], [45, 120]], dtype=np.float32),
+                "GWH24AGD-K6DNA1C/I(WIFI)",
+                0.97,
+            )
+        ]
+
+        comparable, skipped = split_barcode_regions([region], img, ocr_boxes)
+        assert len(comparable) == 1
+        assert skipped == []
