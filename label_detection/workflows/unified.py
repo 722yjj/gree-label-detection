@@ -4,13 +4,15 @@ import argparse
 import base64
 import json
 import os
+import re
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Type
 
 import cv2
 import numpy as np
 import pandas as pd
 from openpyxl.styles import Font
+from pydantic import BaseModel
 
 from label_detection.core import langchain_compat as _langchain_compat  # noqa: F401
 from label_detection.core.config import (
@@ -24,6 +26,10 @@ from label_detection.core.config import (
     USE_VLM_FOR_GRAPHIC,
 )
 from label_detection.extraction.pdf import extract_red_box_info
+from label_detection.extraction.text import (
+    count_populated_fields,
+    extract_compact_spec_from_text,
+)
 from label_detection.matching.layout import (
     detect_layout_regions,
     extract_regions_by_type,
@@ -32,7 +38,7 @@ from label_detection.matching.layout import (
     draw_regions,
 )
 from label_detection.matching.ocr import find_matching_ocr_boxes
-from label_detection.schema import AirConditionerLabel
+from label_detection.schema import LABEL_KIND_COMPACT, get_label_model, infer_label_kind
 from label_detection.preprocessing.border import crop_to_border, find_template_crop_rect
 from label_detection.preprocessing.pipeline import preprocess_target
 from label_detection.services.ocr_service import get_ocr_with_boxes
@@ -108,30 +114,32 @@ def preprocess_template_image(template_path, output_dir=DEFAULT_OUTPUT_DIR):
     return cropped, output_path, None
 
 
-def run_llm_extraction(image_path, ocr_text, max_retries=None):
-    """
-    使用 LLM 提取结构化标签信息
+def _build_extraction_prompt(label_kind: str, ocr_text: str) -> str:
+    if label_kind == LABEL_KIND_COMPACT:
+        return f"""【任务】：提取图中紧凑型标签的文字信息
 
-    Args:
-        image_path: 图片路径
-        ocr_text: OCR 提取的文本
-        max_retries: 最大重试次数
+【参考 OCR 文本】：
+{ocr_text}
 
-    Returns:
-        AirConditionerLabel: 结构化数据
-    """
-    import re
-    import json as json_module
+【字段定义】：
+- model_number: 型号
+- net_weight: N.W.
+- gross_weight: G.W.
+- color: Color
+- connection_pipes: Connection Pipes
+- refrigerant: Refrigerant
+- barcode: 条形码下方的数字
 
-    if max_retries is None:
-        max_retries = LLM_MAX_RETRIES
+【提取规则】：
+1. 优先根据图片视觉内容提取，OCR 只用于纠错。
+2. 只输出上面 7 个字段；没有就填 null。
+3. 保留原始文本，不要补充不存在的字段。
+4. 必须输出纯标准 JSON，不要包含 Markdown 代码块或解释。
 
-    from langchain_core.messages import HumanMessage
+【输出示例】：
+{{"model_number":"GWH24AGD-K6DNA1C/I(WIFI)","net_weight":"14kg","gross_weight":"16.5kg","color":"White","connection_pipes":"1/4\\"/1/2\\"","refrigerant":"R32","barcode":"600001076226"}}"""
 
-    llm = get_llm()
-    b64_img = encode_image(image_path)
-
-    final_prompt = f"""【任务】：提取图中标签的文字信息
+    return f"""【任务】：提取图中标签的文字信息
 
 【参考信息】：
 为了防止你看不清小字，我已经使用 OCR 技术识别了图中的文字，内容如下（可能存在乱序，仅供参考拼写和数字）：
@@ -146,6 +154,56 @@ def run_llm_extraction(image_path, ocr_text, max_retries=None):
 
 【输出示例】：
 {{"brand":"GREE","product_type":"SPLIT AIR CONDITIONER INDOOR UNIT","model_number":"GWH18AAD-K6DNA2E/I","voltage":"220-240V~","frequency":"50Hz","heating_capacity":"5.20kW","cooling_capacity":"4.60kW","air_volume":"850m³/h","weight":"13.5kg","noise":"46dB(A)","mfg_date":"2026.01","manufacturer":"GREE ELECTRIC APPLIANCES,INC.OF ZHUHAI","address":"Add: West Jinji Rd, Qianshan, Zhuhai, Guangdong, China, 519070","barcode":"600004075219"}}"""
+
+
+def _extract_structured_from_text(
+    label_kind: str,
+    model_cls: Type[BaseModel],
+    ocr_text: str,
+) -> Optional[BaseModel]:
+    if label_kind != LABEL_KIND_COMPACT:
+        return None
+
+    extracted = extract_compact_spec_from_text(ocr_text)
+    if count_populated_fields(extracted) < 4:
+        return None
+
+    print(f"    [规则提取] 紧凑标签命中 {count_populated_fields(extracted)} 个字段")
+    return model_cls(**extracted)
+
+
+def run_llm_extraction(
+    image_path,
+    ocr_text,
+    model_cls: Type[BaseModel],
+    label_kind: str,
+    max_retries=None,
+):
+    """
+    使用 LLM 提取结构化标签信息
+
+    Args:
+        image_path: 图片路径
+        ocr_text: OCR 提取的文本
+        max_retries: 最大重试次数
+
+    Returns:
+        BaseModel: 结构化数据
+    """
+    import json as json_module
+
+    if max_retries is None:
+        max_retries = LLM_MAX_RETRIES
+
+    from langchain_core.messages import HumanMessage
+
+    llm = get_llm()
+    b64_img = encode_image(image_path)
+    rule_based = _extract_structured_from_text(label_kind, model_cls, ocr_text)
+    if rule_based is not None:
+        return rule_based
+
+    final_prompt = _build_extraction_prompt(label_kind, ocr_text)
 
     msg = HumanMessage(
         content=[
@@ -176,7 +234,7 @@ def run_llm_extraction(image_path, ocr_text, max_retries=None):
             json_match = re.search(r'\{[\s\S]*\}', content)
             if json_match:
                 res_dict = json_module.loads(json_match.group())
-                data = AirConditionerLabel(**res_dict)
+                data = model_cls(**res_dict)
                 return data
             else:
                 print(f"    ⚠ 第 {attempt+1} 次尝试: 未找到 JSON，重试...")
@@ -189,7 +247,7 @@ def run_llm_extraction(image_path, ocr_text, max_retries=None):
 
     # 所有重试都失败，返回空数据
     print(f"    ✗ LLM 提取失败，使用空数据")
-    return AirConditionerLabel()
+    return model_cls()
 
 
 def compare_text_results(data1, data2, output_path=None):
@@ -206,9 +264,10 @@ def compare_text_results(data1, data2, output_path=None):
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
+    field_names = list(type(data1).model_fields.keys())
     data_dict = {"参数": [], "模板图片": [], "实拍图片": [], "是否一致": []}
 
-    for k in AirConditionerLabel.model_fields.keys():
+    for k in field_names:
         v1 = getattr(data1, k)
         v2 = getattr(data2, k)
         data_dict["参数"].append(k)
@@ -315,15 +374,23 @@ def run_unified_detection(pdf_path, target_image_path, output_dir=DEFAULT_OUTPUT
     target_text, target_boxes = get_ocr_with_boxes(target_preprocessed_path)
     print(f"  识别到 {len(target_boxes)} 个文字区域，共 {len(target_text)} 字符")
 
-    # 2.3 LLM 提取结构化信息
-    print("\n[2.3] LLM 提取模板结构化信息...")
+    label_kind = infer_label_kind(template_text or target_text)
+    model_cls = get_label_model(label_kind)
+    comparison_fields = list(model_cls.model_fields.keys())
+    print(f"\n[2.3] 识别文字标签类型: {label_kind} ({len(comparison_fields)} 个字段)")
+    print("[2.3] LLM/规则提取模板结构化信息...")
     llm_start = time.time()
-    data1 = run_llm_extraction(template_path, template_text)
+    data1 = run_llm_extraction(template_path, template_text, model_cls, label_kind)
     print(f"  LLM 耗时: {time.time() - llm_start:.2f} 秒")
 
-    print("\n[2.4] LLM 提取实拍结构化信息...")
+    print("\n[2.4] LLM/规则提取实拍结构化信息...")
     llm_start = time.time()
-    data2 = run_llm_extraction(target_preprocessed_path, target_text)
+    data2 = run_llm_extraction(
+        target_preprocessed_path,
+        target_text,
+        model_cls,
+        label_kind,
+    )
     print(f"  LLM 耗时: {time.time() - llm_start:.2f} 秒")
 
     # 2.5 对比文字结果
@@ -334,6 +401,8 @@ def run_unified_detection(pdf_path, target_image_path, output_dir=DEFAULT_OUTPUT
     )
 
     results["text_detection"] = {
+        "label_kind": label_kind,
+        "fields": comparison_fields,
         "template_data": data1.model_dump(),
         "target_data": data2.model_dump(),
         "excel_path": text_excel_path,
@@ -437,7 +506,7 @@ def run_unified_detection(pdf_path, target_image_path, output_dir=DEFAULT_OUTPUT
 
     # 1. 标注差异的文字区域 (红色)
     print("  寻找并标注差异文字区域...")
-    for k in AirConditionerLabel.model_fields.keys():
+    for k in comparison_fields:
         v1 = getattr(data1, k)
         v2 = getattr(data2, k)
 
@@ -505,10 +574,10 @@ def run_unified_detection(pdf_path, target_image_path, output_dir=DEFAULT_OUTPUT
 
     # 文字对比统计
     match_count = sum(
-        1 for k in AirConditionerLabel.model_fields.keys()
+        1 for k in comparison_fields
         if getattr(data1, k) == getattr(data2, k)
     )
-    total_fields = len(AirConditionerLabel.model_fields)
+    total_fields = len(comparison_fields)
 
     print(f"\n📝 文字检测:")
     print(f"   - 字段匹配: {match_count}/{total_fields}")
