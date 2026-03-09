@@ -688,6 +688,16 @@ def compare_region_pair(
             trad_result = _compute_traditional_score(img1, img2, box1, box2)
             shape_score = trad_result.get("shape_score", 0.5)
             vlm_decision = vlm_result.get("decision", "unknown")
+            summary_text = str(vlm_result.get("summary", "")).lower()
+            barcode_ignored = "barcode_ignored" in summary_text
+
+            if barcode_ignored:
+                vlm_result["decision"] = "match"
+                vlm_result["is_match"] = True
+                vlm_result["needs_review"] = False
+                vlm_result["judgment_source"] = "barcode_prompt"
+                vlm_result["traditional_shape_score"] = shape_score
+                return vlm_result
 
             # 融合判定规则
             if shape_score >= 0.8:

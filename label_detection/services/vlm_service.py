@@ -53,6 +53,7 @@ class VLMComparator:
 - 轻微模糊
 - 亮度或颜色变化
 - 小于15%的缩放差异
+- 条形码、二维码、条码下方数字或纯编码区域
 
 重点检查：
 1. 图标数量是否一致
@@ -67,8 +68,9 @@ class VLMComparator:
    - "confidence": 0.0 到 1.0 的数字
    - "differences": 字符串数组
    - "summary": 字符串
-4. 如果无法可靠判断，必须输出 "decision": "unknown"，不要猜测。
-5. 当 decision 为 "match" 时，differences 必须是空数组 []。
+4. 如果区域主体是条形码、二维码、条码数字或纯编码，直接输出 "decision":"match"，并将 "summary" 固定为 "barcode_ignored"。
+5. 如果无法可靠判断，必须输出 "decision": "unknown"，不要猜测。
+6. 当 decision 为 "match" 时，differences 必须是空数组 []。
 
 仅输出如下格式的 JSON：
 {"decision":"match|mismatch|unknown","confidence":0.0,"differences":[],"summary":"..."}"""
