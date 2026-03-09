@@ -668,7 +668,7 @@ def preprocess_template_image(template_path: str, output_dir: str = "results/lay
     预处理模板图片：检测黑框，去除黑框外白边，裁剪到黑框内部
     """
     cv2 = _require_cv2()
-    from label_detection.preprocessing import crop_to_border, find_black_border
+    from label_detection.preprocessing import crop_to_border, find_template_crop_rect
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -680,13 +680,18 @@ def preprocess_template_image(template_path: str, output_dir: str = "results/lay
 
     print(f"  原始尺寸: {template.shape}")
 
-    border = find_black_border(template, output_dir, "template")
+    crop_candidate = find_template_crop_rect(template, output_dir, "template")
 
-    if border is None:
-        print("  未检测到明确的黑框，使用原图")
+    if crop_candidate is None:
+        print("  未找到可靠的模板裁剪区域，使用原图")
         cropped = template
     else:
-        cropped = crop_to_border(template, border, padding=3)
+        padding = 3 if crop_candidate["strategy"] == "border" else -6
+        cropped = crop_to_border(template, crop_candidate["rect"], padding=padding)
+        print(
+            "  使用模板裁剪策略: "
+            f"{crop_candidate['strategy']} -> {crop_candidate['rect']}"
+        )
         print(f"  裁剪后尺寸: {cropped.shape}")
 
     output_path = os.path.join(output_dir, "template_preprocessed.jpg")

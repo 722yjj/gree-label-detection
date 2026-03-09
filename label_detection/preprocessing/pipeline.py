@@ -7,10 +7,9 @@ STATUS: main
 """
 
 import cv2
-import numpy as np
 import os
 
-from .border import crop_to_border, find_black_border
+from .border import crop_to_border, find_template_crop_rect
 from .perspective import detect_and_correct_perspective
 
 
@@ -35,15 +34,18 @@ def preprocess_template(template_path, output_dir="results/preprocessed"):
 
     print(f"  原始尺寸: {template.shape}")
 
-    # 检测黑框
-    border = find_black_border(template, output_dir, "template")
+    crop_candidate = find_template_crop_rect(template, output_dir, "template")
 
-    if border is None:
-        print("  未检测到明确的黑框，使用原图")
+    if crop_candidate is None:
+        print("  未找到可靠的模板裁剪区域，使用原图")
         return template, None, None
 
-    # 裁剪
-    cropped = crop_to_border(template, border, padding=3)
+    padding = 3 if crop_candidate["strategy"] == "border" else -6
+    cropped = crop_to_border(template, crop_candidate["rect"], padding=padding)
+    print(
+        "  使用模板裁剪策略: "
+        f"{crop_candidate['strategy']} -> {crop_candidate['rect']}"
+    )
     print(f"  裁剪后尺寸: {cropped.shape}")
 
     # 保存预处理结果
@@ -51,7 +53,7 @@ def preprocess_template(template_path, output_dir="results/preprocessed"):
     cv2.imwrite(output_path, cropped)
     print(f"  已保存: {output_path}")
 
-    return cropped, border, None
+    return cropped, crop_candidate["rect"], None
 
 
 def preprocess_target(target_path, output_dir="results/preprocessed", template_image=None):

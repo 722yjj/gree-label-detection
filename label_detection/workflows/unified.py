@@ -33,7 +33,7 @@ from label_detection.matching.layout import (
 )
 from label_detection.matching.ocr import find_matching_ocr_boxes
 from label_detection.schema import AirConditionerLabel
-from label_detection.preprocessing.border import crop_to_border, find_black_border
+from label_detection.preprocessing.border import crop_to_border, find_template_crop_rect
 from label_detection.preprocessing.pipeline import preprocess_target
 from label_detection.services.ocr_service import get_ocr_with_boxes
 
@@ -86,15 +86,18 @@ def preprocess_template_image(template_path, output_dir=DEFAULT_OUTPUT_DIR):
 
     print(f"  原始尺寸: {template.shape}")
 
-    # 检测黑框
-    border = find_black_border(template, output_dir, "template")
+    crop_candidate = find_template_crop_rect(template, output_dir, "template")
 
-    if border is None:
-        print("  未检测到明确的黑框，使用原图")
+    if crop_candidate is None:
+        print("  未找到可靠的模板裁剪区域，使用原图")
         cropped = template
     else:
-        # 裁剪到黑框内部
-        cropped = crop_to_border(template, border, padding=3)
+        padding = 3 if crop_candidate["strategy"] == "border" else -6
+        cropped = crop_to_border(template, crop_candidate["rect"], padding=padding)
+        print(
+            "  使用模板裁剪策略: "
+            f"{crop_candidate['strategy']} -> {crop_candidate['rect']}"
+        )
         print(f"  裁剪后尺寸: {cropped.shape}")
 
     # 保存预处理结果
