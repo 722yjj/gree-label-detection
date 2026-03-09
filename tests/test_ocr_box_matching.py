@@ -53,3 +53,28 @@ class TestFindMatchingOcrBoxes:
         ]
 
         assert find_matching_ocr_boxes("50Hz", boxes) == []
+
+    def test_matches_labeled_weight_value_in_same_box(self):
+        boxes = [
+            self._make_box("N.W.:14kg"),
+            self._make_box("G.W.:16.5kg"),
+        ]
+
+        assert find_matching_ocr_boxes("14kg", boxes, field_name="net_weight") == [0]
+        assert find_matching_ocr_boxes("16.5kg", boxes, field_name="gross_weight") == [1]
+
+    def test_matches_labeled_refrigerant_value_in_same_box(self):
+        boxes = [
+            self._make_box("Refrigerant:R32"),
+            self._make_box("Color:White"),
+        ]
+
+        assert find_matching_ocr_boxes("R32", boxes, field_name="refrigerant") == [0]
+
+    def test_still_rejects_frequency_embedded_in_other_value_without_label(self):
+        boxes = [
+            self._make_box("220-240V~50Hz"),
+            self._make_box("Rated Voltage 220-240V~"),
+        ]
+
+        assert find_matching_ocr_boxes("50Hz", boxes, field_name="frequency") == []

@@ -515,7 +515,11 @@ def run_unified_detection(pdf_path, target_image_path, output_dir=DEFAULT_OUTPUT
             if not target_val or target_val == "None":
                 continue
 
-            matched_box_indices = find_matching_ocr_boxes(target_val, target_boxes)
+            matched_box_indices = find_matching_ocr_boxes(
+                target_val,
+                target_boxes,
+                field_name=k,
+            )
 
             if matched_box_indices:
                 matched_texts = [target_boxes[b_idx][1] for b_idx in matched_box_indices]

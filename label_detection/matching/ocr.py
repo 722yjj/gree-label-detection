@@ -10,10 +10,27 @@ from __future__ import annotations
 import re
 import unicodedata
 from difflib import SequenceMatcher
-from typing import List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 
 OCRBox = Tuple[object, str, float]
+
+
+FIELD_LABEL_ALIASES: Dict[str, Sequence[str]] = {
+    "net_weight": ("nw", "nw", "netweight"),
+    "gross_weight": ("gw", "gw", "grossweight"),
+    "connection_pipes": ("connectionpipes", "connectionpipe", "pipes"),
+    "refrigerant": ("refrigerant",),
+    "color": ("color",),
+    "barcode": ("serialno", "serialnumber", "barcode"),
+    "model_number": ("model",),
+    "weight": ("weight",),
+    "frequency": ("ratedfrequency", "frequency"),
+    "voltage": ("ratedvoltage", "voltage"),
+    "air_volume": ("airflowvolume", "airvolume"),
+    "cooling_capacity": ("coolingcapacity",),
+    "heating_capacity": ("heatingcapacity",),
+}
 
 
 def normalize_text_for_match(text: object) -> str:
@@ -26,8 +43,61 @@ def normalize_text_for_match(text: object) -> str:
     return re.sub(r"[^0-9a-z]+", "", normalized)
 
 
+def _normalize_raw_text(text: object) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).lower()
+    return re.sub(r"\s+", "", normalized)
+
+
 def _digit_signature(text: str) -> str:
     return re.sub(r"\D+", "", text)
+
+
+def _has_labeled_value(
+    target_value: object,
+    ocr_text: object,
+    field_name: str | None = None,
+) -> bool:
+    """
+    Match values embedded inside a single OCR box with their field label.
+
+    Examples:
+    - `N.W.:14kg`
+    - `Refrigerant:R32`
+    - `Rated Frequency 50Hz`
+
+    This stays conservative by requiring label evidence and by rejecting
+    multi-value concatenations like `220-240V~50Hz` when no field label exists.
+    """
+    target_raw = _normalize_raw_text(target_value)
+    ocr_raw = _normalize_raw_text(ocr_text)
+    if len(target_raw) < 2 or len(ocr_raw) < 2:
+        return False
+
+    idx = ocr_raw.find(target_raw)
+    if idx < 0:
+        return False
+
+    prefix = ocr_raw[:idx]
+    suffix = ocr_raw[idx + len(target_raw) :]
+    label_text = re.sub(r"[^a-z]+", "", prefix)
+    suffix_text = re.sub(r"[^a-z0-9]+", "", suffix)
+    prefix_digits = len(re.findall(r"\d", prefix))
+
+    aliases = FIELD_LABEL_ALIASES.get(field_name or "", ())
+    if aliases and any(alias in label_text for alias in aliases):
+        return suffix_text == ""
+
+    if suffix_text != "":
+        return False
+
+    if idx == 0:
+        return False
+
+    # Generic fallback: allow clear label prefixes with no significant numeric noise.
+    if len(label_text) >= 2 and prefix_digits <= 1:
+        return True
+
+    return False
 
 
 def _match_score(target_value: object, ocr_text: object) -> float:
@@ -72,6 +142,7 @@ def find_matching_ocr_boxes(
     target_value: object,
     ocr_boxes: Sequence[OCRBox],
     min_score: float = 0.88,
+    field_name: str | None = None,
 ) -> List[int]:
     """Find OCR boxes that best correspond to a structured field value."""
     target_norm = normalize_text_for_match(target_value)
@@ -92,6 +163,8 @@ def find_matching_ocr_boxes(
             continue
 
         score = _match_score(target_value, ocr_text)
+        if score < min_score and _has_labeled_value(target_value, ocr_text, field_name):
+            score = 0.9
         if score >= min_score:
             scored_matches.append((idx, score))
 
