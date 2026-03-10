@@ -241,7 +241,7 @@ class VLMObjectDetector:
         return None
 
     def _extract_object_list(self, payload: Dict[str, Any]) -> List[Any]:
-        for key in ("objects", "detections", "results", "items", "boxes"):
+        for key in ("objects", "regions", "detections", "results", "items", "boxes"):
             value = payload.get(key)
             if isinstance(value, list):
                 return value

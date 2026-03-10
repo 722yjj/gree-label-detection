@@ -69,6 +69,50 @@
 
 ---
 
+## 2026-03-10 - 新增直跑式 VLM 布局区域对比脚本
+
+- 背景：
+  用户的真实目标不是做通用单图目标检测 CLI，而是验证“VLM 能否完成当前项目里布局检测模型负责的图形区域检测工作”。因此需要一个把参数、图片路径、提示词都写在代码顶部的直跑脚本，并且最好直接对比 `PP-DocLayoutV3` 的 `image` 区域结果。
+
+- 修改文件：
+  - `scripts/test_vlm_layout_regions.py`
+  - `label_detection/services/vlm_detection.py`
+  - `label_detection/preprocessing/pipeline.py`
+  - `tests/test_vlm_detection.py`
+  - `AGENT_CHANGELOG.md`
+
+- 修改内容：
+  - 新增直跑脚本 `scripts/test_vlm_layout_regions.py`：
+    - 在文件顶部直接配置图片路径、PDF 路径、提示词、IoU 阈值、输出目录等参数。
+    - 复用项目现有模板提取、预处理、布局检测能力。
+    - 在同一张测试图上同时运行 `PP-DocLayoutV3` 和 VLM 区域检测。
+    - 输出布局模型框、VLM 框、叠加图、原始响应和汇总 JSON。
+  - `label_detection/services/vlm_detection.py` 新增对 `regions` 键的兼容，便于 VLM 用更贴近“区域检测”语义的 JSON 输出。
+  - 修复 `label_detection/preprocessing/pipeline.py` 中缺失 `numpy` 导入的问题，避免目标图预处理 fallback 触发时报 `NameError`。
+  - 在 `tests/test_vlm_detection.py` 中补充 `regions` 键解析测试。
+
+- 修改原因：
+  - 让测试脚本直接对齐当前项目的核心问题：VLM 是否有机会替代布局模型做图形区域检测。
+  - 降低运行门槛，避免每次手动传命令行参数。
+  - 让测试输出既能肉眼看，也能通过 IoU 和计数做粗粒度比较。
+
+- 影响范围：
+  - 不改变 unified 主流程行为。
+  - 新增一个偏实验性质的评估脚本，主要用于能力验证和人工分析。
+  - 预处理模块因补充 `numpy` 导入而更稳定。
+
+- 验证情况：
+  - 已完成帮助信息/源码编译级检查。
+  - 已完成 VLM 区域 JSON 解析的内联断言验证。
+  - 尚未在当前命令环境完成真实图像 + 真实 Ollama 模型的端到端运行。
+
+- 风险 / 待验证项：
+  - VLM 对“版面图形区域”的理解可能和 `PP-DocLayoutV3` 的 `image` 标签定义不完全一致，结果存在语义偏差。
+  - IoU 对比只适合做粗比较，不代表真正可替代性结论。
+  - 如果默认 Python 环境仍缺 OpenCV / NumPy / PaddleX，对端到端运行仍有依赖门槛。
+
+---
+
 ## 2026-03-08 - 标签透视预处理链路清理与候选框筛选增强
 
 - 背景：

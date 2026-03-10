@@ -52,6 +52,17 @@ class TestVLMObjectDetectionParsing:
         assert result["objects"][0]["bbox_px"] == [50, 200, 200, 500]
         assert result["objects"][0]["coord_mode"] == "ratio"
 
+    def test_parse_regions_key(self, detector):
+        response = (
+            '{"regions":[{"label":"image","confidence":0.66,'
+            '"bbox_1000":[200,200,400,400]}],"summary":"regions"}'
+        )
+        result = detector._parse_response(response, (500, 500), "image")
+
+        assert result["parse_error"] is False
+        assert len(result["objects"]) == 1
+        assert result["objects"][0]["bbox_px"] == [100, 100, 200, 200]
+
     def test_parse_failure(self, detector):
         result = detector._parse_response("not a json response", (100, 100), "barcode")
 
