@@ -22,6 +22,53 @@
 
 ---
 
+## 2026-03-10 - 新增独立 VLM 目标检测测试脚本
+
+- 背景：
+  当前项目中的 `label_detection/services/vlm_service.py` 主要面向“区域对比”场景，适合比较模板局部图和实拍局部图是否一致，但不适合直接拿单张图测试 VLM 的目标检测能力。为便于单独验证 `qwen3-vl:8b` 在标签图上的框选能力，需要补一个独立的测试入口。
+
+- 修改文件：
+  - `label_detection/services/vlm_detection.py`
+  - `scripts/run_vlm_object_detection.py`
+  - `tests/test_vlm_detection.py`
+  - `AGENT_CHANGELOG.md`
+
+- 修改内容：
+  - 新增 `label_detection/services/vlm_detection.py`：
+    - 封装单图 VLM 目标检测调用。
+    - 复用项目现有 Ollama 配置。
+    - 约束模型输出固定 JSON，并统一解析为像素坐标和 `bbox_1000`。
+    - 兼容 `bbox_1000`、像素坐标、比例坐标等常见输出格式。
+  - 新增 CLI 脚本 `scripts/run_vlm_object_detection.py`：
+    - 支持传入图片路径和目标描述进行单图检测。
+    - 自动保存标注图、JSON 结果，以及可选的原始模型响应。
+    - 支持自定义模型、API 地址、超时、最大目标数和可视化置信度阈值。
+  - 新增解析单测 `tests/test_vlm_detection.py`，覆盖：
+    - `bbox_1000` 输出解析
+    - Markdown 代码块 JSON 解析
+    - 比例坐标转换
+    - 非 JSON 输出失败兜底
+
+- 修改原因：
+  - 给项目补一个“单独测 VLM 检测能力”的最小可用入口，避免每次都借整条 unified 流程间接验证。
+  - 把检测脚本和解析逻辑拆开，既方便手动调试，也方便后续继续演进成正式能力。
+
+- 影响范围：
+  - 不影响现有 unified 检测主流程。
+  - 新增一个独立脚本入口，可用于人工验证 VLM 的框选能力和输出稳定性。
+
+- 验证情况：
+  - 计划通过 `tests/test_vlm_detection.py` 做解析单测。
+  - 计划通过 `python scripts/run_vlm_object_detection.py --help` 验证 CLI 可运行。
+  - 尚未完成真实 Ollama 推理验证，仍需在本地模型服务已启动的环境下实测。
+
+- 风险 / 待验证项：
+  - VLM 的目标检测本质仍是提示词驱动输出，框位置和格式稳定性不如专用检测模型。
+  - 当前脚本主要用于能力探索和人工验证，不应直接替代正式检测算法。
+  - 真实效果仍取决于模型版本、提示词和图像内容复杂度。
+
+---
+
 ## 2026-03-08 - 标签透视预处理链路清理与候选框筛选增强
 
 - 背景：
