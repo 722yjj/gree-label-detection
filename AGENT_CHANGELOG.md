@@ -85,8 +85,8 @@
   - 新增直跑脚本 `scripts/test_vlm_layout_regions.py`：
     - 在文件顶部直接配置图片路径、PDF 路径、提示词、IoU 阈值、输出目录等参数。
     - 复用项目现有模板提取、预处理、布局检测能力。
-    - 在同一张测试图上同时运行 `PP-DocLayoutV3` 和 VLM 区域检测。
-    - 输出布局模型框、VLM 框、叠加图、原始响应和汇总 JSON。
+    - 默认对模板图和实拍图分别运行 `PP-DocLayoutV3` 与 VLM 区域检测。
+    - 输出模板图/实拍图各自的布局模型框、VLM 框、叠加图、原始响应和汇总 JSON。
   - `label_detection/services/vlm_detection.py` 新增对 `regions` 键的兼容，便于 VLM 用更贴近“区域检测”语义的 JSON 输出。
   - 修复 `label_detection/preprocessing/pipeline.py` 中缺失 `numpy` 导入的问题，避免目标图预处理 fallback 触发时报 `NameError`。
   - 在 `tests/test_vlm_detection.py` 中补充 `regions` 键解析测试。

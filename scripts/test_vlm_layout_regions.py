@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -23,7 +23,7 @@ from label_detection.services.vlm_detection import VLMObjectDetector
 
 # ==================== 直接在这里改测试参数 ====================
 TEST_NAME = "vlm_vs_layout_image_regions"
-IMAGE_SOURCE = "target"  # 可选: "target" / "template"
+IMAGE_SOURCES = ("template", "target")  # 可选: ("template",) / ("target",) / ("template", "target")
 
 PDF_PATH = REPO_ROOT / "samples" / "pdfs" / "600004075219-01.pdf"
 TARGET_IMAGE_PATH = REPO_ROOT / "samples" / "images" / "produce" / "type1" / "600004075219_1.jpg"
@@ -57,14 +57,16 @@ VLM_REGION_PROMPT = f"""你是版面图形区域检测器。
 """
 
 
-def prepare_test_image(output_dir: Path) -> Tuple[object, Path, Dict[str, object]]:
-    """Prepare the image used by both layout detection and VLM detection."""
+def prepare_test_images(output_dir: Path) -> Dict[str, Dict[str, object]]:
+    """Prepare template/target images used by both layout detection and VLM detection."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    meta: Dict[str, object] = {
-        "image_source": IMAGE_SOURCE,
+    image_payloads: Dict[str, Dict[str, object]] = {}
+    common_meta: Dict[str, object] = {
+        "image_sources": list(IMAGE_SOURCES),
         "use_project_preprocessing": USE_PROJECT_PREPROCESSING,
     }
 
+    template_raw_path = None
     template_image = None
     if PDF_PATH.exists():
         template_asset_dir = output_dir / "template_assets"
@@ -73,7 +75,6 @@ def prepare_test_image(output_dir: Path) -> Tuple[object, Path, Dict[str, object
             target_dpi=300,
             output_dir=str(template_asset_dir),
         )
-        meta["template_raw_path"] = template_raw_path
         if template_raw_path:
             template_preprocess_dir = output_dir / "template_preprocess"
             template_image, _, template_err = preprocess_template(
@@ -84,17 +85,34 @@ def prepare_test_image(output_dir: Path) -> Tuple[object, Path, Dict[str, object
                 print(f"[WARN] 模板预处理失败: {template_err}")
                 template_image = None
 
-    if IMAGE_SOURCE == "template":
-        if not meta.get("template_raw_path"):
+    if "template" in IMAGE_SOURCES:
+        if not template_raw_path:
             raise RuntimeError(f"无法从 PDF 提取模板图: {PDF_PATH}")
-
         if USE_PROJECT_PREPROCESSING and template_image is not None:
             prepared_image = template_image
-            meta["prepared_from"] = "template_preprocess"
+            prepared_from = "template_preprocess"
         else:
-            prepared_image = cv2.imread(str(meta["template_raw_path"]))
-            meta["prepared_from"] = "template_raw_image"
-    elif IMAGE_SOURCE == "target":
+            prepared_image = cv2.imread(str(template_raw_path))
+            prepared_from = "template_raw_image"
+
+        if prepared_image is None:
+            raise RuntimeError("模板测试图片准备失败")
+
+        prepared_path = output_dir / "template_prepared.jpg"
+        cv2.imwrite(str(prepared_path), prepared_image)
+        image_payloads["template"] = {
+            "image": prepared_image,
+            "prepared_path": prepared_path,
+            "meta": {
+                **common_meta,
+                "image_source": "template",
+                "template_raw_path": template_raw_path,
+                "prepared_from": prepared_from,
+                "prepared_image_path": str(prepared_path),
+            },
+        }
+
+    if "target" in IMAGE_SOURCES:
         if USE_PROJECT_PREPROCESSING:
             target_preprocess_dir = output_dir / "target_preprocess"
             prepared_image, _, target_err = preprocess_target(
@@ -104,20 +122,30 @@ def prepare_test_image(output_dir: Path) -> Tuple[object, Path, Dict[str, object
             )
             if target_err:
                 raise RuntimeError(target_err)
-            meta["prepared_from"] = "target_preprocess"
+            prepared_from = "target_preprocess"
         else:
             prepared_image = cv2.imread(str(TARGET_IMAGE_PATH))
-            meta["prepared_from"] = "target_raw_image"
-    else:
-        raise ValueError(f"不支持的 IMAGE_SOURCE: {IMAGE_SOURCE}")
+            prepared_from = "target_raw_image"
 
-    if prepared_image is None:
-        raise RuntimeError("测试图片准备失败")
+        if prepared_image is None:
+            raise RuntimeError("实拍测试图片准备失败")
 
-    prepared_path = output_dir / f"{IMAGE_SOURCE}_prepared.jpg"
-    cv2.imwrite(str(prepared_path), prepared_image)
-    meta["prepared_image_path"] = str(prepared_path)
-    return prepared_image, prepared_path, meta
+        prepared_path = output_dir / "target_prepared.jpg"
+        cv2.imwrite(str(prepared_path), prepared_image)
+        image_payloads["target"] = {
+            "image": prepared_image,
+            "prepared_path": prepared_path,
+            "meta": {
+                **common_meta,
+                "image_source": "target",
+                "target_image_path": str(TARGET_IMAGE_PATH),
+                "template_raw_path": template_raw_path,
+                "prepared_from": prepared_from,
+                "prepared_image_path": str(prepared_path),
+            },
+        }
+
+    return image_payloads
 
 
 def build_vlm_region_dicts(vlm_objects: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
@@ -217,27 +245,27 @@ def save_visualizations(
     }
 
 
-def main() -> int:
-    output_dir = OUTPUT_DIR / TEST_NAME
-    output_dir.mkdir(parents=True, exist_ok=True)
+def run_single_image_test(
+    image_source: str,
+    image_payload: Dict[str, object],
+    output_dir: Path,
+) -> Dict[str, object]:
+    image = image_payload["image"]
+    prepared_path = image_payload["prepared_path"]
+    image_meta = image_payload["meta"]
 
+    print("\n" + "=" * 60)
+    print(f"[{image_source}] 测试开始")
     print("=" * 60)
-    print("测试目标: VLM 是否能替代布局检测模型找出图形区域")
-    print("=" * 60)
-    print(f"TEST_NAME: {TEST_NAME}")
-    print(f"IMAGE_SOURCE: {IMAGE_SOURCE}")
-    print(f"OUTPUT_DIR: {output_dir}")
+    print(f"  prepared image: {prepared_path}")
 
-    image, prepared_path, image_meta = prepare_test_image(output_dir)
-    print(f"\n[1] 测试图片已准备: {prepared_path}")
-
-    print("\n[2] 运行 PP-DocLayoutV3 获取基线图形区域...")
+    print(f"\n[{image_source}] 运行 PP-DocLayoutV3 获取基线图形区域...")
     layout_all_regions = detect_layout_regions(str(prepared_path), threshold=LAYOUT_THRESHOLD)
     layout_regions = extract_regions_by_type(layout_all_regions, REGION_TYPE)
-    print(f"  - 布局模型总区域数: {len(layout_all_regions)}")
-    print(f"  - {REGION_TYPE} 区域数: {len(layout_regions)}")
+    print(f"  - [{image_source}] 布局模型总区域数: {len(layout_all_regions)}")
+    print(f"  - [{image_source}] {REGION_TYPE} 区域数: {len(layout_regions)}")
 
-    print("\n[3] 运行 VLM 检测图形区域...")
+    print(f"\n[{image_source}] 运行 VLM 检测图形区域...")
     detector = VLMObjectDetector(
         model_name=VLM_MODEL,
         api_base=VLM_API_BASE,
@@ -250,23 +278,23 @@ def main() -> int:
         custom_prompt=VLM_REGION_PROMPT,
     )
     vlm_regions = build_vlm_region_dicts(vlm_result.get("objects", []))
-    print(f"  - VLM 返回区域数: {len(vlm_regions)}")
-    print(f"  - VLM 摘要: {vlm_result.get('summary', '')}")
-    print(f"  - 解析错误: {vlm_result.get('parse_error', False)}")
+    print(f"  - [{image_source}] VLM 返回区域数: {len(vlm_regions)}")
+    print(f"  - [{image_source}] VLM 摘要: {vlm_result.get('summary', '')}")
+    print(f"  - [{image_source}] 解析错误: {vlm_result.get('parse_error', False)}")
 
-    print("\n[4] 对比布局模型区域和 VLM 区域...")
+    print(f"\n[{image_source}] 对比布局模型区域和 VLM 区域...")
     comparison = compare_region_sets(
         layout_regions=layout_regions,
         vlm_regions=vlm_regions,
         iou_threshold=IOU_MATCH_THRESHOLD,
     )
-    print(f"  - 匹配成功: {comparison['matched_count']}")
-    print(f"  - layout recall: {comparison['recall_vs_layout']:.4f}")
-    print(f"  - vlm precision: {comparison['precision_vs_layout']:.4f}")
-    print(f"  - 未匹配 layout 区域: {comparison['unmatched_layout']}")
-    print(f"  - 未匹配 vlm 区域: {comparison['unmatched_vlm']}")
+    print(f"  - [{image_source}] 匹配成功: {comparison['matched_count']}")
+    print(f"  - [{image_source}] layout recall: {comparison['recall_vs_layout']:.4f}")
+    print(f"  - [{image_source}] vlm precision: {comparison['precision_vs_layout']:.4f}")
+    print(f"  - [{image_source}] 未匹配 layout 区域: {comparison['unmatched_layout']}")
+    print(f"  - [{image_source}] 未匹配 vlm 区域: {comparison['unmatched_vlm']}")
 
-    print("\n[5] 保存可视化结果...")
+    print(f"\n[{image_source}] 保存可视化结果...")
     vis_paths = save_visualizations(image, layout_regions, vlm_regions, output_dir)
     for key, value in vis_paths.items():
         print(f"  - {key}: {value}")
@@ -276,7 +304,7 @@ def main() -> int:
 
     summary = {
         "test_name": TEST_NAME,
-        "image_source": IMAGE_SOURCE,
+        "image_source": image_source,
         "prepared_image_path": str(prepared_path),
         "image_meta": image_meta,
         "layout_threshold": LAYOUT_THRESHOLD,
@@ -299,10 +327,56 @@ def main() -> int:
     with open(summary_path, "w", encoding="utf-8") as file_obj:
         json.dump(summary, file_obj, ensure_ascii=False, indent=2)
 
-    print("\n[6] 汇总结果")
+    print(f"\n[{image_source}] 汇总结果")
     print(f"  - summary json: {summary_path}")
     print(f"  - raw response: {raw_response_path}")
     print("  - 可以直接看 overlay 图判断 VLM 框和布局模型框是否接近")
+    summary["summary_path"] = str(summary_path)
+    return summary
+
+
+def main() -> int:
+    output_dir = OUTPUT_DIR / TEST_NAME
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 60)
+    print("测试目标: VLM 是否能替代布局检测模型找出图形区域")
+    print("=" * 60)
+    print(f"TEST_NAME: {TEST_NAME}")
+    print(f"IMAGE_SOURCES: {IMAGE_SOURCES}")
+    print(f"OUTPUT_DIR: {output_dir}")
+
+    image_payloads = prepare_test_images(output_dir)
+    all_results: Dict[str, Dict[str, object]] = {}
+
+    for image_source in IMAGE_SOURCES:
+        if image_source not in image_payloads:
+            print(f"[WARN] 未准备好 {image_source} 测试图片，跳过")
+            continue
+
+        source_output_dir = output_dir / image_source
+        all_results[image_source] = run_single_image_test(
+            image_source=image_source,
+            image_payload=image_payloads[image_source],
+            output_dir=source_output_dir,
+        )
+
+    combined_summary = {
+        "test_name": TEST_NAME,
+        "image_sources": list(IMAGE_SOURCES),
+        "output_dir": str(output_dir),
+        "results": all_results,
+    }
+    combined_summary_path = output_dir / "all_results_summary.json"
+    with open(combined_summary_path, "w", encoding="utf-8") as file_obj:
+        json.dump(combined_summary, file_obj, ensure_ascii=False, indent=2)
+
+    print("\n" + "=" * 60)
+    print("全部测试完成")
+    print("=" * 60)
+    print(f"combined summary: {combined_summary_path}")
+    for image_source, result in all_results.items():
+        print(f"  - {image_source}: {result.get('summary_path', '')}")
     return 0
 
 
