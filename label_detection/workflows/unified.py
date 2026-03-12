@@ -25,7 +25,7 @@ from label_detection.core.config import (
     DEFAULT_TARGET_PATH,
     USE_VLM_FOR_GRAPHIC,
 )
-from label_detection.extraction.pdf import extract_red_box_info
+from label_detection.extraction.template_source import resolve_template_input
 from label_detection.extraction.text import (
     count_populated_fields,
     extract_compact_spec_from_text,
@@ -503,12 +503,16 @@ def _recover_unmatched_regions(
     }
 
 
-def run_unified_detection(pdf_path, target_image_path, output_dir=DEFAULT_OUTPUT_DIR):
+def run_unified_detection(
+    template_input_path,
+    target_image_path,
+    output_dir=DEFAULT_OUTPUT_DIR,
+):
     """
     完整的整合检测流程（使用 VLM 进行图形对比）
 
     Args:
-        pdf_path: 模板 PDF 文件路径
+        template_input_path: 模板文件路径（支持 PDF 或图片）
         target_image_path: 实拍图片路径
         output_dir: 输出目录
 
@@ -532,15 +536,18 @@ def run_unified_detection(pdf_path, target_image_path, output_dir=DEFAULT_OUTPUT
     print("Step 1: 预处理")
     print("=" * 40)
 
-    # 1.1 从 PDF 提取模板图片
-    print("\n[1.1] 从 PDF 提取模板图片...")
-    template_raw_path = extract_red_box_info(
-        pdf_path,
-        target_dpi=300,
+    # 1.1 解析模板输入
+    print("\n[1.1] 解析模板输入...")
+    template_raw_path, template_source_type, err = resolve_template_input(
+        template_input_path,
         output_dir=os.path.join(output_dir, "template_assets"),
     )
-    if not template_raw_path:
-        return {"success": False, "error": "无法从 PDF 提取模板图片"}
+    if err:
+        return {"success": False, "error": err}
+    if template_source_type == "pdf":
+        print("  模板来源: PDF，已提取红框区域")
+    else:
+        print("  模板来源: 图片，直接使用原图")
 
     # 1.2 预处理模板（检测黑框，去除白边）
     print("\n[1.2] 预处理模板图片（去除黑框外白边）...")
@@ -772,6 +779,11 @@ def run_unified_detection(pdf_path, target_image_path, output_dir=DEFAULT_OUTPUT
         "comparison_results": comparison_results,
         "region_type": "image"
     }
+    results["template_input"] = {
+        "source_path": template_input_path,
+        "source_type": template_source_type,
+        "resolved_image_path": template_raw_path,
+    }
 
     # ========== Step 4: 结果可视化 (差异标注) ==========
     print("\n" + "=" * 40)
@@ -978,7 +990,13 @@ def run_unified_detection(pdf_path, target_image_path, output_dir=DEFAULT_OUTPUT
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(description="整合检测脚本 (VLM 模式)")
-    parser.add_argument("--pdf", default=DEFAULT_PDF_PATH, help="模板 PDF 路径")
+    parser.add_argument(
+        "--template",
+        "--pdf",
+        dest="template",
+        default=DEFAULT_PDF_PATH,
+        help="模板文件路径，支持 PDF 或图片",
+    )
     parser.add_argument("--target", default=DEFAULT_TARGET_PATH, help="实拍图片路径")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="结果输出目录")
     return parser
@@ -988,7 +1006,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
     print("运行模式: VLM")
-    result = run_unified_detection(args.pdf, args.target, output_dir=args.output_dir)
+    result = run_unified_detection(
+        args.template,
+        args.target,
+        output_dir=args.output_dir,
+    )
     if not result.get("success"):
         print(f"检测失败: {result.get('error', '未知错误')}")
         return 1

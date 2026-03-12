@@ -1,13 +1,13 @@
 # 格力标签检测系统
 
-基于 OCR + VLM 的空调标签差异检测工具，用于对比模板 PDF 与实拍标签图片在文字和图形上的差异。
+基于 OCR + VLM 的空调标签差异检测工具，用于对比模板文件与实拍标签图片在文字和图形上的差异。模板文件支持 PDF 和图片输入。
 
 ## 项目入口
 
 当前根入口文件为 `main.py`：
 
 ```bash
-python main.py --pdf samples/pdfs/600004075219-01.pdf --target samples/images/produce/type1/600004075219_1.jpg
+python main.py --template samples/pdfs/600004075219-01.pdf --target samples/images/produce/type1/600004075219_1.jpg
 ```
 
 实际主流程位于 `label_detection/workflows/unified.py`，`main.py` 只是根目录 CLI 包装器。
@@ -15,7 +15,7 @@ python main.py --pdf samples/pdfs/600004075219-01.pdf --target samples/images/pr
 ## 核心流程
 
 ```text
-模板 PDF + 实拍图
+模板文件(PDF/图片) + 实拍图
   -> 模板提取 / 图像预处理
   -> OCR 文字识别
   -> LLM 结构化提取
@@ -42,7 +42,7 @@ project/
 ├── requirements.txt
 ├── label_detection/              # 业务代码
 │   ├── core/                     # 配置与兼容层
-│   ├── extraction/               # PDF 模板提取
+│   ├── extraction/               # 模板输入解析 / PDF 提取
 │   ├── matching/                 # OCR / 布局 / 图形匹配
 │   ├── models/                   # 数据模型导出
 │   ├── preprocessing/            # 图像预处理
@@ -85,7 +85,8 @@ ollama pull qwen3-vl:8b
 
 `main.py` 支持以下参数：
 
-- `--pdf`：模板 PDF 路径
+- `--template`：模板文件路径，支持 PDF 或图片
+- `--pdf`：`--template` 的兼容别名
 - `--target`：实拍图片路径
 - `--output-dir`：结果输出目录
 
@@ -96,6 +97,7 @@ ollama pull qwen3-vl:8b
 仓库内可直接使用的样例包括：
 
 - 模板 PDF：`samples/pdfs/600004075219-01.pdf`
+- 模板图片：`samples/images/original/type1/1.png`
 - 实拍图片：`samples/images/produce/type1/600004075219_1.jpg`
 - 参考图片与文本：`samples/reference/`
 
