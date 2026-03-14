@@ -35,6 +35,7 @@ llm-results*.xlsx
 .idea/
 *.swp
 *.swo
+tests/.tmp/
 
 # OS
 .DS_Store
