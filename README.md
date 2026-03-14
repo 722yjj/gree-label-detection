@@ -101,6 +101,53 @@ ollama pull qwen3-vl:8b
 - 实拍图片：`samples/images/produce/type1/600004075219_1.jpg`
 - 参考图片与文本：`samples/reference/`
 
+## 批量样本测试
+
+批量测试入口：
+
+```bash
+python scripts/batch_run_samples.py --dry-run --pair-mode all
+```
+
+默认行为：
+
+- 模板目录扫描 `samples/pdfs/`
+- 实拍目录扫描 `samples/images/produce/`
+- 按文件名中的主编码自动配对
+- 名称中的 `-01`、`_1`、`_2` 等后缀会被视为同一编码的不同变体
+- 默认输出目录为 `results/batch_samples/`
+- 每个 case 只保留 `result.json` 和 `visualization_diff.jpg`
+- 批量根目录额外生成 `summary.json`
+
+常用命令：
+
+```bash
+# 只预览将要运行的配对，不真正执行
+python scripts/batch_run_samples.py --dry-run --pair-mode all
+
+# 同一编码下，所有模板变体 × 所有实拍变体，全部运行
+python scripts/batch_run_samples.py --pair-mode all
+
+# 同一编码下，只选一个最优模板变体，再配对全部实拍变体
+python scripts/batch_run_samples.py --pair-mode best-template
+
+# 只运行指定编码的所有组合
+python scripts/batch_run_samples.py --code 600004075219 --pair-mode all
+```
+
+参数说明：
+
+- `--dry-run`：只显示将要运行的 case 列表，不执行检测
+- `--pair-mode all`：同编码下的所有模板变体与所有实拍变体做全组合
+- `--pair-mode best-template`：每个编码只选一个优先模板，适合节省时间和算力
+- `--code 600004075219`：只跑指定编码，适合单独回归某类样本
+
+推荐用法：
+
+1. 先执行 `--dry-run` 确认配对是否符合预期。
+2. 大批量正式跑时优先考虑 `--pair-mode best-template`。
+3. 某个编码需要复查时，再用 `--code <编码> --pair-mode all` 精确重跑。
+
 ## 输出结果
 
 默认输出目录为 `results/unified/`，常见产物包括：
