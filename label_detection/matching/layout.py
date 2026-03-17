@@ -251,6 +251,14 @@ def detect_barcode_region(
         and 0.10 <= texture["dark_column_ratio"] <= 0.85
         and texture["vertical_bias"] >= 1.4
     )
+    ocr_guided_barcode = (
+        has_long_digits
+        and aspect_ratio >= 1.15
+        and height_ratio <= 0.60
+        and texture["transition_density"] >= 0.18
+        and 0.08 <= texture["dark_column_ratio"] <= 0.85
+        and texture["vertical_bias"] >= 1.8
+    )
     strong_texture_barcode = (
         aspect_ratio >= 2.2
         and height_ratio <= 0.38
@@ -262,6 +270,7 @@ def detect_barcode_region(
 
     is_barcode = (
         (has_long_digits and stripe_like and height_ratio <= 0.50)
+        or ocr_guided_barcode
         or (has_barcode_token and stripe_like)
         or strong_texture_barcode
     )
