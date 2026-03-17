@@ -28,6 +28,7 @@ from label_detection.core.config import (
     MATCH_WEIGHT_ASPECT,
     MATCH_WEIGHT_IOU,
     MATCH_COST_THRESHOLD,
+    ENABLE_IMAGE_REGION_SPLIT,
 )
 
 
@@ -297,6 +298,190 @@ def split_barcode_regions(
             comparable.append(region_copy)
 
     return comparable, skipped
+
+
+def _vertical_overlap_ratio(box1: Sequence[float], box2: Sequence[float]) -> float:
+    overlap = min(float(box1[3]), float(box2[3])) - max(float(box1[1]), float(box2[1]))
+    if overlap <= 0:
+        return 0.0
+
+    h1 = max(1.0, float(box1[3]) - float(box1[1]))
+    h2 = max(1.0, float(box2[3]) - float(box2[1]))
+    return float(overlap / min(h1, h2))
+
+
+def _merge_adjacent_local_boxes(
+    boxes: Sequence[Sequence[int]],
+    crop_shape: Tuple[int, int],
+) -> List[List[int]]:
+    """Merge nearby local boxes so one symbol is not fragmented into multiple pieces."""
+    if not boxes:
+        return []
+
+    _, crop_w = crop_shape
+    max_gap = max(4, min(int(round(crop_w * 0.03)), 12))
+
+    merged: List[List[int]] = [list(boxes[0])]
+    for box in boxes[1:]:
+        current = [int(v) for v in box]
+        previous = merged[-1]
+
+        previous_height = max(1, previous[3] - previous[1])
+        current_height = max(1, current[3] - current[1])
+        gap = current[0] - previous[2]
+        height_ratio = min(previous_height, current_height) / max(previous_height, current_height)
+        overlap_ratio = _vertical_overlap_ratio(previous, current)
+
+        if gap <= max_gap and overlap_ratio >= 0.55 and height_ratio >= 0.55:
+            merged[-1] = [
+                min(previous[0], current[0]),
+                min(previous[1], current[1]),
+                max(previous[2], current[2]),
+                max(previous[3], current[3]),
+            ]
+        else:
+            merged.append(current)
+
+    return merged
+
+
+def _extract_split_candidate_boxes(crop: np.ndarray) -> List[List[int]]:
+    """Extract multiple icon-like groups inside one layout image region."""
+    if crop.size == 0:
+        return []
+
+    cv2 = _require_cv2()
+
+    if crop.ndim == 3:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = crop.copy()
+
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    noise_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, noise_kernel)
+
+    connect_w = max(5, min(int(round(crop.shape[1] * 0.04)), 15))
+    connect_h = max(3, min(int(round(crop.shape[0] * 0.04)), 7))
+    connect_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (connect_w, connect_h))
+    grouped = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, connect_kernel)
+
+    contours, _ = cv2.findContours(grouped, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    crop_area = float(crop.shape[0] * crop.shape[1])
+    min_box_area = max(40.0, crop_area * 0.008)
+    min_width = max(10, int(round(crop.shape[1] * 0.04)))
+    min_height = max(12, int(round(crop.shape[0] * 0.20)))
+
+    boxes: List[List[int]] = []
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        box_area = float(w * h)
+        if box_area < min_box_area:
+            continue
+        if w < min_width or h < min_height:
+            continue
+
+        fill_ratio = float((binary[y : y + h, x : x + w] > 0).mean())
+        if fill_ratio < 0.08:
+            continue
+
+        boxes.append([int(x), int(y), int(x + w), int(y + h)])
+
+    boxes.sort(key=lambda box: (box[0], box[1]))
+    boxes = _merge_adjacent_local_boxes(boxes, crop.shape[:2])
+
+    meaningful_boxes: List[List[int]] = []
+    for box in boxes:
+        width = max(1, box[2] - box[0])
+        height = max(1, box[3] - box[1])
+        area_ratio = (width * height) / max(1.0, crop_area)
+        height_ratio = height / max(1.0, crop.shape[0])
+        width_ratio = width / max(1.0, crop.shape[1])
+        if area_ratio < 0.03 and not (height_ratio >= 0.45 and width_ratio >= 0.08):
+            continue
+        meaningful_boxes.append(box)
+
+    if len(meaningful_boxes) < 2 or len(meaningful_boxes) > 6:
+        return []
+
+    return meaningful_boxes
+
+
+def split_composite_image_regions(
+    regions: Sequence[Dict],
+    image: np.ndarray,
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Split one large image region into multiple icon regions when clear sub-groups exist.
+
+    PP-DocLayoutV3 is good at finding image blocks, but it often merges an entire row
+    of certification icons into a single `image` region. This post-process keeps the
+    existing detector and only refines obviously composite regions.
+    """
+    refined: List[Dict] = []
+    split_parents: List[Dict] = []
+    img_h, img_w = image.shape[:2]
+
+    for idx, region in enumerate(regions):
+        region_copy = dict(region)
+        region_copy.setdefault("original_idx", idx)
+
+        x1, y1, x2, y2 = [int(v) for v in region_copy["coordinate"]]
+        x1 = max(0, min(x1, img_w))
+        x2 = max(0, min(x2, img_w))
+        y1 = max(0, min(y1, img_h))
+        y2 = max(0, min(y2, img_h))
+        crop = image[y1:y2, x1:x2]
+
+        local_boxes = _extract_split_candidate_boxes(crop)
+        if len(local_boxes) < 2:
+            refined.append(region_copy)
+            continue
+
+        child_regions: List[Dict] = []
+        for child_idx, local_box in enumerate(local_boxes):
+            local_width = max(1, local_box[2] - local_box[0])
+            local_height = max(1, local_box[3] - local_box[1])
+            pad_x = max(2, int(round(local_width * 0.06)))
+            pad_y = max(2, int(round(local_height * 0.06)))
+            child_box = clip_box_to_image(
+                [
+                    x1 + local_box[0] - pad_x,
+                    y1 + local_box[1] - pad_y,
+                    x1 + local_box[2] + pad_x,
+                    y1 + local_box[3] + pad_y,
+                ],
+                image.shape[:2],
+                min_size=8,
+            )
+            if child_box is None:
+                continue
+
+            child_region = dict(region_copy)
+            child_region["coordinate"] = child_box
+            child_region["split_parent_coordinate"] = list(region_copy["coordinate"])
+            child_region["split_child_idx"] = child_idx
+            child_regions.append(child_region)
+
+        if len(child_regions) < 2:
+            refined.append(region_copy)
+            continue
+
+        split_child_count = len(child_regions)
+        for child_region in child_regions:
+            child_region["split_child_count"] = split_child_count
+
+        split_parents.append(
+            {
+                **region_copy,
+                "split_children": [list(item["coordinate"]) for item in child_regions],
+            }
+        )
+        refined.extend(child_regions)
+
+    return refined, split_parents
 
 
 def calculate_iou(box1: List[float], box2: List[float]) -> float:
@@ -1159,6 +1344,8 @@ def run_layout_comparison(
 
     skipped_template_regions: List[Dict] = []
     skipped_target_regions: List[Dict] = []
+    split_template_regions: List[Dict] = []
+    split_target_regions: List[Dict] = []
     if region_type == "image":
         _, template_boxes = get_ocr_with_boxes(template_path)
         _, target_boxes = get_ocr_with_boxes(target_preprocessed_path)
@@ -1172,11 +1359,26 @@ def run_layout_comparison(
             target_cropped,
             target_boxes,
         )
+        if ENABLE_IMAGE_REGION_SPLIT:
+            template_regions, split_template_regions = split_composite_image_regions(
+                template_regions,
+                template_cropped,
+            )
+            target_regions, split_target_regions = split_composite_image_regions(
+                target_regions,
+                target_cropped,
+            )
         print(
             "  条码过滤后: "
             f"模板保留 {len(template_regions)} / 跳过 {len(skipped_template_regions)}, "
             f"实拍保留 {len(target_regions)} / 跳过 {len(skipped_target_regions)}"
         )
+        if ENABLE_IMAGE_REGION_SPLIT:
+            print(
+                "  图形拆分后: "
+                f"模板拆分 {len(split_template_regions)} 个大框, "
+                f"实拍拆分 {len(split_target_regions)} 个大框"
+            )
 
     results["template_regions"] = template_regions
     results["target_regions"] = target_regions
@@ -1184,6 +1386,8 @@ def run_layout_comparison(
     results["target_regions_total_count"] = len(extract_regions_by_type(target_all_regions, region_type))
     results["skipped_template_regions"] = skipped_template_regions
     results["skipped_target_regions"] = skipped_target_regions
+    results["split_template_regions"] = split_template_regions
+    results["split_target_regions"] = split_target_regions
     
     # 保存检测可视化
     template_vis = draw_regions(template_cropped, template_regions, (0, 255, 0))

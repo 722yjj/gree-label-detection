@@ -24,6 +24,7 @@ from label_detection.core.config import (
     DEFAULT_PDF_PATH,
     DEFAULT_TARGET_PATH,
     USE_VLM_FOR_GRAPHIC,
+    ENABLE_IMAGE_REGION_SPLIT,
 )
 from label_detection.extraction.template_source import resolve_template_input
 from label_detection.extraction.text import (
@@ -41,6 +42,7 @@ from label_detection.matching.layout import (
     compare_region_pair,
     draw_regions,
     split_barcode_regions,
+    split_composite_image_regions,
     infer_corresponding_region,
     estimate_region_foreground_ratio,
 )
@@ -640,6 +642,8 @@ def run_unified_detection(
 
     skipped_template_regions: List[Dict] = []
     skipped_target_regions: List[Dict] = []
+    split_template_regions: List[Dict] = []
+    split_target_regions: List[Dict] = []
     template_regions, skipped_template_regions = split_barcode_regions(
         template_regions,
         template_cropped,
@@ -650,6 +654,15 @@ def run_unified_detection(
         target_cropped,
         target_boxes,
     )
+    if ENABLE_IMAGE_REGION_SPLIT:
+        template_regions, split_template_regions = split_composite_image_regions(
+            template_regions,
+            template_cropped,
+        )
+        target_regions, split_target_regions = split_composite_image_regions(
+            target_regions,
+            target_cropped,
+        )
 
     print(
         "  - 模板图片区域: "
@@ -661,6 +674,12 @@ def run_unified_detection(
         f"{len(target_regions)} 个可比对 / {len(skipped_target_regions)} 个条码跳过 "
         f"(总检测 {len(target_all_regions)})"
     )
+    if ENABLE_IMAGE_REGION_SPLIT:
+        print(
+            "  - 图片区域二次拆分: "
+            f"模板拆分 {len(split_template_regions)} 个大框, "
+            f"实拍拆分 {len(split_target_regions)} 个大框"
+        )
 
     # 3.2 区域匹配
     print("\n[3.2] 匹配对应区域...")
@@ -769,6 +788,8 @@ def run_unified_detection(
         "target_regions_count": len(target_regions),
         "skipped_template_regions": skipped_template_regions,
         "skipped_target_regions": skipped_target_regions,
+        "split_template_regions": split_template_regions,
+        "split_target_regions": split_target_regions,
         "recovered_template_regions": recovered_template_regions,
         "recovered_target_regions": recovered_target_regions,
         "remaining_unmatched_template": remaining_unmatched1,

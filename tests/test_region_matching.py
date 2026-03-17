@@ -18,6 +18,7 @@ from label_detection.matching.layout import (
     match_regions,
     _compute_match_cost,
     split_barcode_regions,
+    split_composite_image_regions,
     infer_corresponding_region,
 )
 
@@ -286,3 +287,39 @@ class TestBarcodeRegionFilter:
         comparable, skipped = split_barcode_regions([region], img, ocr_boxes)
         assert len(comparable) == 1
         assert skipped == []
+
+
+class TestCompositeImageRegionSplit:
+    def _make_region(self, x1, y1, x2, y2):
+        return {"coordinate": [x1, y1, x2, y2], "label": "image", "score": 0.9}
+
+    def test_splits_wide_region_into_multiple_icon_groups(self):
+        img = np.full((220, 360, 3), 255, dtype=np.uint8)
+
+        # 左侧一个图标组：两个相邻块应被合并成一个子区域。
+        img[60:170, 30:70] = 0
+        img[60:170, 76:116] = 0
+
+        # 右侧另一个图标组：与左组距离明显更大，应拆成第二个子区域。
+        img[55:175, 190:255] = 0
+
+        region = self._make_region(20, 40, 270, 190)
+        refined, split_parents = split_composite_image_regions([region], img)
+
+        assert len(split_parents) == 1
+        assert len(refined) == 2
+        assert all(item["split_child_count"] == 2 for item in refined)
+        assert refined[0]["coordinate"][2] < refined[1]["coordinate"][0]
+        assert refined[0]["split_parent_coordinate"] == region["coordinate"]
+        assert refined[1]["split_parent_coordinate"] == region["coordinate"]
+
+    def test_keeps_single_graphic_region_when_no_clear_split_exists(self):
+        img = np.full((220, 320, 3), 255, dtype=np.uint8)
+        img[70:160, 40:250] = 0
+
+        region = self._make_region(30, 60, 260, 170)
+        refined, split_parents = split_composite_image_regions([region], img)
+
+        assert len(refined) == 1
+        assert refined[0]["coordinate"] == region["coordinate"]
+        assert split_parents == []
