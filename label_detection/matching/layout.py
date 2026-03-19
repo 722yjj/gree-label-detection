@@ -451,7 +451,8 @@ def _extract_split_candidate_boxes(crop: np.ndarray) -> List[List[int]]:
     crop_area = float(crop.shape[0] * crop.shape[1])
     min_box_area = max(40.0, crop_area * 0.008)
     min_width = max(10, int(round(crop.shape[1] * 0.04)))
-    min_height = max(12, int(round(crop.shape[0] * 0.20)))
+    min_height = max(10, int(round(crop.shape[0] * 0.12)))
+    min_horizontal_bar_width = max(20, int(round(crop.shape[1] * 0.12)))
 
     boxes: List[List[int]] = []
     for contour in contours:
@@ -459,7 +460,9 @@ def _extract_split_candidate_boxes(crop: np.ndarray) -> List[List[int]]:
         box_area = float(w * h)
         if box_area < min_box_area:
             continue
-        if w < min_width or h < min_height:
+        if w < min_width:
+            continue
+        if h < min_height and w < min_horizontal_bar_width:
             continue
 
         fill_ratio = float((binary[y : y + h, x : x + w] > 0).mean())
