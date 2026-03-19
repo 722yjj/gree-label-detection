@@ -658,10 +658,12 @@ def run_unified_detection(
         template_regions, split_template_regions = split_composite_image_regions(
             template_regions,
             template_cropped,
+            template_boxes,
         )
         target_regions, split_target_regions = split_composite_image_regions(
             target_regions,
             target_cropped,
+            target_boxes,
         )
 
     print(

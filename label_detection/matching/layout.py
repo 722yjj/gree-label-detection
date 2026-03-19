@@ -259,6 +259,14 @@ def detect_barcode_region(
         and 0.08 <= texture["dark_column_ratio"] <= 0.85
         and texture["vertical_bias"] >= 1.8
     )
+    texture_only_barcode = (
+        aspect_ratio >= 1.6
+        and height_ratio <= 0.55
+        and center_y_ratio >= 0.35
+        and texture["transition_density"] >= 0.22
+        and 0.05 <= texture["dark_column_ratio"] <= 0.80
+        and texture["vertical_bias"] >= 2.6
+    )
     strong_texture_barcode = (
         aspect_ratio >= 2.2
         and height_ratio <= 0.38
@@ -271,6 +279,7 @@ def detect_barcode_region(
     is_barcode = (
         (has_long_digits and stripe_like and height_ratio <= 0.50)
         or ocr_guided_barcode
+        or texture_only_barcode
         or (has_barcode_token and stripe_like)
         or strong_texture_barcode
     )
@@ -319,39 +328,98 @@ def _vertical_overlap_ratio(box1: Sequence[float], box2: Sequence[float]) -> flo
     return float(overlap / min(h1, h2))
 
 
-def _merge_adjacent_local_boxes(
+def _horizontal_overlap_ratio(box1: Sequence[float], box2: Sequence[float]) -> float:
+    overlap = min(float(box1[2]), float(box2[2])) - max(float(box1[0]), float(box2[0]))
+    if overlap <= 0:
+        return 0.0
+
+    w1 = max(1.0, float(box1[2]) - float(box1[0]))
+    w2 = max(1.0, float(box2[2]) - float(box2[0]))
+    return float(overlap / min(w1, w2))
+
+
+def _box_union(box1: Sequence[int], box2: Sequence[int]) -> List[int]:
+    return [
+        int(min(box1[0], box2[0])),
+        int(min(box1[1], box2[1])),
+        int(max(box1[2], box2[2])),
+        int(max(box1[3], box2[3])),
+    ]
+
+
+def _boxes_should_merge(
+    box1: Sequence[int],
+    box2: Sequence[int],
+    crop_shape: Tuple[int, int],
+) -> bool:
+    crop_h, crop_w = crop_shape
+    gap_x = max(0, max(int(box2[0]) - int(box1[2]), int(box1[0]) - int(box2[2])))
+    gap_y = max(0, max(int(box2[1]) - int(box1[3]), int(box1[1]) - int(box2[3])))
+
+    vertical_overlap = _vertical_overlap_ratio(box1, box2)
+    horizontal_overlap = _horizontal_overlap_ratio(box1, box2)
+
+    h1 = max(1, int(box1[3]) - int(box1[1]))
+    h2 = max(1, int(box2[3]) - int(box2[1]))
+    w1 = max(1, int(box1[2]) - int(box1[0]))
+    w2 = max(1, int(box2[2]) - int(box2[0]))
+    height_ratio = min(h1, h2) / max(h1, h2)
+    width_ratio = min(w1, w2) / max(w1, w2)
+
+    same_row_gap = max(4, min(int(round(crop_w * 0.03)), 14))
+    stacked_gap = max(6, min(int(round(crop_h * 0.12)), 18))
+
+    horizontally_related = (
+        gap_x <= same_row_gap
+        and vertical_overlap >= 0.50
+        and height_ratio >= 0.40
+    )
+    vertically_stacked = (
+        gap_y <= stacked_gap
+        and horizontal_overlap >= 0.45
+        and width_ratio >= 0.18
+    )
+    return bool(horizontally_related or vertically_stacked)
+
+
+def _merge_related_local_boxes(
     boxes: Sequence[Sequence[int]],
     crop_shape: Tuple[int, int],
 ) -> List[List[int]]:
-    """Merge nearby local boxes so one symbol is not fragmented into multiple pieces."""
-    if not boxes:
-        return []
+    """Merge nearby fragments so one symbol is not split by thin gaps or lower baselines."""
+    pending = [list(box) for box in boxes]
+    pending.sort(key=lambda box: (box[0], box[1]))
 
-    _, crop_w = crop_shape
-    max_gap = max(4, min(int(round(crop_w * 0.03)), 12))
+    changed = True
+    while changed:
+        changed = False
+        merged: List[List[int]] = []
+        used = [False] * len(pending)
 
-    merged: List[List[int]] = [list(boxes[0])]
-    for box in boxes[1:]:
-        current = [int(v) for v in box]
-        previous = merged[-1]
+        for i, box in enumerate(pending):
+            if used[i]:
+                continue
 
-        previous_height = max(1, previous[3] - previous[1])
-        current_height = max(1, current[3] - current[1])
-        gap = current[0] - previous[2]
-        height_ratio = min(previous_height, current_height) / max(previous_height, current_height)
-        overlap_ratio = _vertical_overlap_ratio(previous, current)
+            current = list(box)
+            used[i] = True
 
-        if gap <= max_gap and overlap_ratio >= 0.55 and height_ratio >= 0.55:
-            merged[-1] = [
-                min(previous[0], current[0]),
-                min(previous[1], current[1]),
-                max(previous[2], current[2]),
-                max(previous[3], current[3]),
-            ]
-        else:
+            merged_this_round = True
+            while merged_this_round:
+                merged_this_round = False
+                for j, candidate in enumerate(pending):
+                    if used[j]:
+                        continue
+                    if _boxes_should_merge(current, candidate, crop_shape):
+                        current = _box_union(current, candidate)
+                        used[j] = True
+                        merged_this_round = True
+                        changed = True
+
             merged.append(current)
 
-    return merged
+        pending = sorted(merged, key=lambda box: (box[0], box[1]))
+
+    return pending
 
 
 def _extract_split_candidate_boxes(crop: np.ndarray) -> List[List[int]]:
@@ -372,10 +440,12 @@ def _extract_split_candidate_boxes(crop: np.ndarray) -> List[List[int]]:
     noise_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, noise_kernel)
 
-    connect_w = max(5, min(int(round(crop.shape[1] * 0.04)), 15))
-    connect_h = max(3, min(int(round(crop.shape[0] * 0.04)), 7))
-    connect_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (connect_w, connect_h))
-    grouped = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, connect_kernel)
+    connect_w = max(5, min(int(round(crop.shape[1] * 0.04)), 17))
+    connect_h = max(3, min(int(round(crop.shape[0] * 0.05)), 9))
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (connect_w, 3))
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, connect_h))
+    grouped = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, horizontal_kernel)
+    grouped = cv2.morphologyEx(grouped, cv2.MORPH_CLOSE, vertical_kernel)
 
     contours, _ = cv2.findContours(grouped, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     crop_area = float(crop.shape[0] * crop.shape[1])
@@ -393,13 +463,13 @@ def _extract_split_candidate_boxes(crop: np.ndarray) -> List[List[int]]:
             continue
 
         fill_ratio = float((binary[y : y + h, x : x + w] > 0).mean())
-        if fill_ratio < 0.08:
+        if fill_ratio < 0.02:
             continue
 
         boxes.append([int(x), int(y), int(x + w), int(y + h)])
 
     boxes.sort(key=lambda box: (box[0], box[1]))
-    boxes = _merge_adjacent_local_boxes(boxes, crop.shape[:2])
+    boxes = _merge_related_local_boxes(boxes, crop.shape[:2])
 
     meaningful_boxes: List[List[int]] = []
     for box in boxes:
@@ -408,7 +478,7 @@ def _extract_split_candidate_boxes(crop: np.ndarray) -> List[List[int]]:
         area_ratio = (width * height) / max(1.0, crop_area)
         height_ratio = height / max(1.0, crop.shape[0])
         width_ratio = width / max(1.0, crop.shape[1])
-        if area_ratio < 0.03 and not (height_ratio >= 0.45 and width_ratio >= 0.08):
+        if area_ratio < 0.018 and not (height_ratio >= 0.35 and width_ratio >= 0.06):
             continue
         meaningful_boxes.append(box)
 
@@ -421,6 +491,7 @@ def _extract_split_candidate_boxes(crop: np.ndarray) -> List[List[int]]:
 def split_composite_image_regions(
     regions: Sequence[Dict],
     image: np.ndarray,
+    ocr_boxes: Sequence[Tuple[object, str, float]] | None = None,
 ) -> Tuple[List[Dict], List[Dict]]:
     """
     Split one large image region into multiple icon regions when clear sub-groups exist.
@@ -436,6 +507,13 @@ def split_composite_image_regions(
     for idx, region in enumerate(regions):
         region_copy = dict(region)
         region_copy.setdefault("original_idx", idx)
+
+        # Defensive guard: even if an upstream caller forgets barcode filtering,
+        # keep strong stripe-texture regions intact instead of splitting them.
+        is_barcode, _ = detect_barcode_region(region_copy, image, ocr_boxes)
+        if is_barcode:
+            refined.append(region_copy)
+            continue
 
         x1, y1, x2, y2 = [int(v) for v in region_copy["coordinate"]]
         x1 = max(0, min(x1, img_w))
@@ -1372,10 +1450,12 @@ def run_layout_comparison(
             template_regions, split_template_regions = split_composite_image_regions(
                 template_regions,
                 template_cropped,
+                template_boxes,
             )
             target_regions, split_target_regions = split_composite_image_regions(
                 target_regions,
                 target_cropped,
+                target_boxes,
             )
         print(
             "  条码过滤后: "

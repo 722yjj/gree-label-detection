@@ -288,6 +288,18 @@ class TestBarcodeRegionFilter:
         assert len(comparable) == 1
         assert skipped == []
 
+    def test_texture_only_barcode_region_is_skipped_without_digits(self):
+        img = np.full((240, 360, 3), 255, dtype=np.uint8)
+        for x in range(150, 300, 8):
+            img[90:180, x : x + 4] = 0
+
+        region = self._make_region(140, 80, 310, 185)
+        comparable, skipped = split_barcode_regions([region], img, None)
+
+        assert comparable == []
+        assert len(skipped) == 1
+        assert skipped[0]["skip_reason"] == "barcode"
+
 
 class TestCompositeImageRegionSplit:
     def _make_region(self, x1, y1, x2, y2):
@@ -312,6 +324,27 @@ class TestCompositeImageRegionSplit:
         assert refined[0]["coordinate"][2] < refined[1]["coordinate"][0]
         assert refined[0]["split_parent_coordinate"] == region["coordinate"]
         assert refined[1]["split_parent_coordinate"] == region["coordinate"]
+
+    def test_merges_stacked_parts_of_same_icon(self):
+        img = np.full((240, 420, 3), 255, dtype=np.uint8)
+
+        # 左侧图标由上下两段组成，应该被合并成一个框。
+        img[60:140, 40:110] = 0
+        img[150:162, 48:102] = 0
+
+        # 右侧第二个图标。
+        img[55:175, 250:320] = 0
+
+        region = self._make_region(20, 40, 340, 190)
+        refined, split_parents = split_composite_image_regions([region], img)
+
+        assert len(split_parents) == 1
+        assert len(refined) == 2
+
+        refined = sorted(refined, key=lambda item: item["coordinate"][0])
+        left_box = refined[0]["coordinate"]
+        assert left_box[1] <= 60
+        assert left_box[3] >= 162
 
     def test_keeps_single_graphic_region_when_no_clear_split_exists(self):
         img = np.full((220, 320, 3), 255, dtype=np.uint8)
