@@ -49,8 +49,8 @@ DEFAULT_OUTPUT_DIR = os.getenv(
 # 是否默认启用 VLM 进行图形比对
 USE_VLM_FOR_GRAPHIC = True
 
-# 是否对版面模型的 image 大区域做二次拆分（将多个并排图标拆成多个子区域）
-ENABLE_IMAGE_REGION_SPLIT = os.getenv("ENABLE_IMAGE_REGION_SPLIT", "1").strip().lower() not in {
+# 是否对版面模型的 image 大区域做二次拆分（默认关闭，按需实验性开启）
+ENABLE_IMAGE_REGION_SPLIT = os.getenv("ENABLE_IMAGE_REGION_SPLIT", "0").strip().lower() not in {
     "0",
     "false",
     "no",
