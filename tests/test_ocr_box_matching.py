@@ -4,7 +4,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from label_detection.matching.ocr import (
+    field_values_match,
     find_matching_ocr_boxes,
+    normalize_text_for_compare,
     normalize_text_for_match,
 )
 
@@ -14,6 +16,26 @@ class TestNormalizeTextForMatch:
         assert normalize_text_for_match("590m³/h") == "590m3h"
         assert normalize_text_for_match(" 2025.12 ") == "202512"
         assert normalize_text_for_match("50HZ") == "50hz"
+
+
+class TestNormalizeTextForCompare:
+    def test_ignores_spacing_noise_but_keeps_significant_punctuation(self):
+        assert (
+            normalize_text_for_compare("GREE ELECTRIC APPLIANCES, INC. OF ZHUHAI")
+            == "gree electric appliances,inc.of zhuhai"
+        )
+        assert normalize_text_for_compare("13.5 kg") == "13.5kg"
+
+
+class TestFieldValuesMatch:
+    def test_treats_punctuation_spacing_difference_as_match(self):
+        assert field_values_match(
+            "GREE ELECTRIC APPLIANCES,INC.OF ZHUHAI",
+            "GREE ELECTRIC APPLIANCES, INC. OF ZHUHAI",
+        )
+
+    def test_keeps_decimal_difference_significant(self):
+        assert not field_values_match("13.5kg", "135kg")
 
 
 class TestFindMatchingOcrBoxes:

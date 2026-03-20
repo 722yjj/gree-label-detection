@@ -46,7 +46,7 @@ from label_detection.matching.layout import (
     infer_corresponding_region,
     estimate_region_foreground_ratio,
 )
-from label_detection.matching.ocr import find_matching_ocr_boxes
+from label_detection.matching.ocr import field_values_match, find_matching_ocr_boxes
 from label_detection.schema import LABEL_KIND_COMPACT, get_label_model, infer_label_kind
 from label_detection.preprocessing.border import crop_to_border, find_template_crop_rect
 from label_detection.preprocessing.pipeline import preprocess_target
@@ -297,14 +297,17 @@ def compare_text_results(data1, data2, output_path=None):
 
     field_names = list(type(data1).model_fields.keys())
     data_dict = {"参数": [], "模板图片": [], "实拍图片": [], "是否一致": []}
+    match_flags: List[bool] = []
 
     for k in field_names:
         v1 = getattr(data1, k)
         v2 = getattr(data2, k)
+        is_match = field_values_match(v1, v2)
         data_dict["参数"].append(k)
         data_dict["模板图片"].append(v1 if v1 else "-")
         data_dict["实拍图片"].append(v2 if v2 else "-")
-        data_dict["是否一致"].append("✓" if v1 == v2 else "✗")
+        data_dict["是否一致"].append("✓" if is_match else "✗")
+        match_flags.append(is_match)
 
     df = pd.DataFrame(data_dict)
 
@@ -319,7 +322,7 @@ def compare_text_results(data1, data2, output_path=None):
             cell2 = worksheet.cell(row=row, column=3)
             cell3 = worksheet.cell(row=row, column=4)
 
-            if cell1.value != cell2.value:
+            if not match_flags[row - 2]:
                 cell1.font = red_font
                 cell2.font = red_font
                 cell3.font = red_font
@@ -905,7 +908,7 @@ def run_unified_detection(
         v1 = getattr(data1, k)
         v2 = getattr(data2, k)
 
-        if v1 != v2:
+        if not field_values_match(v1, v2):
             target_val = str(v2) if v2 else ""
             if not target_val or target_val == "None":
                 continue
@@ -997,7 +1000,7 @@ def run_unified_detection(
     # 文字对比统计
     match_count = sum(
         1 for k in comparison_fields
-        if getattr(data1, k) == getattr(data2, k)
+        if field_values_match(getattr(data1, k), getattr(data2, k))
     )
     total_fields = len(comparison_fields)
 

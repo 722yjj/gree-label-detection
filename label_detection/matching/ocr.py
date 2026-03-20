@@ -43,6 +43,36 @@ def normalize_text_for_match(text: object) -> str:
     return re.sub(r"[^0-9a-z]+", "", normalized)
 
 
+def normalize_text_for_compare(text: object) -> str:
+    """
+    Normalize extracted field values for conservative equality checks.
+
+    This is intentionally less aggressive than `normalize_text_for_match`:
+    punctuation such as decimal points and hyphens remains significant, while
+    whitespace-only formatting noise is ignored.
+    """
+    if text is None:
+        return ""
+
+    normalized = unicodedata.normalize("NFKC", str(text)).strip()
+    if not normalized or normalized.lower() == "none":
+        return ""
+
+    normalized = normalized.replace("³", "3")
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = re.sub(r"\s*([,.:;/~()\-])\s*", r"\1", normalized)
+    normalized = re.sub(r"(?<=\d)\s+(?=\d)", "", normalized)
+    normalized = re.sub(r"(?<=\d)\s+(?=[a-zA-Z])", "", normalized)
+    normalized = re.sub(r"(?<=[a-zA-Z])\s+(?=\d)", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized.casefold()
+
+
+def field_values_match(expected: object, actual: object) -> bool:
+    """Return whether two extracted field values are equivalent."""
+    return normalize_text_for_compare(expected) == normalize_text_for_compare(actual)
+
+
 def _normalize_raw_text(text: object) -> str:
     normalized = unicodedata.normalize("NFKC", str(text or "")).lower()
     return re.sub(r"\s+", "", normalized)
