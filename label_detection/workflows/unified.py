@@ -340,6 +340,58 @@ def _print_graphic_decision(prefix: str, result: Dict) -> None:
         print(f"{prefix}⚠️  需复核 (Conf: {conf}, Source: {source})")
 
 
+def _make_unresolved_recovery_result(
+    source_side: str,
+    source_idx: int,
+    reason: str,
+    inferred_region: Dict | None,
+    foreground_ratio: float | None = None,
+    exc: Exception | None = None,
+) -> Dict:
+    if source_side == "实拍":
+        subject = f"实拍未匹配区域 #{source_idx}"
+        side_hint = "疑似实拍多出图形，或模板侧漏检"
+    else:
+        subject = f"模板未匹配区域 #{source_idx}"
+        side_hint = "疑似实拍缺失图形，或实拍侧漏检"
+
+    if reason == "inference_failed":
+        summary = f"{subject} 无法推理对应区域，{side_hint}"
+        error_type = "recovery_inference_failed"
+    elif reason == "low_foreground":
+        summary = f"{subject} 推理区域前景过少 ({foreground_ratio:.3f})，{side_hint}"
+        error_type = "recovery_low_foreground"
+    else:
+        summary = f"{subject} 恢复对比失败，{side_hint}"
+        if exc is not None:
+            summary = f"{summary} ({exc})"
+        error_type = "recovery_compare_error"
+
+    return {
+        "decision": "unknown",
+        "is_match": False,
+        "confidence": 0.0,
+        "needs_review": True,
+        "error_type": error_type,
+        "differences": [summary],
+        "summary": summary,
+        "judgment_source": "recovery_failed",
+        "recovered": True,
+        "unresolved_unmatched": True,
+        "recovery_source_side": source_side,
+        "recovery_foreground_ratio": foreground_ratio,
+        "template_idx": None,
+        "target_idx": None,
+        "match_distance": None,
+        "inferred_template_box": (
+            inferred_region["coordinate"] if source_side == "实拍" and inferred_region is not None else None
+        ),
+        "inferred_target_box": (
+            inferred_region["coordinate"] if source_side == "模板" and inferred_region is not None else None
+        ),
+    }
+
+
 def _recover_unmatched_regions(
     template_regions: List[Dict],
     target_regions: List[Dict],
@@ -368,14 +420,54 @@ def _recover_unmatched_regions(
         foreground_ratio: float,
     ) -> None:
         nonlocal pair_idx
+
+        def _finalize_result(result: Dict) -> None:
+            result.setdefault("recovered", True)
+            result["recovery_source_side"] = source_side
+            result["recovery_foreground_ratio"] = foreground_ratio
+            result.setdefault("template_idx", None)
+            result.setdefault("target_idx", None)
+            result.setdefault("match_distance", None)
+            result.setdefault("inferred_template_box", None)
+            result.setdefault("inferred_target_box", None)
+
+            if source_side == "实拍":
+                result["target_idx"] = source_idx
+                if inferred_region is not None:
+                    result["inferred_template_box"] = inferred_region["coordinate"]
+            else:
+                result["template_idx"] = source_idx
+                if inferred_region is not None:
+                    result["inferred_target_box"] = inferred_region["coordinate"]
+
+            recovery_results.append(result)
+            _print_graphic_decision("      恢复判定: ", result)
+
         if inferred_region is None:
             print(f"    - {source_side} 未匹配区域 #{source_idx}: 无法推理对应区域")
+            _finalize_result(
+                _make_unresolved_recovery_result(
+                    source_side=source_side,
+                    source_idx=source_idx,
+                    reason="inference_failed",
+                    inferred_region=None,
+                )
+            )
             return
 
         if foreground_ratio < 0.01:
             print(
                 f"    - {source_side} 未匹配区域 #{source_idx}: "
                 f"推理区域前景过少 ({foreground_ratio:.3f})"
+            )
+            _finalize_result(
+                _make_unresolved_recovery_result(
+                    source_side=source_side,
+                    source_idx=source_idx,
+                    reason="low_foreground",
+                    inferred_region=inferred_region,
+                    foreground_ratio=foreground_ratio,
+                )
             )
             return
 
@@ -396,14 +488,20 @@ def _recover_unmatched_regions(
             )
         except Exception as exc:
             print(f"      恢复对比出错: {exc}")
+            _finalize_result(
+                _make_unresolved_recovery_result(
+                    source_side=source_side,
+                    source_idx=source_idx,
+                    reason="compare_error",
+                    inferred_region=inferred_region,
+                    foreground_ratio=foreground_ratio,
+                    exc=exc,
+                )
+            )
             pair_idx += 1
             return
 
-        result["recovered"] = True
-        result["recovery_source_side"] = source_side
-        result["recovery_foreground_ratio"] = foreground_ratio
-        recovery_results.append(result)
-        _print_graphic_decision("      恢复判定: ", result)
+        _finalize_result(result)
         pair_idx += 1
 
         if result.get("decision") == "match" and not result.get("needs_review", False):
@@ -437,7 +535,6 @@ def _recover_unmatched_regions(
         )
         compare_box1 = inferred_template_region["coordinate"] if inferred_template_region else [0, 0, 0, 0]
         compare_box2 = target_region["coordinate"]
-        before_count = len(recovery_results)
         _run_recovery(
             "实拍",
             target_idx,
@@ -447,13 +544,6 @@ def _recover_unmatched_regions(
             compare_box2,
             foreground_ratio,
         )
-        if len(recovery_results) > before_count:
-            recovery_results[-1]["template_idx"] = None
-            recovery_results[-1]["target_idx"] = target_idx
-            recovery_results[-1]["match_distance"] = None
-            recovery_results[-1]["inferred_template_box"] = (
-                inferred_template_region["coordinate"] if inferred_template_region else None
-            )
 
     if unmatched1:
         print("  - 尝试根据模板未匹配区域恢复实拍漏检...")
@@ -478,7 +568,6 @@ def _recover_unmatched_regions(
         )
         compare_box1 = template_region["coordinate"]
         compare_box2 = inferred_target_region["coordinate"] if inferred_target_region else [0, 0, 0, 0]
-        before_count = len(recovery_results)
         _run_recovery(
             "模板",
             template_idx,
@@ -488,13 +577,6 @@ def _recover_unmatched_regions(
             compare_box2,
             foreground_ratio,
         )
-        if len(recovery_results) > before_count:
-            recovery_results[-1]["template_idx"] = template_idx
-            recovery_results[-1]["target_idx"] = None
-            recovery_results[-1]["match_distance"] = None
-            recovery_results[-1]["inferred_target_box"] = (
-                inferred_target_region["coordinate"] if inferred_target_region else None
-            )
 
     return {
         "recovery_results": recovery_results,
@@ -857,6 +939,7 @@ def run_unified_detection(
     # 2. 标注差异的图形区域
     print("  标注差异和需复核的图形区域...")
     needs_review_regions = []
+    unresolved_regions = []
     for res in comparison_results:
         decision = res.get("decision", "unknown")
         target_idx = res.get("target_idx")
@@ -876,6 +959,16 @@ def run_unified_detection(
                 cv2.putText(vis_image, "Diff", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 diff_count += 1
                 print(f"    - 图形差异: 区域 #{target_idx if target_idx is not None else 'recovered'} (确认不匹配)")
+            elif res.get("unresolved_unmatched"):
+                # 未恢复区域：橙框
+                cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 128, 255), 3)
+                cv2.putText(vis_image, "Unmatched", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 128, 255), 2)
+                unresolved_regions.append(res)
+                print(
+                    "    - 图形未恢复: 区域 "
+                    f"#{target_idx if target_idx is not None else 'recovered'} "
+                    f"({res.get('summary', '')})"
+                )
             elif decision == "unknown":
                 # 需复核：黄框
                 cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 200, 255), 3)
@@ -890,7 +983,10 @@ def run_unified_detection(
     # 保存可视化结果
     vis_path = os.path.join(output_dir, "visualization_diff.jpg")
     cv2.imwrite(vis_path, vis_image)
-    print(f"  差异可视化已保存: {vis_path} (差异 {diff_count} 处, 待复核 {len(needs_review_regions)} 处)")
+    print(
+        f"  差异可视化已保存: {vis_path} "
+        f"(差异 {diff_count} 处, 未恢复 {len(unresolved_regions)} 处, 待复核 {len(needs_review_regions)} 处)"
+    )
 
 
     # ========== 输出汇总 ==========
