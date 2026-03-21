@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -67,6 +68,10 @@ TEXTURE_TRANSITION_MIN = 0.08
 TEXTURE_VERTICAL_BIAS_MIN = 1.6
 TEXTURE_GRADIENT_BIAS_MIN = 1.8
 TEXTURE_ROW_TRANSITION_MAX = 0.18
+
+DIFF_REGION_MIN_AREA_RATIO = 0.0015
+DIFF_REGION_CLOSE_KERNEL = 7
+DIFF_REGION_DILATE_KERNEL = 5
 
 
 def prepare_test_images(output_dir: Path) -> Dict[str, Dict[str, object]]:
@@ -519,14 +524,42 @@ def unmatched_area_ratio(boxes: Sequence[Sequence[int]], mask: np.ndarray) -> fl
     return float(sum(box_area(box) for box in boxes) / fg_area)
 
 
+def extract_diff_region_boxes(diff_mask: np.ndarray) -> List[List[int]]:
+    if diff_mask.size == 0:
+        return []
+
+    binary = (diff_mask > 0).astype(np.uint8) * 255
+    close_kernel = np.ones((DIFF_REGION_CLOSE_KERNEL, DIFF_REGION_CLOSE_KERNEL), dtype=np.uint8)
+    dilate_kernel = np.ones((DIFF_REGION_DILATE_KERNEL, DIFF_REGION_DILATE_KERNEL), dtype=np.uint8)
+    merged = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_kernel)
+    merged = cv2.dilate(merged, dilate_kernel, iterations=1)
+
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats((merged > 0).astype(np.uint8), connectivity=8)
+    min_area = diff_mask.shape[0] * diff_mask.shape[1] * DIFF_REGION_MIN_AREA_RATIO
+    boxes: List[List[int]] = []
+
+    for label_idx in range(1, num_labels):
+        x, y, w, h, area = stats[label_idx]
+        if area < min_area:
+            continue
+        if w < 6 or h < 6:
+            continue
+        boxes.append([int(x), int(y), int(x + w), int(y + h)])
+
+    boxes.sort(key=lambda item: (item[0], item[1]))
+    return boxes
+
+
 def suggest_decision(metrics: Dict[str, float]) -> str:
     unmatched_area_ratio_total = float(metrics.get("unmatched_area_ratio_total") or 0.0)
+    diff_region_area_ratio_total = float(metrics.get("diff_region_area_ratio_total") or 0.0)
     if (
         float(metrics.get("foreground_iou") or 0.0) >= MATCH_FOREGROUND_IOU_MIN
         and float(metrics.get("xor_ratio") or 0.0) <= MATCH_XOR_RATIO_MAX
         and float(metrics.get("hu_avg") or 0.0) >= MATCH_HU_MIN
         and int(metrics.get("component_count_diff") or 0) <= MATCH_COMPONENT_DELTA_MAX
         and unmatched_area_ratio_total <= MATCH_UNMATCHED_AREA_RATIO_MAX
+        and diff_region_area_ratio_total <= MATCH_UNMATCHED_AREA_RATIO_MAX
     ):
         return "match"
 
@@ -536,8 +569,11 @@ def suggest_decision(metrics: Dict[str, float]) -> str:
         or float(metrics.get("hu_avg") or 0.0) <= MISMATCH_HU_MAX
         or int(metrics.get("component_count_diff") or 0) >= MISMATCH_COMPONENT_DELTA_MIN
         or unmatched_area_ratio_total >= MISMATCH_UNMATCHED_AREA_RATIO_MIN
+        or diff_region_area_ratio_total >= MISMATCH_UNMATCHED_AREA_RATIO_MIN
         or int(metrics.get("unmatched_template_component_count") or 0) >= 1
         or int(metrics.get("unmatched_target_component_count") or 0) >= 1
+        or int(metrics.get("template_diff_region_count") or 0) >= 1
+        or int(metrics.get("target_diff_region_count") or 0) >= 1
     ):
         return "mismatch"
 
@@ -600,6 +636,12 @@ def compare_one_pair(
 
     template_component_area_ratio = unmatched_area_ratio(unmatched_template_boxes, template_mask)
     target_component_area_ratio = unmatched_area_ratio(unmatched_target_boxes, target_mask)
+    template_only_mask = np.where((template_mask > 0) & (target_mask == 0), 255, 0).astype(np.uint8)
+    target_only_mask = np.where((target_mask > 0) & (template_mask == 0), 255, 0).astype(np.uint8)
+    template_diff_boxes = extract_diff_region_boxes(template_only_mask)
+    target_diff_boxes = extract_diff_region_boxes(target_only_mask)
+    template_diff_area_ratio = unmatched_area_ratio(template_diff_boxes, template_mask)
+    target_diff_area_ratio = unmatched_area_ratio(target_diff_boxes, target_mask)
 
     metrics = {
         "align_success": False,
@@ -624,12 +666,17 @@ def compare_one_pair(
         "unmatched_template_area_ratio": template_component_area_ratio,
         "unmatched_target_area_ratio": target_component_area_ratio,
         "unmatched_area_ratio_total": template_component_area_ratio + target_component_area_ratio,
+        "template_diff_region_count": len(template_diff_boxes),
+        "target_diff_region_count": len(target_diff_boxes),
+        "template_diff_region_area_ratio": template_diff_area_ratio,
+        "target_diff_region_area_ratio": target_diff_area_ratio,
+        "diff_region_area_ratio_total": template_diff_area_ratio + target_diff_area_ratio,
     }
     metrics["suggested_decision"] = suggest_decision(metrics)
 
     diff_overlay = make_diff_overlay(template_mask, target_mask)
-    diff_boxes_overlay = draw_boxes(diff_overlay, unmatched_template_boxes, (0, 0, 255))
-    diff_boxes_overlay = draw_boxes(diff_boxes_overlay, unmatched_target_boxes, (255, 0, 0))
+    diff_boxes_overlay = draw_boxes(diff_overlay, template_diff_boxes, (0, 0, 255))
+    diff_boxes_overlay = draw_boxes(diff_boxes_overlay, target_diff_boxes, (255, 0, 0))
 
     template_boxes_preview = draw_boxes(template_normalized, template_component_boxes, (0, 180, 0))
     template_boxes_preview = draw_boxes(template_boxes_preview, unmatched_template_boxes, (0, 0, 255))
@@ -640,6 +687,8 @@ def compare_one_pair(
     cv2.imwrite(str(pair_output_dir / "target_normalized.jpg"), target_normalized)
     cv2.imwrite(str(pair_output_dir / "template_mask.jpg"), template_mask)
     cv2.imwrite(str(pair_output_dir / "target_normalized_mask.jpg"), target_mask)
+    cv2.imwrite(str(pair_output_dir / "template_only_mask.jpg"), template_only_mask)
+    cv2.imwrite(str(pair_output_dir / "target_only_mask.jpg"), target_only_mask)
     cv2.imwrite(str(pair_output_dir / "template_component_boxes.jpg"), template_boxes_preview)
     cv2.imwrite(str(pair_output_dir / "target_component_boxes.jpg"), target_boxes_preview)
     cv2.imwrite(str(pair_output_dir / "difference_overlay.jpg"), diff_overlay)
@@ -655,6 +704,8 @@ def compare_one_pair(
         "target_component_boxes": target_component_boxes,
         "unmatched_template_boxes": unmatched_template_boxes,
         "unmatched_target_boxes": unmatched_target_boxes,
+        "template_diff_boxes": template_diff_boxes,
+        "target_diff_boxes": target_diff_boxes,
         "component_matches": component_matches,
         "metrics": metrics,
     }
@@ -662,6 +713,8 @@ def compare_one_pair(
 
 def main() -> int:
     output_dir = OUTPUT_DIR / TEST_NAME
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "=" * 60)
@@ -765,7 +818,9 @@ def main() -> int:
                 f"xor={float(metrics.get('xor_ratio', 0.0) or 0.0):.4f} | "
                 f"hu={float(metrics.get('hu_avg', 0.0) or 0.0):.4f} | "
                 f"unmatched_t={int(metrics.get('unmatched_template_component_count', 0) or 0)} | "
-                f"unmatched_s={int(metrics.get('unmatched_target_component_count', 0) or 0)}"
+                f"unmatched_s={int(metrics.get('unmatched_target_component_count', 0) or 0)} | "
+                f"diff_t={int(metrics.get('template_diff_region_count', 0) or 0)} | "
+                f"diff_s={int(metrics.get('target_diff_region_count', 0) or 0)}"
             )
 
     summary = {
@@ -796,6 +851,11 @@ def main() -> int:
             "vertical_bias_min": TEXTURE_VERTICAL_BIAS_MIN,
             "gradient_bias_min": TEXTURE_GRADIENT_BIAS_MIN,
             "row_transition_max": TEXTURE_ROW_TRANSITION_MAX,
+        },
+        "diff_region_thresholds": {
+            "min_area_ratio": DIFF_REGION_MIN_AREA_RATIO,
+            "close_kernel": DIFF_REGION_CLOSE_KERNEL,
+            "dilate_kernel": DIFF_REGION_DILATE_KERNEL,
         },
         "template_regions": template_regions,
         "target_regions": target_regions,

@@ -72,6 +72,8 @@
   - 在实验脚本中新增“重复竖纹纹理”二次过滤，进一步跳过条码/类似条码区域。
   - 移除每对图形区域上的 SIFT 单应性配准，改为“前景裁剪 + 等高缩放 + 补边到底部对齐”的保内容归一化。
   - 在已匹配的大图形区域内部提取连通组件，并输出未匹配组件框，辅助定位多余/缺失图形。
+  - 新增基于 XOR 差分图的差异区域框提取，用于兜底定位细线图标或被碎片化的新增/缺失图形。
+  - 运行前清空该实验脚本的输出目录，避免上一轮残留图片干扰判断。
   - 新增 `template_normalized.jpg`、`target_normalized.jpg`、`template_component_boxes.jpg`、`target_component_boxes.jpg`、`difference_boxes_overlay.jpg` 等调试结果。
   - 在 `comparison_summary.json` 中增加组件差异面积和纹理过滤阈值信息。
 
