@@ -66,10 +66,14 @@ CANDIDATE_MIN_AREA_RATIO = 0.003
 CANDIDATE_MERGE_GAP = 16
 CANDIDATE_CONTEXT_PAD = 20
 MAX_CANDIDATES_PER_PAIR = 5
+REVIEW_MIN_DIFF_PIXELS = 130
+REVIEW_MIN_SIDE_DIFF_PIXELS = 90
+REVIEW_MIN_DOMINANCE_RATIO = 2.2
 
 CANDIDATE_REVIEW_PROMPT = """你是局部图形差异复核器。
 你将看到左右两张局部候选区域图：左边是 Template，右边是 Target。
-它们来自同一图形区域中的同一位置，只需要判断这个局部是否存在真实图形差异。
+它们来自同一图形区域中的同一位置，红色框标出了待复核候选区域，框外内容只作为上下文。
+你只需要判断红色框对应位置是否存在真实图形差异。
 
 忽略以下情况，不要判为差异：
 - 轻微模糊
@@ -80,9 +84,9 @@ CANDIDATE_REVIEW_PROMPT = """你是局部图形差异复核器。
 - 小于15%的缩放差异
 
 重点检查：
-1. Target 是否多出图形/符号
-2. Target 是否缺少图形/符号
-3. 主体图形是否被替换成不同图形
+1. 红框内 Target 是否多出图形/符号
+2. 红框内 Target 是否缺少图形/符号
+3. 红框内主体图形是否被替换成不同图形
 
 输出规则（必须严格遵守）：
 1. 只输出一个 JSON 对象，不要输出任何其他文本。
@@ -409,6 +413,13 @@ def draw_indexed_boxes(image: np.ndarray, candidates: Sequence[Dict[str, object]
     return canvas
 
 
+def draw_single_box(image: np.ndarray, box: Sequence[int], color: Tuple[int, int, int]) -> np.ndarray:
+    canvas = image.copy()
+    x1, y1, x2, y2 = [int(v) for v in box]
+    cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
+    return canvas
+
+
 def extract_candidate_boxes(
     template_only_mask: np.ndarray,
     target_only_mask: np.ndarray,
@@ -459,6 +470,44 @@ def extract_candidate_boxes(
     return candidates[:MAX_CANDIDATES_PER_PAIR]
 
 
+def should_review_candidate(candidate: Dict[str, object]) -> Tuple[bool, Dict[str, float | str]]:
+    template_pixels = int(candidate["template_diff_pixels"])
+    target_pixels = int(candidate["target_diff_pixels"])
+    diff_pixels = int(candidate["diff_pixels"])
+    max_side_pixels = max(template_pixels, target_pixels)
+    min_side_pixels = min(template_pixels, target_pixels)
+    dominance_ratio = float(max_side_pixels / max(1, min_side_pixels))
+
+    keep = (
+        diff_pixels >= REVIEW_MIN_DIFF_PIXELS
+        or max_side_pixels >= REVIEW_MIN_SIDE_DIFF_PIXELS
+        or dominance_ratio >= REVIEW_MIN_DOMINANCE_RATIO
+    )
+    reason = "review"
+    if not keep:
+        reason = "skip_small_balanced_residual"
+
+    return keep, {
+        "diff_pixels": float(diff_pixels),
+        "max_side_pixels": float(max_side_pixels),
+        "min_side_pixels": float(min_side_pixels),
+        "dominance_ratio": dominance_ratio,
+        "reason": reason,
+    }
+
+
+def build_marked_candidate_crop(
+    image: np.ndarray,
+    crop_box: Sequence[int],
+    candidate_box: Sequence[int],
+) -> np.ndarray:
+    cx1, cy1, cx2, cy2 = [int(v) for v in crop_box]
+    bx1, by1, bx2, by2 = [int(v) for v in candidate_box]
+    crop = image[cy1:cy2, cx1:cx2].copy()
+    rel_box = [bx1 - cx1, by1 - cy1, bx2 - cx1, by2 - cy1]
+    return draw_single_box(crop, rel_box, (0, 0, 255))
+
+
 def summarize_pair_decision(candidate_results: Sequence[Dict[str, object]]) -> str:
     if not candidate_results:
         return "match"
@@ -469,6 +518,10 @@ def summarize_pair_decision(candidate_results: Sequence[Dict[str, object]]) -> s
     if any(decision == "unknown" for decision in decisions):
         return "unknown"
     return "match"
+
+
+def count_reviewed_candidates(candidate_results: Sequence[Dict[str, object]]) -> int:
+    return sum(1 for item in candidate_results if bool(item.get("sent_to_vlm")))
 
 
 def compare_one_pair(
@@ -513,19 +566,45 @@ def compare_one_pair(
 
         candidate_box = clip_box(candidate["box"], template_normalized.shape[:2], pad=CANDIDATE_CONTEXT_PAD)
         cx1, cy1, cx2, cy2 = candidate_box
-        template_candidate_crop = template_normalized[cy1:cy2, cx1:cx2]
-        target_candidate_crop = target_normalized[cy1:cy2, cx1:cx2]
-
-        vlm_result = comparator.compare_images(
-            template_candidate_crop,
-            target_candidate_crop,
-            custom_prompt=CANDIDATE_REVIEW_PROMPT,
+        template_candidate_crop = template_normalized[cy1:cy2, cx1:cx2].copy()
+        target_candidate_crop = target_normalized[cy1:cy2, cx1:cx2].copy()
+        template_candidate_marked = build_marked_candidate_crop(
+            template_normalized,
+            candidate_box,
+            candidate["box"],
+        )
+        target_candidate_marked = build_marked_candidate_crop(
+            target_normalized,
+            candidate_box,
+            candidate["box"],
         )
 
-        canvas = comparator._create_comparison_canvas(template_candidate_crop, target_candidate_crop)
+        should_review, review_meta = should_review_candidate(candidate)
+
         cv2.imwrite(str(candidate_dir / "template_candidate.jpg"), template_candidate_crop)
         cv2.imwrite(str(candidate_dir / "target_candidate.jpg"), target_candidate_crop)
-        cv2.imwrite(str(candidate_dir / "vlm_canvas.jpg"), canvas)
+        cv2.imwrite(str(candidate_dir / "template_candidate_marked.jpg"), template_candidate_marked)
+        cv2.imwrite(str(candidate_dir / "target_candidate_marked.jpg"), target_candidate_marked)
+
+        if should_review:
+            vlm_result = comparator.compare_images(
+                template_candidate_marked,
+                target_candidate_marked,
+                custom_prompt=CANDIDATE_REVIEW_PROMPT,
+            )
+            canvas = comparator._create_comparison_canvas(template_candidate_marked, target_candidate_marked)
+            cv2.imwrite(str(candidate_dir / "vlm_canvas.jpg"), canvas)
+        else:
+            vlm_result = {
+                "decision": "match",
+                "is_match": True,
+                "confidence": 0.0,
+                "needs_review": False,
+                "error_type": None,
+                "differences": [],
+                "summary": "候选框被规则过滤为小面积且双边均衡的边缘残差，未送入 VLM 复核。",
+                "raw_response": "",
+            }
 
         candidate_payload = {
             "candidate_idx": idx,
@@ -535,6 +614,8 @@ def compare_one_pair(
             "template_diff_pixels": int(candidate["template_diff_pixels"]),
             "target_diff_pixels": int(candidate["target_diff_pixels"]),
             "diff_pixels": int(candidate["diff_pixels"]),
+            "review_gate": review_meta,
+            "sent_to_vlm": bool(should_review),
             "vlm_result": vlm_result,
         }
         with open(candidate_dir / "result.json", "w", encoding="utf-8") as file_obj:
@@ -549,6 +630,7 @@ def compare_one_pair(
         "target_size": list(target_crop.shape[:2]),
         "normalization": normalized["meta"],
         "candidate_count": len(candidate_results),
+        "reviewed_candidate_count": count_reviewed_candidates(candidate_results),
         "pair_decision": pair_decision,
         "candidates": candidate_results,
     }
@@ -643,7 +725,8 @@ def main() -> int:
         print(
             "pair_decision="
             f"{result.get('pair_decision')} | "
-            f"candidate_count={result.get('candidate_count', 0)}"
+            f"candidate_count={result.get('candidate_count', 0)} | "
+            f"reviewed_candidate_count={result.get('reviewed_candidate_count', 0)}"
         )
 
     overall_decision = "match"
@@ -674,6 +757,9 @@ def main() -> int:
             "candidate_merge_gap": CANDIDATE_MERGE_GAP,
             "candidate_context_pad": CANDIDATE_CONTEXT_PAD,
             "max_candidates_per_pair": MAX_CANDIDATES_PER_PAIR,
+            "review_min_diff_pixels": REVIEW_MIN_DIFF_PIXELS,
+            "review_min_side_diff_pixels": REVIEW_MIN_SIDE_DIFF_PIXELS,
+            "review_min_dominance_ratio": REVIEW_MIN_DOMINANCE_RATIO,
         },
         "template_regions": template_regions,
         "target_regions": target_regions,
