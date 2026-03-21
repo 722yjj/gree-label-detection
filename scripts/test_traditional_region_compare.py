@@ -72,6 +72,7 @@ TEXTURE_ROW_TRANSITION_MAX = 0.18
 DIFF_REGION_MIN_AREA_RATIO = 0.0015
 DIFF_REGION_CLOSE_KERNEL = 7
 DIFF_REGION_DILATE_KERNEL = 5
+DIFF_TOLERANCE_KERNEL = 9
 
 
 def prepare_test_images(output_dir: Path) -> Dict[str, Dict[str, object]]:
@@ -524,6 +525,59 @@ def unmatched_area_ratio(boxes: Sequence[Sequence[int]], mask: np.ndarray) -> fl
     return float(sum(box_area(box) for box in boxes) / fg_area)
 
 
+def compute_tolerant_difference_masks(
+    template_mask: np.ndarray,
+    target_mask: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (DIFF_TOLERANCE_KERNEL, DIFF_TOLERANCE_KERNEL),
+    )
+    template_relaxed = cv2.dilate(template_mask, kernel, iterations=1)
+    target_relaxed = cv2.dilate(target_mask, kernel, iterations=1)
+
+    template_only = np.where((template_mask > 0) & (target_relaxed == 0), 255, 0).astype(np.uint8)
+    target_only = np.where((target_mask > 0) & (template_relaxed == 0), 255, 0).astype(np.uint8)
+    return template_only, target_only
+
+
+def diff_pixel_ratio(diff_mask: np.ndarray, reference_mask: np.ndarray) -> float:
+    reference_pixels = float((reference_mask > 0).sum())
+    if reference_pixels <= 0:
+        return 0.0
+    return float((diff_mask > 0).sum() / reference_pixels)
+
+
+def total_diff_pixel_ratio(
+    template_only_mask: np.ndarray,
+    target_only_mask: np.ndarray,
+    template_mask: np.ndarray,
+    target_mask: np.ndarray,
+) -> float:
+    union_pixels = float(np.logical_or(template_mask > 0, target_mask > 0).sum())
+    if union_pixels <= 0:
+        return 0.0
+    diff_pixels = float((template_only_mask > 0).sum() + (target_only_mask > 0).sum())
+    return diff_pixels / union_pixels
+
+
+def make_tolerant_diff_overlay(
+    template_mask: np.ndarray,
+    target_mask: np.ndarray,
+    template_only_mask: np.ndarray,
+    target_only_mask: np.ndarray,
+) -> np.ndarray:
+    overlay = np.ones((template_mask.shape[0], template_mask.shape[1], 3), dtype=np.uint8) * 255
+    overlap = np.logical_and(template_mask > 0, target_mask > 0)
+    template_only = template_only_mask > 0
+    target_only = target_only_mask > 0
+
+    overlay[overlap] = (0, 180, 0)
+    overlay[template_only] = (0, 0, 255)
+    overlay[target_only] = (255, 0, 0)
+    return overlay
+
+
 def extract_diff_region_boxes(diff_mask: np.ndarray) -> List[List[int]]:
     if diff_mask.size == 0:
         return []
@@ -552,14 +606,14 @@ def extract_diff_region_boxes(diff_mask: np.ndarray) -> List[List[int]]:
 
 def suggest_decision(metrics: Dict[str, float]) -> str:
     unmatched_area_ratio_total = float(metrics.get("unmatched_area_ratio_total") or 0.0)
-    diff_region_area_ratio_total = float(metrics.get("diff_region_area_ratio_total") or 0.0)
+    diff_pixel_ratio_total = float(metrics.get("diff_pixel_ratio_total") or 0.0)
     if (
         float(metrics.get("foreground_iou") or 0.0) >= MATCH_FOREGROUND_IOU_MIN
         and float(metrics.get("xor_ratio") or 0.0) <= MATCH_XOR_RATIO_MAX
         and float(metrics.get("hu_avg") or 0.0) >= MATCH_HU_MIN
         and int(metrics.get("component_count_diff") or 0) <= MATCH_COMPONENT_DELTA_MAX
         and unmatched_area_ratio_total <= MATCH_UNMATCHED_AREA_RATIO_MAX
-        and diff_region_area_ratio_total <= MATCH_UNMATCHED_AREA_RATIO_MAX
+        and diff_pixel_ratio_total <= MATCH_UNMATCHED_AREA_RATIO_MAX
     ):
         return "match"
 
@@ -569,7 +623,7 @@ def suggest_decision(metrics: Dict[str, float]) -> str:
         or float(metrics.get("hu_avg") or 0.0) <= MISMATCH_HU_MAX
         or int(metrics.get("component_count_diff") or 0) >= MISMATCH_COMPONENT_DELTA_MIN
         or unmatched_area_ratio_total >= MISMATCH_UNMATCHED_AREA_RATIO_MIN
-        or diff_region_area_ratio_total >= MISMATCH_UNMATCHED_AREA_RATIO_MIN
+        or diff_pixel_ratio_total >= MISMATCH_UNMATCHED_AREA_RATIO_MIN
         or int(metrics.get("unmatched_template_component_count") or 0) >= 1
         or int(metrics.get("unmatched_target_component_count") or 0) >= 1
         or int(metrics.get("template_diff_region_count") or 0) >= 1
@@ -636,12 +690,20 @@ def compare_one_pair(
 
     template_component_area_ratio = unmatched_area_ratio(unmatched_template_boxes, template_mask)
     target_component_area_ratio = unmatched_area_ratio(unmatched_target_boxes, target_mask)
-    template_only_mask = np.where((template_mask > 0) & (target_mask == 0), 255, 0).astype(np.uint8)
-    target_only_mask = np.where((target_mask > 0) & (template_mask == 0), 255, 0).astype(np.uint8)
+    template_only_mask, target_only_mask = compute_tolerant_difference_masks(
+        template_mask,
+        target_mask,
+    )
     template_diff_boxes = extract_diff_region_boxes(template_only_mask)
     target_diff_boxes = extract_diff_region_boxes(target_only_mask)
-    template_diff_area_ratio = unmatched_area_ratio(template_diff_boxes, template_mask)
-    target_diff_area_ratio = unmatched_area_ratio(target_diff_boxes, target_mask)
+    template_diff_pixel_ratio = diff_pixel_ratio(template_only_mask, template_mask)
+    target_diff_pixel_ratio = diff_pixel_ratio(target_only_mask, target_mask)
+    diff_pixel_ratio_total = total_diff_pixel_ratio(
+        template_only_mask,
+        target_only_mask,
+        template_mask,
+        target_mask,
+    )
 
     metrics = {
         "align_success": False,
@@ -668,13 +730,18 @@ def compare_one_pair(
         "unmatched_area_ratio_total": template_component_area_ratio + target_component_area_ratio,
         "template_diff_region_count": len(template_diff_boxes),
         "target_diff_region_count": len(target_diff_boxes),
-        "template_diff_region_area_ratio": template_diff_area_ratio,
-        "target_diff_region_area_ratio": target_diff_area_ratio,
-        "diff_region_area_ratio_total": template_diff_area_ratio + target_diff_area_ratio,
+        "template_diff_pixel_ratio": template_diff_pixel_ratio,
+        "target_diff_pixel_ratio": target_diff_pixel_ratio,
+        "diff_pixel_ratio_total": diff_pixel_ratio_total,
     }
     metrics["suggested_decision"] = suggest_decision(metrics)
 
-    diff_overlay = make_diff_overlay(template_mask, target_mask)
+    diff_overlay = make_tolerant_diff_overlay(
+        template_mask,
+        target_mask,
+        template_only_mask,
+        target_only_mask,
+    )
     diff_boxes_overlay = draw_boxes(diff_overlay, template_diff_boxes, (0, 0, 255))
     diff_boxes_overlay = draw_boxes(diff_boxes_overlay, target_diff_boxes, (255, 0, 0))
 
@@ -832,7 +899,7 @@ def main() -> int:
         "layout_threshold": LAYOUT_THRESHOLD,
         "match_cost_threshold": MATCH_COST_THRESHOLD,
         "pair_index": PAIR_INDEX,
-        "comparison_method": "foreground_crop_resize_pad_bottom_align + component_delta",
+        "comparison_method": "foreground_crop_resize_pad_bottom_align + tolerant_diff + component_delta",
         "decision_thresholds": {
             "match_foreground_iou_min": MATCH_FOREGROUND_IOU_MIN,
             "match_xor_ratio_max": MATCH_XOR_RATIO_MAX,
@@ -856,6 +923,7 @@ def main() -> int:
             "min_area_ratio": DIFF_REGION_MIN_AREA_RATIO,
             "close_kernel": DIFF_REGION_CLOSE_KERNEL,
             "dilate_kernel": DIFF_REGION_DILATE_KERNEL,
+            "tolerance_kernel": DIFF_TOLERANCE_KERNEL,
         },
         "template_regions": template_regions,
         "target_regions": target_regions,
