@@ -73,6 +73,7 @@ MAX_CANDIDATES_PER_PAIR = 5
 REVIEW_MIN_DIFF_PIXELS = 130
 REVIEW_MIN_SIDE_DIFF_PIXELS = 90
 REVIEW_MIN_DOMINANCE_RATIO = 2.2
+FINAL_SINGLE_SIDED_HINTS = {"target_extra", "template_extra"}
 
 CANDIDATE_REVIEW_PROMPT = """你是局部图形差异复核器。
 你将看到一个 2x2 复核画布：
@@ -640,19 +641,44 @@ def compare_canvas_with_vlm(
 
 def split_final_candidates(
     candidate_results: Sequence[Dict[str, object]],
-) -> Tuple[List[List[int]], List[List[int]]]:
-    mismatch_boxes: List[List[int]] = []
-    unknown_boxes: List[List[int]] = []
-    for candidate in candidate_results:
-        if not bool(candidate.get("sent_to_vlm")):
-            continue
-        decision = str(candidate.get("vlm_result", {}).get("decision", "unknown"))
-        box = [int(v) for v in candidate["box"]]
-        if decision == "mismatch":
-            mismatch_boxes.append(box)
-        elif decision == "unknown":
-            unknown_boxes.append(box)
-    return mismatch_boxes, unknown_boxes
+) -> Tuple[List[List[int]], List[List[int]], Dict[str, object]]:
+    reviewed = [candidate for candidate in candidate_results if bool(candidate.get("sent_to_vlm"))]
+    mismatch_candidates = [
+        candidate
+        for candidate in reviewed
+        if str(candidate.get("vlm_result", {}).get("decision", "unknown")) == "mismatch"
+    ]
+    unknown_candidates = [
+        candidate
+        for candidate in reviewed
+        if str(candidate.get("vlm_result", {}).get("decision", "unknown")) == "unknown"
+    ]
+
+    single_sided_mismatches = [
+        candidate
+        for candidate in mismatch_candidates
+        if str(candidate.get("type_hint", "")) in FINAL_SINGLE_SIDED_HINTS
+    ]
+
+    suppressed_candidate_indices: List[int] = []
+    if single_sided_mismatches:
+        final_mismatch_candidates = single_sided_mismatches
+        suppressed_candidate_indices = [
+            int(candidate["candidate_idx"])
+            for candidate in mismatch_candidates
+            if str(candidate.get("type_hint", "")) not in FINAL_SINGLE_SIDED_HINTS
+        ]
+    else:
+        final_mismatch_candidates = mismatch_candidates
+
+    mismatch_boxes = [[int(v) for v in candidate["box"]] for candidate in final_mismatch_candidates]
+    unknown_boxes = [[int(v) for v in candidate["box"]] for candidate in unknown_candidates]
+    selection_meta = {
+        "selection_rule": "prefer_single_sided_mismatch_over_mixed",
+        "single_sided_mismatch_count": len(single_sided_mismatches),
+        "suppressed_candidate_indices": suppressed_candidate_indices,
+    }
+    return mismatch_boxes, unknown_boxes, selection_meta
 
 
 def draw_final_diff_canvas(
@@ -774,7 +800,7 @@ def compare_one_pair(
         candidate_results.append(candidate_payload)
 
     pair_decision = summarize_pair_decision(candidate_results)
-    mismatch_boxes, unknown_boxes = split_final_candidates(candidate_results)
+    mismatch_boxes, unknown_boxes, final_selection = split_final_candidates(candidate_results)
     final_diff_canvas = draw_final_diff_canvas(
         template_normalized,
         target_normalized,
@@ -785,6 +811,7 @@ def compare_one_pair(
         "pair_decision": pair_decision,
         "final_mismatch_boxes": mismatch_boxes,
         "final_unknown_boxes": unknown_boxes,
+        "final_selection": final_selection,
         "candidate_results": candidate_results,
     }
     cv2.imwrite(str(pair_output_dir / "final_diff_canvas.jpg"), final_diff_canvas)
@@ -802,6 +829,7 @@ def compare_one_pair(
         "pair_decision": pair_decision,
         "final_mismatch_boxes": mismatch_boxes,
         "final_unknown_boxes": unknown_boxes,
+        "final_selection": final_selection,
         "candidates": candidate_results,
     }
 
@@ -932,6 +960,7 @@ def main() -> int:
             "review_min_diff_pixels": REVIEW_MIN_DIFF_PIXELS,
             "review_min_side_diff_pixels": REVIEW_MIN_SIDE_DIFF_PIXELS,
             "review_min_dominance_ratio": REVIEW_MIN_DOMINANCE_RATIO,
+            "final_selection_rule": "prefer_single_sided_mismatch_over_mixed",
         },
         "template_regions": template_regions,
         "target_regions": target_regions,
