@@ -85,21 +85,27 @@ CANDIDATE_REVIEW_PROMPT = """你是局部图形差异复核器。
 - 左下：Template 红框区域放大图
 - 右下：Target 红框区域放大图
 
-你只需要判断红框对应位置是否存在真实图形差异。
+你的任务只有一个：判断红框内的深色前景图形结构是否存在真实差异。
+只关注黑色/深色前景笔画、轮廓、连通结构是否多出、缺少或被替换。
 不要描述图形像什么，不要猜测图标语义。
 
-忽略以下情况，不要判为差异：
+以下内容必须忽略，不要判为差异：
+- 背景颜色不同
+- 灰底、黄底、白底或亮度差异
+- 纸张底色、阴影、污渍、反光
+- 留白差异
 - 轻微模糊
 - 位置偏移
-- 留白差异
 - 线条粗细不同
 - 小范围轮廓边缘残差
 - 小于15%的缩放差异
 
-重点检查：
-1. 红框内 Target 是否多出图形/符号
-2. 红框内 Target 是否缺少图形/符号
-3. 红框内主体图形是否被替换成不同图形
+判为 mismatch 只允许基于前景结构差异：
+1. 红框内 Target 多出前景图形/符号
+2. 红框内 Target 缺少前景图形/符号
+3. 红框内主体前景结构被替换成不同结构
+
+如果主体前景图形一致，而只有背景灰白、明暗、底色不同，必须输出 "decision":"match"。
 
 输出规则（必须严格遵守）：
 1. 只输出一个 JSON 对象，不要输出任何其他文本。
@@ -108,10 +114,10 @@ CANDIDATE_REVIEW_PROMPT = """你是局部图形差异复核器。
    - "confidence": 0.0 到 1.0 的数字
    - "differences": 字符串数组
    - "summary": 字符串
-3. 如果只是边缘厚度或轻微对齐误差，输出 "decision":"match"。
-4. 如果无法可靠判断，输出 "decision":"unknown"。
+3. 如果只是背景差异、边缘厚度变化或轻微对齐误差，输出 "decision":"match"。
+4. 如果无法可靠判断前景结构，输出 "decision":"unknown"。
 5. 当 decision 为 "match" 时，differences 必须是空数组 []。
-6. summary 只描述“是否存在真实差异”，不要描述图形类别。
+6. summary 只描述“是否存在前景结构差异”，不要描述背景差异，不要描述图形类别。
 
 仅输出如下格式的 JSON：
 {"decision":"match|mismatch|unknown","confidence":0.0,"differences":[],"summary":"..."}"""
@@ -644,15 +650,67 @@ def compare_canvas_with_vlm(
 
 def is_background_only_mismatch(candidate: Dict[str, object]) -> bool:
     vlm_result = candidate.get("vlm_result", {})
-    text = " ".join(
-        [str(vlm_result.get("summary", ""))]
-        + [str(item) for item in vlm_result.get("differences", [])]
-    ).lower()
-    background_keywords = ["背景", "background", "灰色", "白色", "gray", "grey", "white"]
-    structural_keywords = ["额外", "多出", "缺少", "缺失", "手形", "符号", "图形", "extra", "missing", "symbol"]
-    return any(keyword in text for keyword in background_keywords) and not any(
-        keyword in text for keyword in structural_keywords
+    summary = str(vlm_result.get("summary", "")).lower()
+    differences = [str(item).lower() for item in vlm_result.get("differences", [])]
+    text = " ".join([summary] + differences)
+
+    background_keywords = [
+        "背景",
+        "background",
+        "灰色",
+        "白色",
+        "gray",
+        "grey",
+        "white",
+        "底色",
+        "明暗",
+        "亮度",
+    ]
+    same_structure_phrases = [
+        "主体图形一致",
+        "图形一致",
+        "前景图形一致",
+        "主体前景一致",
+        "结构一致",
+        "轮廓一致",
+        "same graphic",
+        "same foreground",
+        "same structure",
+    ]
+    structural_difference_keywords = [
+        "额外",
+        "多出",
+        "新增",
+        "缺少",
+        "缺失",
+        "替换",
+        "不同结构",
+        "结构不同",
+        "不同图形",
+        "图形不同",
+        "空白",
+        "extra",
+        "additional",
+        "missing",
+        "replace",
+        "replaced",
+        "different structure",
+        "different graphic",
+        "blank",
+        "non-empty",
+    ]
+
+    has_background = any(keyword in text for keyword in background_keywords)
+    if not has_background:
+        return False
+
+    has_structural_difference = any(keyword in text for keyword in structural_difference_keywords)
+    has_same_structure = any(keyword in summary for keyword in same_structure_phrases)
+    all_differences_are_background = bool(differences) and all(
+        any(keyword in item for keyword in background_keywords) for item in differences
     )
+
+    return (has_same_structure or all_differences_are_background) and not has_structural_difference
 
 
 def split_final_candidates(
@@ -711,12 +769,17 @@ def split_final_candidates(
         final_mismatch_candidates = mismatch_candidates
 
     if single_sided_mismatches and not final_mismatch_candidates:
-        final_mismatch_candidates = single_sided_mismatches
-        suppressed_candidate_indices = [
-            int(candidate["candidate_idx"])
+        final_mismatch_candidates = [
+            candidate
             for candidate in mismatch_candidates
             if str(candidate.get("type_hint", "")) not in FINAL_SINGLE_SIDED_HINTS
         ]
+        suppressed_candidate_indices = sorted(
+            set(suppressed_candidate_indices).union(
+                int(candidate["candidate_idx"])
+                for candidate in single_sided_mismatches
+            )
+        )
 
     mismatch_boxes = [[int(v) for v in candidate["box"]] for candidate in final_mismatch_candidates]
     unknown_boxes = [[int(v) for v in candidate["box"]] for candidate in unknown_candidates]
