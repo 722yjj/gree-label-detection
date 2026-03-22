@@ -22,6 +22,51 @@
 
 ---
 
+## 2026-03-22 - 混合条码区域改为抢救非条码子区域，未匹配区域计入最终差异
+
+- 背景：
+  最新实验样本 `600004075219_8.jpg` 中，目标图比模板多了一个打印机图标，但最终结果仍然输出 `match`。根因不是 VLM，而是最上游区域过滤把“打印机 + 条码”混合区域整块按 `repetitive_vertical_texture` 跳过了，导致额外图形根本没有进入后续比较；即使后续把该额外图形救成 `unmatched_target`，旧逻辑也不会把未匹配区域计入最终差异。
+
+- 修改文件：
+  - `scripts/test_vlm_candidate_review.py`
+  - `AGENT_CHANGELOG.md`
+
+- 修改内容：
+  - 新增 `filter_regions_with_barcode_salvage()`，替代原来“先 `split_barcode_regions()`、再 `filter_repetitive_texture_regions()`”的两段式过滤。
+  - 对整块被判为条码或强竖纹纹理的 region，不再直接整块跳过；会先尝试在 region 内部检测局部条码子框。
+  - 若检测到局部条码子框，且移除这些子框后仍存在足够大的前景组件，则：
+    - 把剩余前景组件作为新的 `comparable` 子区域保留下来
+    - 把局部条码子框作为 `skipped` 子区域保留为调试输出
+  - 对 `pair_results` 之外的 `unmatched_template` / `unmatched_target`，新增最终判定规则：
+    - 未匹配但可比较的区域也算最终差异
+  - 新增顶层 `final_overview.jpg`：
+    - 在原始模板图/目标图上直接框出“匹配失败的 pair 区域”和“未匹配区域”
+    - 让额外图形即使没有进入 pair 级细粒度对比，也能在最终输出中可见
+  - 在 `summary.json` 中新增：
+    - `overview_mismatch_template_boxes`
+    - `overview_mismatch_target_boxes`
+    - `overview_unknown_template_boxes`
+    - `overview_unknown_target_boxes`
+    - `overview_output`
+
+- 修改原因：
+  - 修复“额外图形被和条码一起跳过”的假阴性。
+  - 让实验脚本的最终输出不再只依赖 matched pair，而能覆盖“目标侧多出一个独立区域”这类真实差异。
+
+- 影响范围：
+  - 仅影响 `scripts/test_vlm_candidate_review.py` 的实验行为，不影响主流程。
+  - `target_regions.jpg` / `template_regions.jpg` 中的绿色可比较区域和橙色跳过区域可能与之前不同，因为混合条码框现在会被拆成“保留部分 + 跳过部分”。
+
+- 验证情况：
+  - 已完成静态语法检查。
+  - 尚未在当前命令环境重新跑样图验证，需在服务器上确认打印机图标是否已出现在 `final_overview.jpg` 或新的 pair / unmatched 输出中。
+
+- 风险 / 待验证项：
+  - 若混合条码区域里的非条码图形非常小，仍可能在 salvage 阶段被面积阈值过滤掉。
+  - 当前 `final_overview.jpg` 对 matched pair 仍是 region 级定位，不是 pair 内部细粒度候选框定位。
+
+---
+
 ## 2026-03-22 - 候选差异实验增加区域内条码子区域屏蔽
 
 - 背景：

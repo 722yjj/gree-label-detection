@@ -33,7 +33,6 @@ from label_detection.matching.layout import (
     draw_regions,
     extract_regions_by_type,
     match_regions,
-    split_barcode_regions,
 )
 from label_detection.preprocessing.pipeline import preprocess_target, preprocess_template
 from label_detection.services.ocr_service import get_ocr_with_boxes
@@ -74,6 +73,11 @@ LOCAL_BARCODE_BOX_PAD_X = 10
 LOCAL_BARCODE_BOX_PAD_TOP = 4
 LOCAL_BARCODE_BOX_PAD_BOTTOM_RATIO = 0.45
 LOCAL_BARCODE_MERGE_GAP = 18
+SALVAGE_COMPONENT_MIN_AREA_RATIO = 0.006
+SALVAGE_COMPONENT_MIN_SIZE = 10
+SALVAGE_COMPONENT_PAD_X = 6
+SALVAGE_COMPONENT_PAD_Y = 6
+SALVAGE_COMPONENT_MERGE_GAP = 14
 
 DIFF_TOLERANCE_KERNEL = 9
 CANDIDATE_CLOSE_KERNEL = 11
@@ -297,6 +301,12 @@ def filter_repetitive_texture_regions(
     return comparable, skipped
 
 
+def _map_local_box_to_global(parent_box: Sequence[int], local_box: Sequence[int]) -> List[int]:
+    px1, py1, _, _ = [int(v) for v in parent_box]
+    lx1, ly1, lx2, ly2 = [int(v) for v in local_box]
+    return [px1 + lx1, py1 + ly1, px1 + lx2, py1 + ly2]
+
+
 def detect_local_barcode_boxes(image: np.ndarray) -> List[List[int]]:
     if image.size == 0:
         return []
@@ -360,6 +370,98 @@ def detect_local_barcode_boxes(image: np.ndarray) -> List[List[int]]:
     if not raw_boxes:
         return []
     return merge_boxes(raw_boxes, LOCAL_BARCODE_MERGE_GAP)
+
+
+def salvage_non_barcode_subregions(
+    region: Dict[str, object],
+    image: np.ndarray,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    crop = crop_region(image, region["coordinate"])
+    local_barcode_boxes = detect_local_barcode_boxes(crop)
+    if not local_barcode_boxes:
+        return [], []
+
+    crop_mask = to_binary_mask(crop)
+    crop_mask = apply_ignore_boxes_to_mask(crop_mask, local_barcode_boxes)
+    crop_mask = cv2.morphologyEx(crop_mask, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8))
+    crop_mask = cv2.morphologyEx(crop_mask, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8))
+
+    img_h, img_w = crop_mask.shape[:2]
+    min_area = img_h * img_w * SALVAGE_COMPONENT_MIN_AREA_RATIO
+    raw_boxes: List[List[int]] = []
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats((crop_mask > 0).astype(np.uint8), connectivity=8)
+    for label_idx in range(1, num_labels):
+        x, y, w, h, area = stats[label_idx]
+        if area < min_area or w < SALVAGE_COMPONENT_MIN_SIZE or h < SALVAGE_COMPONENT_MIN_SIZE:
+            continue
+        raw_boxes.append(
+            clip_box(
+                [
+                    int(x - SALVAGE_COMPONENT_PAD_X),
+                    int(y - SALVAGE_COMPONENT_PAD_Y),
+                    int(x + w + SALVAGE_COMPONENT_PAD_X),
+                    int(y + h + SALVAGE_COMPONENT_PAD_Y),
+                ],
+                crop.shape[:2],
+            )
+        )
+
+    if not raw_boxes:
+        return [], []
+
+    child_regions: List[Dict[str, object]] = []
+    for child_idx, local_box in enumerate(merge_boxes(raw_boxes, SALVAGE_COMPONENT_MERGE_GAP)):
+        child_region = dict(region)
+        child_region["coordinate"] = _map_local_box_to_global(region["coordinate"], local_box)
+        child_region["salvaged_from_mixed_barcode"] = True
+        child_region["salvage_child_idx"] = child_idx
+        child_regions.append(child_region)
+
+    skipped_regions: List[Dict[str, object]] = []
+    for local_box in local_barcode_boxes:
+        skipped_region = dict(region)
+        skipped_region["coordinate"] = _map_local_box_to_global(region["coordinate"], local_box)
+        skipped_region["skip_reason"] = "local_barcode_subregion"
+        skipped_region["salvaged_from_mixed_barcode"] = True
+        skipped_regions.append(skipped_region)
+
+    return child_regions, skipped_regions
+
+
+def filter_regions_with_barcode_salvage(
+    regions: Sequence[Dict[str, object]],
+    image: np.ndarray,
+    ocr_boxes: Sequence[Tuple[object, str, float]] | None = None,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    comparable: List[Dict[str, object]] = []
+    skipped: List[Dict[str, object]] = []
+
+    for idx, region in enumerate(regions):
+        region_copy = dict(region)
+        region_copy.setdefault("original_idx", idx)
+        crop = crop_region(image, region_copy["coordinate"])
+        is_barcode, barcode_meta = detect_barcode_region(region_copy, image, ocr_boxes)
+        is_texture, texture_meta = is_repetitive_vertical_texture(crop)
+
+        if is_barcode or is_texture:
+            salvaged_regions, salvaged_skipped = salvage_non_barcode_subregions(region_copy, image)
+            if salvaged_regions:
+                comparable.extend(salvaged_regions)
+                skipped.extend(salvaged_skipped)
+                continue
+
+        if is_barcode:
+            region_copy["skip_reason"] = "barcode"
+            region_copy["barcode_hint"] = barcode_meta
+            skipped.append(region_copy)
+        elif is_texture:
+            region_copy["skip_reason"] = "repetitive_vertical_texture"
+            region_copy["texture_hint"] = texture_meta
+            skipped.append(region_copy)
+        else:
+            comparable.append(region_copy)
+
+    return comparable, skipped
 
 
 def apply_ignore_boxes_to_mask(mask: np.ndarray, boxes: Sequence[Sequence[int]]) -> np.ndarray:
@@ -910,6 +1012,36 @@ def draw_final_diff_canvas(
     return canvas
 
 
+def draw_overview_diff_canvas(
+    template_image: np.ndarray,
+    target_image: np.ndarray,
+    mismatch_template_boxes: Sequence[Sequence[int]],
+    mismatch_target_boxes: Sequence[Sequence[int]],
+    unknown_template_boxes: Sequence[Sequence[int]],
+    unknown_target_boxes: Sequence[Sequence[int]],
+) -> np.ndarray:
+    template_canvas = template_image.copy()
+    target_canvas = target_image.copy()
+    for box in mismatch_template_boxes:
+        template_canvas = draw_single_box(template_canvas, box, (0, 0, 255))
+    for box in mismatch_target_boxes:
+        target_canvas = draw_single_box(target_canvas, box, (0, 0, 255))
+    for box in unknown_template_boxes:
+        template_canvas = draw_single_box(template_canvas, box, (0, 165, 255))
+    for box in unknown_target_boxes:
+        target_canvas = draw_single_box(target_canvas, box, (0, 165, 255))
+
+    canvas = np.ones(
+        (max(template_canvas.shape[0], target_canvas.shape[0]) + 40, template_canvas.shape[1] + target_canvas.shape[1] + 20, 3),
+        dtype=np.uint8,
+    ) * 255
+    cv2.putText(canvas, "Template", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+    cv2.putText(canvas, "Target", (template_canvas.shape[1] + 30, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+    canvas[40:40 + template_canvas.shape[0], 0:template_canvas.shape[1]] = template_canvas
+    canvas[40:40 + target_canvas.shape[0], template_canvas.shape[1] + 20:template_canvas.shape[1] + 20 + target_canvas.shape[1]] = target_canvas
+    return canvas
+
+
 def summarize_pair_decision(candidate_results: Sequence[Dict[str, object]]) -> str:
     if not candidate_results:
         return "match"
@@ -1088,13 +1220,16 @@ def main() -> int:
 
     _, template_boxes = get_ocr_with_boxes(str(template_path))
     _, target_boxes = get_ocr_with_boxes(str(target_path))
-    template_regions, skipped_template_regions = split_barcode_regions(template_regions, template_image, template_boxes)
-    target_regions, skipped_target_regions = split_barcode_regions(target_regions, target_image, target_boxes)
-
-    template_regions, texture_skipped_template_regions = filter_repetitive_texture_regions(template_regions, template_image)
-    target_regions, texture_skipped_target_regions = filter_repetitive_texture_regions(target_regions, target_image)
-    skipped_template_regions = skipped_template_regions + texture_skipped_template_regions
-    skipped_target_regions = skipped_target_regions + texture_skipped_target_regions
+    template_regions, skipped_template_regions = filter_regions_with_barcode_salvage(
+        template_regions,
+        template_image,
+        template_boxes,
+    )
+    target_regions, skipped_target_regions = filter_regions_with_barcode_salvage(
+        target_regions,
+        target_image,
+        target_boxes,
+    )
 
     template_vis = draw_regions(template_image, template_regions, color=(0, 255, 0))
     target_vis = draw_regions(target_image, target_regions, color=(0, 255, 0))
@@ -1157,12 +1292,49 @@ def main() -> int:
             f"final_unknown_boxes={len(result.get('final_unknown_boxes', []))}"
         )
 
-    overall_decision = "match"
     pair_decisions = [str(item.get("pair_decision", "unknown")) for item in pair_results]
-    if any(item == "mismatch" for item in pair_decisions):
+    overview_mismatch_template_boxes = [
+        [int(v) for v in item["template_box"]]
+        for item in pair_results
+        if str(item.get("pair_decision", "unknown")) == "mismatch"
+    ] + [
+        [int(v) for v in template_regions[idx]["coordinate"]]
+        for idx in unmatched_template
+    ]
+    overview_mismatch_target_boxes = [
+        [int(v) for v in item["target_box"]]
+        for item in pair_results
+        if str(item.get("pair_decision", "unknown")) == "mismatch"
+    ] + [
+        [int(v) for v in target_regions[idx]["coordinate"]]
+        for idx in unmatched_target
+    ]
+    overview_unknown_template_boxes = [
+        [int(v) for v in item["template_box"]]
+        for item in pair_results
+        if str(item.get("pair_decision", "unknown")) == "unknown"
+    ]
+    overview_unknown_target_boxes = [
+        [int(v) for v in item["target_box"]]
+        for item in pair_results
+        if str(item.get("pair_decision", "unknown")) == "unknown"
+    ]
+
+    overall_decision = "match"
+    if unmatched_template or unmatched_target or any(item == "mismatch" for item in pair_decisions):
         overall_decision = "mismatch"
     elif any(item == "unknown" for item in pair_decisions):
         overall_decision = "unknown"
+
+    final_overview_canvas = draw_overview_diff_canvas(
+        template_image,
+        target_image,
+        overview_mismatch_template_boxes,
+        overview_mismatch_target_boxes,
+        overview_unknown_template_boxes,
+        overview_unknown_target_boxes,
+    )
+    cv2.imwrite(str(output_dir / "final_overview.jpg"), final_overview_canvas)
 
     summary = {
         "test_name": TEST_NAME,
@@ -1185,6 +1357,9 @@ def main() -> int:
             "local_barcode_min_height_ratio": LOCAL_BARCODE_MIN_HEIGHT_RATIO,
             "local_barcode_min_area_ratio": LOCAL_BARCODE_MIN_AREA_RATIO,
             "local_barcode_merge_gap": LOCAL_BARCODE_MERGE_GAP,
+            "salvage_component_min_area_ratio": SALVAGE_COMPONENT_MIN_AREA_RATIO,
+            "salvage_component_min_size": SALVAGE_COMPONENT_MIN_SIZE,
+            "salvage_component_merge_gap": SALVAGE_COMPONENT_MERGE_GAP,
             "candidate_close_kernel": CANDIDATE_CLOSE_KERNEL,
             "candidate_dilate_kernel": CANDIDATE_DILATE_KERNEL,
             "candidate_min_area_ratio": CANDIDATE_MIN_AREA_RATIO,
@@ -1194,6 +1369,7 @@ def main() -> int:
             "review_min_diff_pixels": REVIEW_MIN_DIFF_PIXELS,
             "review_min_side_diff_pixels": REVIEW_MIN_SIDE_DIFF_PIXELS,
             "review_min_dominance_ratio": REVIEW_MIN_DOMINANCE_RATIO,
+            "unmatched_region_rule": "unmatched comparable regions count as mismatch",
             "final_selection_rule": "prefer_single_sided_mismatch_over_mixed",
             "background_only_small_reject_max_diff_pixels": FINAL_BACKGROUND_REJECT_MAX_DIFF_PIXELS,
             "background_only_small_reject_max_side_pixels": FINAL_BACKGROUND_REJECT_MAX_SIDE_PIXELS,
@@ -1207,7 +1383,12 @@ def main() -> int:
         "unmatched_template": unmatched_template,
         "unmatched_target": unmatched_target,
         "overall_decision": overall_decision,
+        "overview_mismatch_template_boxes": overview_mismatch_template_boxes,
+        "overview_mismatch_target_boxes": overview_mismatch_target_boxes,
+        "overview_unknown_template_boxes": overview_unknown_template_boxes,
+        "overview_unknown_target_boxes": overview_unknown_target_boxes,
         "pair_results": pair_results,
+        "overview_output": str(output_dir / "final_overview.jpg"),
         "final_outputs": [
             {
                 "pair_dir": str(output_dir / f"pair_{idx:02d}_t{item['template_idx']}_s{item['target_idx']}"),
