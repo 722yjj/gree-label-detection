@@ -66,6 +66,13 @@ LOCAL_BARCODE_CLOSE_WIDTH = 17
 LOCAL_BARCODE_CLOSE_HEIGHT = 3
 LOCAL_BARCODE_DILATE_WIDTH = 11
 LOCAL_BARCODE_DILATE_HEIGHT = 5
+LOCAL_BARCODE_BAND_WINDOW = 11
+LOCAL_BARCODE_BAND_EDGE_MIN = 0.20
+LOCAL_BARCODE_BAND_DARK_MIN = 0.08
+LOCAL_BARCODE_BAND_DARK_MAX = 0.88
+LOCAL_BARCODE_BAND_MIN_WIDTH_RATIO = 0.18
+LOCAL_BARCODE_BAND_MIN_START_RATIO = 0.35
+LOCAL_BARCODE_BAND_CLOSE_GAP = 9
 LOCAL_BARCODE_MIN_WIDTH_RATIO = 0.16
 LOCAL_BARCODE_MIN_HEIGHT_RATIO = 0.16
 LOCAL_BARCODE_MIN_AREA_RATIO = 0.008
@@ -307,6 +314,107 @@ def _map_local_box_to_global(parent_box: Sequence[int], local_box: Sequence[int]
     return [px1 + lx1, py1 + ly1, px1 + lx2, py1 + ly2]
 
 
+def _smooth_1d(values: np.ndarray, window: int) -> np.ndarray:
+    if values.size == 0 or window <= 1:
+        return values.astype(np.float32, copy=True)
+    kernel = np.ones(int(window), dtype=np.float32) / float(window)
+    return np.convolve(values.astype(np.float32), kernel, mode="same")
+
+
+def detect_barcode_band_box(image: np.ndarray) -> List[int] | None:
+    if image.size == 0:
+        return None
+
+    img_h, img_w = image.shape[:2]
+    if img_h < 24 or img_w < 64:
+        return None
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    upper_h = max(18, int(round(img_h * 0.72)))
+    upper = (binary[:upper_h] > 0).astype(np.uint8)
+    if upper.size == 0:
+        return None
+
+    dark_profile = upper.mean(axis=0)
+    edge_profile = np.zeros(img_w, dtype=np.float32)
+    if img_w > 1:
+        edge_profile[1:] = np.abs(np.diff(upper.astype(np.float32), axis=1)).mean(axis=0)
+    smooth_edge = _smooth_1d(edge_profile, LOCAL_BARCODE_BAND_WINDOW)
+
+    candidate_cols = (
+        (smooth_edge >= LOCAL_BARCODE_BAND_EDGE_MIN)
+        & (dark_profile >= LOCAL_BARCODE_BAND_DARK_MIN)
+        & (dark_profile <= LOCAL_BARCODE_BAND_DARK_MAX)
+    )
+    if not np.any(candidate_cols):
+        return None
+
+    candidate_img = (candidate_cols.astype(np.uint8) * 255)[None, :]
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (LOCAL_BARCODE_BAND_CLOSE_GAP, 1))
+    candidate_img = cv2.morphologyEx(candidate_img, cv2.MORPH_CLOSE, close_kernel)
+    candidate_cols = candidate_img[0] > 0
+
+    min_width = max(56, int(round(img_w * LOCAL_BARCODE_BAND_MIN_WIDTH_RATIO)))
+    min_start = int(round(img_w * LOCAL_BARCODE_BAND_MIN_START_RATIO))
+    segments: List[Tuple[int, int, float]] = []
+    start = None
+    for idx, is_on in enumerate(candidate_cols.tolist() + [False]):
+        if is_on and start is None:
+            start = idx
+        elif not is_on and start is not None:
+            end = idx
+            width = end - start
+            if width >= min_width and end >= min_start:
+                score = float(smooth_edge[start:end].mean() * width + end * 0.02)
+                segments.append((start, end, score))
+            start = None
+
+    if not segments:
+        return None
+
+    x1, x2, _ = max(segments, key=lambda item: item[2])
+    band_pixels = binary[:, x1:x2] > 0
+    if not np.any(band_pixels):
+        return None
+
+    rows = np.where(np.any(band_pixels, axis=1))[0]
+    if rows.size == 0:
+        return None
+
+    local_box = clip_box(
+        [
+            int(x1 - LOCAL_BARCODE_BOX_PAD_X),
+            int(rows.min() - LOCAL_BARCODE_BOX_PAD_TOP),
+            int(x2 + LOCAL_BARCODE_BOX_PAD_X),
+            int(rows.max() + 1 + max(10, int(round((rows.max() - rows.min() + 1) * LOCAL_BARCODE_BOX_PAD_BOTTOM_RATIO)))),
+        ],
+        image.shape[:2],
+    )
+
+    region = {
+        "label": "image",
+        "score": 1.0,
+        "coordinate": [int(v) for v in local_box],
+    }
+    is_barcode, _ = detect_barcode_region(region, image, ocr_boxes=None)
+    if not is_barcode:
+        upper_region = dict(region)
+        upper_region["coordinate"] = [
+            int(local_box[0]),
+            int(local_box[1]),
+            int(local_box[2]),
+            int(min(image.shape[0], local_box[1] + max(18, int(round((local_box[3] - local_box[1]) * 0.72))))),
+        ]
+        is_barcode, _ = detect_barcode_region(upper_region, image, ocr_boxes=None)
+        if not is_barcode:
+            return None
+
+    return local_box
+
+
 def detect_local_barcode_boxes(image: np.ndarray) -> List[List[int]]:
     if image.size == 0:
         return []
@@ -366,6 +474,10 @@ def detect_local_barcode_boxes(image: np.ndarray) -> List[List[int]]:
             image.shape[:2],
         )
         raw_boxes.append(padded)
+
+    band_box = detect_barcode_band_box(image)
+    if band_box is not None:
+        raw_boxes.append(band_box)
 
     if not raw_boxes:
         return []
@@ -1353,6 +1465,12 @@ def main() -> int:
             "tolerance_kernel": DIFF_TOLERANCE_KERNEL,
             "local_barcode_close_kernel": [LOCAL_BARCODE_CLOSE_WIDTH, LOCAL_BARCODE_CLOSE_HEIGHT],
             "local_barcode_dilate_kernel": [LOCAL_BARCODE_DILATE_WIDTH, LOCAL_BARCODE_DILATE_HEIGHT],
+            "local_barcode_band_window": LOCAL_BARCODE_BAND_WINDOW,
+            "local_barcode_band_edge_min": LOCAL_BARCODE_BAND_EDGE_MIN,
+            "local_barcode_band_dark_range": [LOCAL_BARCODE_BAND_DARK_MIN, LOCAL_BARCODE_BAND_DARK_MAX],
+            "local_barcode_band_min_width_ratio": LOCAL_BARCODE_BAND_MIN_WIDTH_RATIO,
+            "local_barcode_band_min_start_ratio": LOCAL_BARCODE_BAND_MIN_START_RATIO,
+            "local_barcode_band_close_gap": LOCAL_BARCODE_BAND_CLOSE_GAP,
             "local_barcode_min_width_ratio": LOCAL_BARCODE_MIN_WIDTH_RATIO,
             "local_barcode_min_height_ratio": LOCAL_BARCODE_MIN_HEIGHT_RATIO,
             "local_barcode_min_area_ratio": LOCAL_BARCODE_MIN_AREA_RATIO,
