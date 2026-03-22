@@ -15,11 +15,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import cv2
 import numpy as np
+import requests
 
 from label_detection.core.config import (
     OLLAMA_API_BASE,
     OLLAMA_MODEL,
     PROJECT_ROOT as REPO_ROOT,
+    VLM_CANVAS_SIZE,
+    VLM_MAX_RETRIES,
+    VLM_NUM_PREDICT,
     VLM_TIMEOUT,
 )
 from label_detection.extraction.pdf import extract_red_box_info
@@ -71,9 +75,14 @@ REVIEW_MIN_SIDE_DIFF_PIXELS = 90
 REVIEW_MIN_DOMINANCE_RATIO = 2.2
 
 CANDIDATE_REVIEW_PROMPT = """你是局部图形差异复核器。
-你将看到左右两张局部候选区域图：左边是 Template，右边是 Target。
-它们来自同一图形区域中的同一位置，红色框标出了待复核候选区域，框外内容只作为上下文。
-你只需要判断红色框对应位置是否存在真实图形差异。
+你将看到一个 2x2 复核画布：
+- 左上：Template 整体区域，红框标出候选位置
+- 右上：Target 整体区域，红框标出候选位置
+- 左下：Template 红框区域放大图
+- 右下：Target 红框区域放大图
+
+你只需要判断红框对应位置是否存在真实图形差异。
+不要描述图形像什么，不要猜测图标语义。
 
 忽略以下情况，不要判为差异：
 - 轻微模糊
@@ -98,6 +107,7 @@ CANDIDATE_REVIEW_PROMPT = """你是局部图形差异复核器。
 3. 如果只是边缘厚度或轻微对齐误差，输出 "decision":"match"。
 4. 如果无法可靠判断，输出 "decision":"unknown"。
 5. 当 decision 为 "match" 时，differences 必须是空数组 []。
+6. summary 只描述“是否存在真实差异”，不要描述图形类别。
 
 仅输出如下格式的 JSON：
 {"decision":"match|mismatch|unknown","confidence":0.0,"differences":[],"summary":"..."}"""
@@ -396,23 +406,6 @@ def clip_box(box: Sequence[int], image_shape: Sequence[int], pad: int = 0) -> Li
     return [x1, y1, x2, y2]
 
 
-def draw_indexed_boxes(image: np.ndarray, candidates: Sequence[Dict[str, object]], color: Tuple[int, int, int]) -> np.ndarray:
-    canvas = image.copy()
-    for idx, candidate in enumerate(candidates):
-        x1, y1, x2, y2 = [int(v) for v in candidate["box"]]
-        cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(
-            canvas,
-            str(idx),
-            (x1, max(12, y1 - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            color,
-            2,
-        )
-    return canvas
-
-
 def draw_single_box(image: np.ndarray, box: Sequence[int], color: Tuple[int, int, int]) -> np.ndarray:
     canvas = image.copy()
     x1, y1, x2, y2 = [int(v) for v in box]
@@ -508,6 +501,183 @@ def build_marked_candidate_crop(
     return draw_single_box(crop, rel_box, (0, 0, 255))
 
 
+def fit_image_to_panel(image: np.ndarray, panel_size: int) -> np.ndarray:
+    panel = np.ones((panel_size, panel_size, 3), dtype=np.uint8) * 255
+    h, w = image.shape[:2]
+    if h == 0 or w == 0:
+        return panel
+
+    scale = panel_size / max(h, w)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    interpolation = cv2.INTER_LINEAR if scale >= 1.0 else cv2.INTER_AREA
+    resized = cv2.resize(image, (new_w, new_h), interpolation=interpolation)
+    x_offset = (panel_size - new_w) // 2
+    y_offset = (panel_size - new_h) // 2
+    panel[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+    return panel
+
+
+def create_candidate_review_canvas(
+    template_full_marked: np.ndarray,
+    target_full_marked: np.ndarray,
+    template_candidate_marked: np.ndarray,
+    target_candidate_marked: np.ndarray,
+) -> np.ndarray:
+    panel_size = VLM_CANVAS_SIZE
+    gap = 20
+    header = 36
+    footer = 8
+    canvas_h = header * 2 + panel_size * 2 + gap + footer
+    canvas_w = panel_size * 2 + gap
+    canvas = np.ones((canvas_h, canvas_w, 3), dtype=np.uint8) * 255
+
+    panels = [
+        ("Template Region", fit_image_to_panel(template_full_marked, panel_size), 0, header),
+        ("Target Region", fit_image_to_panel(target_full_marked, panel_size), panel_size + gap, header),
+        ("Template Zoom", fit_image_to_panel(template_candidate_marked, panel_size), 0, header * 2 + panel_size + gap),
+        ("Target Zoom", fit_image_to_panel(target_candidate_marked, panel_size), panel_size + gap, header * 2 + panel_size + gap),
+    ]
+
+    for title, panel, x, y in panels:
+        cv2.putText(
+            canvas,
+            title,
+            (x + 10, y - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 0),
+            2,
+        )
+        canvas[y:y + panel_size, x:x + panel_size] = panel
+
+    cv2.line(
+        canvas,
+        (panel_size + gap // 2, 0),
+        (panel_size + gap // 2, canvas_h),
+        (180, 180, 180),
+        2,
+    )
+    cv2.line(
+        canvas,
+        (0, header + panel_size + gap // 2),
+        (canvas_w, header + panel_size + gap // 2),
+        (180, 180, 180),
+        2,
+    )
+    return canvas
+
+
+def compare_canvas_with_vlm(
+    comparator,
+    canvas: np.ndarray,
+    prompt: str,
+) -> Dict[str, object]:
+    canvas_b64 = comparator._image_to_base64(canvas)
+    last_error = None
+
+    for attempt in range(VLM_MAX_RETRIES):
+        try:
+            messages = [
+                {
+                    "role": "user",
+                    "content": prompt,
+                    "images": [canvas_b64],
+                }
+            ]
+            response = requests.post(
+                f"{comparator.api_base}/api/chat",
+                json={
+                    "model": comparator.model_name,
+                    "messages": messages,
+                    "stream": False,
+                    "think": False,
+                    "options": {
+                        "temperature": 0,
+                        "num_predict": VLM_NUM_PREDICT,
+                    },
+                },
+                timeout=comparator.timeout,
+            )
+            response.raise_for_status()
+            result = response.json()
+            message = result.get("message", {})
+            content = message.get("content", "") or message.get("thinking", "")
+            if not content:
+                if attempt < VLM_MAX_RETRIES - 1:
+                    continue
+                return comparator._make_unknown_result(
+                    error_type="empty_response",
+                    summary="API 返回空响应",
+                )
+
+            parsed = comparator._parse_response(content)
+            if parsed.get("decision") == "unknown" and parsed.get("parse_error") and attempt < VLM_MAX_RETRIES - 1:
+                continue
+            return parsed
+        except requests.exceptions.Timeout:
+            last_error = "timeout"
+            if attempt < VLM_MAX_RETRIES - 1:
+                continue
+            return comparator._make_unknown_result(
+                error_type="timeout",
+                summary="对比失败：请求超时",
+            )
+        except requests.exceptions.RequestException as exc:
+            last_error = str(exc)
+            if attempt < VLM_MAX_RETRIES - 1:
+                continue
+            return comparator._make_unknown_result(
+                error_type="request_error",
+                summary=f"对比失败：{exc}",
+            )
+
+    return comparator._make_unknown_result(
+        error_type="max_retries_exceeded",
+        summary=f"对比失败：{last_error or '超过最大重试次数'}",
+    )
+
+
+def split_final_candidates(
+    candidate_results: Sequence[Dict[str, object]],
+) -> Tuple[List[List[int]], List[List[int]]]:
+    mismatch_boxes: List[List[int]] = []
+    unknown_boxes: List[List[int]] = []
+    for candidate in candidate_results:
+        if not bool(candidate.get("sent_to_vlm")):
+            continue
+        decision = str(candidate.get("vlm_result", {}).get("decision", "unknown"))
+        box = [int(v) for v in candidate["box"]]
+        if decision == "mismatch":
+            mismatch_boxes.append(box)
+        elif decision == "unknown":
+            unknown_boxes.append(box)
+    return mismatch_boxes, unknown_boxes
+
+
+def draw_final_diff_canvas(
+    template_image: np.ndarray,
+    target_image: np.ndarray,
+    mismatch_boxes: Sequence[Sequence[int]],
+    unknown_boxes: Sequence[Sequence[int]],
+) -> np.ndarray:
+    template_canvas = template_image.copy()
+    target_canvas = target_image.copy()
+    for box in mismatch_boxes:
+        template_canvas = draw_single_box(template_canvas, box, (0, 0, 255))
+        target_canvas = draw_single_box(target_canvas, box, (0, 0, 255))
+    for box in unknown_boxes:
+        template_canvas = draw_single_box(template_canvas, box, (0, 165, 255))
+        target_canvas = draw_single_box(target_canvas, box, (0, 165, 255))
+
+    canvas = np.ones((max(template_canvas.shape[0], target_canvas.shape[0]) + 40, template_canvas.shape[1] + target_canvas.shape[1] + 20, 3), dtype=np.uint8) * 255
+    cv2.putText(canvas, "Template", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+    cv2.putText(canvas, "Target", (template_canvas.shape[1] + 30, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+    canvas[40:40 + template_canvas.shape[0], 0:template_canvas.shape[1]] = template_canvas
+    canvas[40:40 + target_canvas.shape[0], template_canvas.shape[1] + 20:template_canvas.shape[1] + 20 + target_canvas.shape[1]] = target_canvas
+    return canvas
+
+
 def summarize_pair_decision(candidate_results: Sequence[Dict[str, object]]) -> str:
     if not candidate_results:
         return "match"
@@ -547,27 +717,11 @@ def compare_one_pair(
     template_only_mask, target_only_mask = compute_tolerant_difference_masks(template_mask, target_mask)
     candidates = extract_candidate_boxes(template_only_mask, target_only_mask)
 
-    template_candidate_vis = draw_indexed_boxes(template_normalized, candidates, (0, 0, 255))
-    target_candidate_vis = draw_indexed_boxes(target_normalized, candidates, (255, 0, 0))
-
-    cv2.imwrite(str(pair_output_dir / "template_crop.jpg"), template_crop)
-    cv2.imwrite(str(pair_output_dir / "target_crop.jpg"), target_crop)
-    cv2.imwrite(str(pair_output_dir / "template_normalized.jpg"), template_normalized)
-    cv2.imwrite(str(pair_output_dir / "target_normalized.jpg"), target_normalized)
-    cv2.imwrite(str(pair_output_dir / "template_only_mask.jpg"), template_only_mask)
-    cv2.imwrite(str(pair_output_dir / "target_only_mask.jpg"), target_only_mask)
-    cv2.imwrite(str(pair_output_dir / "template_candidates.jpg"), template_candidate_vis)
-    cv2.imwrite(str(pair_output_dir / "target_candidates.jpg"), target_candidate_vis)
-
     candidate_results: List[Dict[str, object]] = []
     for idx, candidate in enumerate(candidates):
-        candidate_dir = pair_output_dir / f"candidate_{idx:02d}"
-        candidate_dir.mkdir(parents=True, exist_ok=True)
-
         candidate_box = clip_box(candidate["box"], template_normalized.shape[:2], pad=CANDIDATE_CONTEXT_PAD)
-        cx1, cy1, cx2, cy2 = candidate_box
-        template_candidate_crop = template_normalized[cy1:cy2, cx1:cx2].copy()
-        target_candidate_crop = target_normalized[cy1:cy2, cx1:cx2].copy()
+        template_full_marked = draw_single_box(template_normalized, candidate["box"], (0, 0, 255))
+        target_full_marked = draw_single_box(target_normalized, candidate["box"], (0, 0, 255))
         template_candidate_marked = build_marked_candidate_crop(
             template_normalized,
             candidate_box,
@@ -581,19 +735,18 @@ def compare_one_pair(
 
         should_review, review_meta = should_review_candidate(candidate)
 
-        cv2.imwrite(str(candidate_dir / "template_candidate.jpg"), template_candidate_crop)
-        cv2.imwrite(str(candidate_dir / "target_candidate.jpg"), target_candidate_crop)
-        cv2.imwrite(str(candidate_dir / "template_candidate_marked.jpg"), template_candidate_marked)
-        cv2.imwrite(str(candidate_dir / "target_candidate_marked.jpg"), target_candidate_marked)
-
         if should_review:
-            vlm_result = comparator.compare_images(
+            review_canvas = create_candidate_review_canvas(
+                template_full_marked,
+                target_full_marked,
                 template_candidate_marked,
                 target_candidate_marked,
-                custom_prompt=CANDIDATE_REVIEW_PROMPT,
             )
-            canvas = comparator._create_comparison_canvas(template_candidate_marked, target_candidate_marked)
-            cv2.imwrite(str(candidate_dir / "vlm_canvas.jpg"), canvas)
+            vlm_result = compare_canvas_with_vlm(
+                comparator,
+                review_canvas,
+                CANDIDATE_REVIEW_PROMPT,
+            )
         else:
             vlm_result = {
                 "decision": "match",
@@ -618,11 +771,26 @@ def compare_one_pair(
             "sent_to_vlm": bool(should_review),
             "vlm_result": vlm_result,
         }
-        with open(candidate_dir / "result.json", "w", encoding="utf-8") as file_obj:
-            json.dump(candidate_payload, file_obj, ensure_ascii=False, indent=2)
         candidate_results.append(candidate_payload)
 
     pair_decision = summarize_pair_decision(candidate_results)
+    mismatch_boxes, unknown_boxes = split_final_candidates(candidate_results)
+    final_diff_canvas = draw_final_diff_canvas(
+        template_normalized,
+        target_normalized,
+        mismatch_boxes,
+        unknown_boxes,
+    )
+    final_result = {
+        "pair_decision": pair_decision,
+        "final_mismatch_boxes": mismatch_boxes,
+        "final_unknown_boxes": unknown_boxes,
+        "candidate_results": candidate_results,
+    }
+    cv2.imwrite(str(pair_output_dir / "final_diff_canvas.jpg"), final_diff_canvas)
+    with open(pair_output_dir / "final_result.json", "w", encoding="utf-8") as file_obj:
+        json.dump(final_result, file_obj, ensure_ascii=False, indent=2)
+
     return {
         "template_box": [int(v) for v in template_box],
         "target_box": [int(v) for v in target_box],
@@ -632,6 +800,8 @@ def compare_one_pair(
         "candidate_count": len(candidate_results),
         "reviewed_candidate_count": count_reviewed_candidates(candidate_results),
         "pair_decision": pair_decision,
+        "final_mismatch_boxes": mismatch_boxes,
+        "final_unknown_boxes": unknown_boxes,
         "candidates": candidate_results,
     }
 
@@ -726,7 +896,9 @@ def main() -> int:
             "pair_decision="
             f"{result.get('pair_decision')} | "
             f"candidate_count={result.get('candidate_count', 0)} | "
-            f"reviewed_candidate_count={result.get('reviewed_candidate_count', 0)}"
+            f"reviewed_candidate_count={result.get('reviewed_candidate_count', 0)} | "
+            f"final_mismatch_boxes={len(result.get('final_mismatch_boxes', []))} | "
+            f"final_unknown_boxes={len(result.get('final_unknown_boxes', []))}"
         )
 
     overall_decision = "match"
@@ -770,6 +942,14 @@ def main() -> int:
         "unmatched_target": unmatched_target,
         "overall_decision": overall_decision,
         "pair_results": pair_results,
+        "final_outputs": [
+            {
+                "pair_dir": str(output_dir / f"pair_{idx:02d}_t{item['template_idx']}_s{item['target_idx']}"),
+                "final_diff_canvas": str(output_dir / f"pair_{idx:02d}_t{item['template_idx']}_s{item['target_idx']}" / "final_diff_canvas.jpg"),
+                "final_result_json": str(output_dir / f"pair_{idx:02d}_t{item['template_idx']}_s{item['target_idx']}" / "final_result.json"),
+            }
+            for idx, item in enumerate(pair_results)
+        ],
     }
 
     summary_path = output_dir / "summary.json"
@@ -778,7 +958,7 @@ def main() -> int:
 
     print("\nsummary json:")
     print(summary_path)
-    print("建议先看每个 pair 目录下的 template_candidates.jpg / target_candidates.jpg，再看各 candidate 的 result.json。")
+    print("请直接查看每个 pair 目录下的 final_diff_canvas.jpg 和 final_result.json。")
     return 0
 
 

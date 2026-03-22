@@ -112,6 +112,8 @@
   - 对每个候选框裁局部上下文，并调用现有 `VLMComparator.compare_images()` 做二次复核。
   - 在候选送入 VLM 前新增一层 review gate，优先过滤“小面积且双边均衡”的边缘残差候选。
   - 将 VLM 复核输入改为“带红框标注的局部上下文”，让模型明确只判断候选框内区域。
+  - 进一步改为脚本内直接构造 2x2 复核画布并发送给 Ollama，避免复用 `compare_images()` 时被重新降回普通左右拼图。
+  - 最终输出收敛为每个 pair 的 `final_diff_canvas.jpg` 与 `final_result.json`，不再把原始候选图作为主要结果输出。
   - 输出大区域候选框可视化、每个候选的局部图、VLM 对比画布、单候选 `result.json` 和顶层 `summary.json`。
 
 - 修改原因：
