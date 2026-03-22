@@ -74,6 +74,9 @@ REVIEW_MIN_DIFF_PIXELS = 130
 REVIEW_MIN_SIDE_DIFF_PIXELS = 90
 REVIEW_MIN_DOMINANCE_RATIO = 2.2
 FINAL_SINGLE_SIDED_HINTS = {"target_extra", "template_extra"}
+FINAL_BACKGROUND_REJECT_MAX_DIFF_PIXELS = 320
+FINAL_BACKGROUND_REJECT_MAX_SIDE_PIXELS = 220
+FINAL_SMALL_SINGLE_SIDED_RATIO = 0.25
 
 CANDIDATE_REVIEW_PROMPT = """你是局部图形差异复核器。
 你将看到一个 2x2 复核画布：
@@ -639,6 +642,19 @@ def compare_canvas_with_vlm(
     )
 
 
+def is_background_only_mismatch(candidate: Dict[str, object]) -> bool:
+    vlm_result = candidate.get("vlm_result", {})
+    text = " ".join(
+        [str(vlm_result.get("summary", ""))]
+        + [str(item) for item in vlm_result.get("differences", [])]
+    ).lower()
+    background_keywords = ["背景", "background", "灰色", "白色", "gray", "grey", "white"]
+    structural_keywords = ["额外", "多出", "缺少", "缺失", "手形", "符号", "图形", "extra", "missing", "symbol"]
+    return any(keyword in text for keyword in background_keywords) and not any(
+        keyword in text for keyword in structural_keywords
+    )
+
+
 def split_final_candidates(
     candidate_results: Sequence[Dict[str, object]],
 ) -> Tuple[List[List[int]], List[List[int]], Dict[str, object]]:
@@ -662,14 +678,45 @@ def split_final_candidates(
 
     suppressed_candidate_indices: List[int] = []
     if single_sided_mismatches:
+        largest_single_sided_diff = max(int(candidate.get("diff_pixels", 0)) for candidate in single_sided_mismatches)
+        filtered_single_sided: List[Dict[str, object]] = []
+        for candidate in single_sided_mismatches:
+            diff_pixels = int(candidate.get("diff_pixels", 0))
+            template_pixels = int(candidate.get("template_diff_pixels", 0))
+            target_pixels = int(candidate.get("target_diff_pixels", 0))
+            max_side_pixels = max(template_pixels, target_pixels)
+            relative_ratio = float(diff_pixels / max(1, largest_single_sided_diff))
+            background_only = is_background_only_mismatch(candidate)
+            should_suppress = (
+                background_only
+                and diff_pixels <= FINAL_BACKGROUND_REJECT_MAX_DIFF_PIXELS
+                and max_side_pixels <= FINAL_BACKGROUND_REJECT_MAX_SIDE_PIXELS
+                and relative_ratio <= FINAL_SMALL_SINGLE_SIDED_RATIO
+            )
+            if should_suppress:
+                suppressed_candidate_indices.append(int(candidate["candidate_idx"]))
+            else:
+                filtered_single_sided.append(candidate)
+
+        final_mismatch_candidates = filtered_single_sided
+        suppressed_candidate_indices.extend(
+            [
+                int(candidate["candidate_idx"])
+                for candidate in mismatch_candidates
+                if str(candidate.get("type_hint", "")) not in FINAL_SINGLE_SIDED_HINTS
+            ]
+        )
+        suppressed_candidate_indices = sorted(set(suppressed_candidate_indices))
+    else:
+        final_mismatch_candidates = mismatch_candidates
+
+    if single_sided_mismatches and not final_mismatch_candidates:
         final_mismatch_candidates = single_sided_mismatches
         suppressed_candidate_indices = [
             int(candidate["candidate_idx"])
             for candidate in mismatch_candidates
             if str(candidate.get("type_hint", "")) not in FINAL_SINGLE_SIDED_HINTS
         ]
-    else:
-        final_mismatch_candidates = mismatch_candidates
 
     mismatch_boxes = [[int(v) for v in candidate["box"]] for candidate in final_mismatch_candidates]
     unknown_boxes = [[int(v) for v in candidate["box"]] for candidate in unknown_candidates]
@@ -677,6 +724,9 @@ def split_final_candidates(
         "selection_rule": "prefer_single_sided_mismatch_over_mixed",
         "single_sided_mismatch_count": len(single_sided_mismatches),
         "suppressed_candidate_indices": suppressed_candidate_indices,
+        "background_only_small_reject_max_diff_pixels": FINAL_BACKGROUND_REJECT_MAX_DIFF_PIXELS,
+        "background_only_small_reject_max_side_pixels": FINAL_BACKGROUND_REJECT_MAX_SIDE_PIXELS,
+        "background_only_small_reject_max_relative_ratio": FINAL_SMALL_SINGLE_SIDED_RATIO,
     }
     return mismatch_boxes, unknown_boxes, selection_meta
 
@@ -961,6 +1011,9 @@ def main() -> int:
             "review_min_side_diff_pixels": REVIEW_MIN_SIDE_DIFF_PIXELS,
             "review_min_dominance_ratio": REVIEW_MIN_DOMINANCE_RATIO,
             "final_selection_rule": "prefer_single_sided_mismatch_over_mixed",
+            "background_only_small_reject_max_diff_pixels": FINAL_BACKGROUND_REJECT_MAX_DIFF_PIXELS,
+            "background_only_small_reject_max_side_pixels": FINAL_BACKGROUND_REJECT_MAX_SIDE_PIXELS,
+            "background_only_small_reject_max_relative_ratio": FINAL_SMALL_SINGLE_SIDED_RATIO,
         },
         "template_regions": template_regions,
         "target_regions": target_regions,
