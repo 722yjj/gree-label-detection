@@ -28,6 +28,7 @@ from label_detection.core.config import (
 )
 from label_detection.extraction.pdf import extract_red_box_info
 from label_detection.matching.layout import (
+    detect_barcode_region,
     detect_layout_regions,
     draw_regions,
     extract_regions_by_type,
@@ -62,6 +63,17 @@ TEXTURE_TRANSITION_MIN = 0.08
 TEXTURE_VERTICAL_BIAS_MIN = 1.6
 TEXTURE_GRADIENT_BIAS_MIN = 1.8
 TEXTURE_ROW_TRANSITION_MAX = 0.18
+LOCAL_BARCODE_CLOSE_WIDTH = 17
+LOCAL_BARCODE_CLOSE_HEIGHT = 3
+LOCAL_BARCODE_DILATE_WIDTH = 11
+LOCAL_BARCODE_DILATE_HEIGHT = 5
+LOCAL_BARCODE_MIN_WIDTH_RATIO = 0.16
+LOCAL_BARCODE_MIN_HEIGHT_RATIO = 0.16
+LOCAL_BARCODE_MIN_AREA_RATIO = 0.008
+LOCAL_BARCODE_BOX_PAD_X = 10
+LOCAL_BARCODE_BOX_PAD_TOP = 4
+LOCAL_BARCODE_BOX_PAD_BOTTOM_RATIO = 0.45
+LOCAL_BARCODE_MERGE_GAP = 18
 
 DIFF_TOLERANCE_KERNEL = 9
 CANDIDATE_CLOSE_KERNEL = 11
@@ -283,6 +295,87 @@ def filter_repetitive_texture_regions(
             comparable.append(region_copy)
 
     return comparable, skipped
+
+
+def detect_local_barcode_boxes(image: np.ndarray) -> List[List[int]]:
+    if image.size == 0:
+        return []
+
+    img_h, img_w = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    close_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (LOCAL_BARCODE_CLOSE_WIDTH, LOCAL_BARCODE_CLOSE_HEIGHT),
+    )
+    dilate_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (LOCAL_BARCODE_DILATE_WIDTH, LOCAL_BARCODE_DILATE_HEIGHT),
+    )
+    merged = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_kernel)
+    merged = cv2.dilate(merged, dilate_kernel, iterations=1)
+
+    min_width = max(56, int(round(img_w * LOCAL_BARCODE_MIN_WIDTH_RATIO)))
+    min_height = max(22, int(round(img_h * LOCAL_BARCODE_MIN_HEIGHT_RATIO)))
+    min_area = img_h * img_w * LOCAL_BARCODE_MIN_AREA_RATIO
+
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats((merged > 0).astype(np.uint8), connectivity=8)
+    raw_boxes: List[List[int]] = []
+    for label_idx in range(1, num_labels):
+        x, y, w, h, area = stats[label_idx]
+        if area < min_area or w < min_width or h < min_height:
+            continue
+
+        region = {
+            "label": "image",
+            "score": 1.0,
+            "coordinate": [int(x), int(y), int(x + w), int(y + h)],
+        }
+        is_barcode, _ = detect_barcode_region(region, image, ocr_boxes=None)
+        if not is_barcode:
+            upper_h = max(12, int(round(h * 0.72)))
+            upper_region = {
+                "label": "image",
+                "score": 1.0,
+                "coordinate": [int(x), int(y), int(x + w), int(y + upper_h)],
+            }
+            is_barcode, _ = detect_barcode_region(upper_region, image, ocr_boxes=None)
+            if not is_barcode:
+                continue
+
+        pad_bottom = max(10, int(round(h * LOCAL_BARCODE_BOX_PAD_BOTTOM_RATIO)))
+        padded = clip_box(
+            [
+                int(x - LOCAL_BARCODE_BOX_PAD_X),
+                int(y - LOCAL_BARCODE_BOX_PAD_TOP),
+                int(x + w + LOCAL_BARCODE_BOX_PAD_X),
+                int(y + h + pad_bottom),
+            ],
+            image.shape[:2],
+        )
+        raw_boxes.append(padded)
+
+    if not raw_boxes:
+        return []
+    return merge_boxes(raw_boxes, LOCAL_BARCODE_MERGE_GAP)
+
+
+def apply_ignore_boxes_to_mask(mask: np.ndarray, boxes: Sequence[Sequence[int]]) -> np.ndarray:
+    output = mask.copy()
+    for box in boxes:
+        x1, y1, x2, y2 = clip_box(box, mask.shape[:2])
+        output[y1:y2, x1:x2] = 0
+    return output
+
+
+def apply_ignore_boxes_to_image(image: np.ndarray, boxes: Sequence[Sequence[int]]) -> np.ndarray:
+    output = image.copy()
+    for box in boxes:
+        x1, y1, x2, y2 = clip_box(box, image.shape[:2])
+        output[y1:y2, x1:x2] = 255
+    return output
 
 
 def foreground_bbox(mask: np.ndarray) -> List[int]:
@@ -853,21 +946,37 @@ def compare_one_pair(
     target_normalized = normalized["target_image"]
     template_mask = normalized["template_mask"]
     target_mask = normalized["target_mask"]
-    template_only_mask, target_only_mask = compute_tolerant_difference_masks(template_mask, target_mask)
+
+    template_barcode_boxes = detect_local_barcode_boxes(template_normalized)
+    target_barcode_boxes = detect_local_barcode_boxes(target_normalized)
+    barcode_ignore_boxes = merge_boxes(
+        template_barcode_boxes + target_barcode_boxes,
+        LOCAL_BARCODE_MERGE_GAP,
+    ) if (template_barcode_boxes or target_barcode_boxes) else []
+
+    comparison_template_image = apply_ignore_boxes_to_image(template_normalized, barcode_ignore_boxes)
+    comparison_target_image = apply_ignore_boxes_to_image(target_normalized, barcode_ignore_boxes)
+    comparison_template_mask = apply_ignore_boxes_to_mask(template_mask, barcode_ignore_boxes)
+    comparison_target_mask = apply_ignore_boxes_to_mask(target_mask, barcode_ignore_boxes)
+
+    template_only_mask, target_only_mask = compute_tolerant_difference_masks(
+        comparison_template_mask,
+        comparison_target_mask,
+    )
     candidates = extract_candidate_boxes(template_only_mask, target_only_mask)
 
     candidate_results: List[Dict[str, object]] = []
     for idx, candidate in enumerate(candidates):
-        candidate_box = clip_box(candidate["box"], template_normalized.shape[:2], pad=CANDIDATE_CONTEXT_PAD)
-        template_full_marked = draw_single_box(template_normalized, candidate["box"], (0, 0, 255))
-        target_full_marked = draw_single_box(target_normalized, candidate["box"], (0, 0, 255))
+        candidate_box = clip_box(candidate["box"], comparison_template_image.shape[:2], pad=CANDIDATE_CONTEXT_PAD)
+        template_full_marked = draw_single_box(comparison_template_image, candidate["box"], (0, 0, 255))
+        target_full_marked = draw_single_box(comparison_target_image, candidate["box"], (0, 0, 255))
         template_candidate_marked = build_marked_candidate_crop(
-            template_normalized,
+            comparison_template_image,
             candidate_box,
             candidate["box"],
         )
         target_candidate_marked = build_marked_candidate_crop(
-            target_normalized,
+            comparison_target_image,
             candidate_box,
             candidate["box"],
         )
@@ -915,13 +1024,16 @@ def compare_one_pair(
     pair_decision = summarize_pair_decision(candidate_results)
     mismatch_boxes, unknown_boxes, final_selection = split_final_candidates(candidate_results)
     final_diff_canvas = draw_final_diff_canvas(
-        template_normalized,
-        target_normalized,
+        comparison_template_image,
+        comparison_target_image,
         mismatch_boxes,
         unknown_boxes,
     )
     final_result = {
         "pair_decision": pair_decision,
+        "barcode_ignore_template_boxes": template_barcode_boxes,
+        "barcode_ignore_target_boxes": target_barcode_boxes,
+        "barcode_ignore_boxes": barcode_ignore_boxes,
         "final_mismatch_boxes": mismatch_boxes,
         "final_unknown_boxes": unknown_boxes,
         "final_selection": final_selection,
@@ -937,6 +1049,9 @@ def compare_one_pair(
         "template_size": list(template_crop.shape[:2]),
         "target_size": list(target_crop.shape[:2]),
         "normalization": normalized["meta"],
+        "barcode_ignore_template_boxes": template_barcode_boxes,
+        "barcode_ignore_target_boxes": target_barcode_boxes,
+        "barcode_ignore_boxes": barcode_ignore_boxes,
         "candidate_count": len(candidate_results),
         "reviewed_candidate_count": count_reviewed_candidates(candidate_results),
         "pair_decision": pair_decision,
@@ -1062,8 +1177,14 @@ def main() -> int:
         "vlm_api_base": VLM_API_BASE,
         "vlm_timeout_seconds": VLM_TIMEOUT_SECONDS,
         "candidate_strategy": {
-            "method": "tolerant_diff_union -> merged candidate boxes -> local VLM review",
+            "method": "internal_barcode_ignore -> tolerant_diff_union -> merged candidate boxes -> local VLM review",
             "tolerance_kernel": DIFF_TOLERANCE_KERNEL,
+            "local_barcode_close_kernel": [LOCAL_BARCODE_CLOSE_WIDTH, LOCAL_BARCODE_CLOSE_HEIGHT],
+            "local_barcode_dilate_kernel": [LOCAL_BARCODE_DILATE_WIDTH, LOCAL_BARCODE_DILATE_HEIGHT],
+            "local_barcode_min_width_ratio": LOCAL_BARCODE_MIN_WIDTH_RATIO,
+            "local_barcode_min_height_ratio": LOCAL_BARCODE_MIN_HEIGHT_RATIO,
+            "local_barcode_min_area_ratio": LOCAL_BARCODE_MIN_AREA_RATIO,
+            "local_barcode_merge_gap": LOCAL_BARCODE_MERGE_GAP,
             "candidate_close_kernel": CANDIDATE_CLOSE_KERNEL,
             "candidate_dilate_kernel": CANDIDATE_DILATE_KERNEL,
             "candidate_min_area_ratio": CANDIDATE_MIN_AREA_RATIO,
