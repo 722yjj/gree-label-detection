@@ -22,6 +22,53 @@
 
 ---
 
+## 2026-03-23 - 局部条码带检测改为固定阈值优先 + 自适应回退
+
+- 背景：
+  在 `salvage_debug/target_region_01/debug.json` 里已经确认，当前失败点不是 salvage 子区域被过滤掉，而是局部条码候选根本没有生成出来。该混合 region 的 `transition_density` 约为 `0.1283`，但按列条码带检测一直使用固定阈值 `0.20`，阈值明显偏高，导致右侧真实条码带没有进入候选。
+
+- 修改文件：
+  - `scripts/test_vlm_candidate_review.py`
+  - `AGENT_CHANGELOG.md`
+
+- 修改内容：
+  - 为 1D 条码带检测新增自适应回退参数：
+    - `LOCAL_BARCODE_BAND_EDGE_FLOOR`
+    - `LOCAL_BARCODE_BAND_ADAPTIVE_PERCENTILE`
+    - `LOCAL_BARCODE_BAND_ADAPTIVE_SCALE`
+    - `LOCAL_BARCODE_BAND_ADAPTIVE_RIGHT_START_RATIO`
+    - `LOCAL_BARCODE_BAND_ADAPTIVE_MIN_ACTIVE_COLS`
+  - `detect_barcode_band_box_with_debug()` 改为两段式：
+    - 先用原固定阈值 `LOCAL_BARCODE_BAND_EDGE_MIN`
+    - 若找不到有效 segment，再基于右侧有效列的 `smooth_edge` 分布自适应计算阈值后重试
+  - 在 `debug.json` 中新增：
+    - `band_edge_threshold_mode`
+    - `band_edge_threshold`
+    - `band_fixed_edge_threshold`
+    - `band_adaptive_edge_threshold`
+    - `band_adaptive_pool_count`
+    - `band_adaptive_right_start`
+    - `band_adaptive_pool_stats`
+  - 在顶层 `summary.json` 的 `candidate_strategy` 中同步记录新增自适应参数。
+
+- 修改原因：
+  - 先修正“局部条码候选生成过于保守”这个明确失败点。
+  - 保留固定阈值作为首选，避免无差别放宽；只有固定阈值无结果时才进入自适应回退。
+
+- 影响范围：
+  - 仅影响实验脚本里的 mixed barcode salvage 分支，不影响主流程。
+  - `salvage_debug` 的 `debug.json` 和顶层 `summary.json` 会新增自适应阈值相关字段。
+
+- 验证情况：
+  - 已完成静态语法检查。
+  - 尚未在当前命令环境执行端到端运行，需在服务器复跑后查看 `salvage_debug/target_region_01/debug.json` 是否出现非空 `local_barcode_boxes` 或 `band_box`。
+
+- 风险 / 待验证项：
+  - 自适应阈值若过宽，可能引入新的右侧伪条码候选；不过后面仍有 `detect_barcode_region()` 二次验证。
+  - 若这轮仍无候选，下一步应优先检查 `detect_barcode_region()` 对局部 band box 的验证是否过严，而不是继续调 band threshold。
+
+---
+
 ## 2026-03-23 - 混合条码抢救增加可视化调试输出
 
 - 背景：

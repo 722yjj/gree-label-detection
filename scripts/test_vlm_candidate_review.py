@@ -68,11 +68,16 @@ LOCAL_BARCODE_DILATE_WIDTH = 11
 LOCAL_BARCODE_DILATE_HEIGHT = 5
 LOCAL_BARCODE_BAND_WINDOW = 11
 LOCAL_BARCODE_BAND_EDGE_MIN = 0.20
+LOCAL_BARCODE_BAND_EDGE_FLOOR = 0.08
 LOCAL_BARCODE_BAND_DARK_MIN = 0.08
 LOCAL_BARCODE_BAND_DARK_MAX = 0.88
 LOCAL_BARCODE_BAND_MIN_WIDTH_RATIO = 0.18
 LOCAL_BARCODE_BAND_MIN_START_RATIO = 0.35
 LOCAL_BARCODE_BAND_CLOSE_GAP = 9
+LOCAL_BARCODE_BAND_ADAPTIVE_PERCENTILE = 72
+LOCAL_BARCODE_BAND_ADAPTIVE_SCALE = 0.92
+LOCAL_BARCODE_BAND_ADAPTIVE_RIGHT_START_RATIO = 0.28
+LOCAL_BARCODE_BAND_ADAPTIVE_MIN_ACTIVE_COLS = 18
 LOCAL_BARCODE_MIN_WIDTH_RATIO = 0.16
 LOCAL_BARCODE_MIN_HEIGHT_RATIO = 0.16
 LOCAL_BARCODE_MIN_AREA_RATIO = 0.008
@@ -327,6 +332,13 @@ def detect_barcode_band_box_with_debug(image: np.ndarray) -> Tuple[List[int] | N
         "smooth_edge_profile": [],
         "candidate_segments": [],
         "candidate_mask": None,
+        "fixed_edge_threshold": float(LOCAL_BARCODE_BAND_EDGE_MIN),
+        "edge_threshold_mode": "fixed",
+        "edge_threshold": float(LOCAL_BARCODE_BAND_EDGE_MIN),
+        "adaptive_edge_threshold": None,
+        "adaptive_pool_count": 0,
+        "adaptive_right_start": 0,
+        "adaptive_pool_stats": {},
     }
     if image.size == 0:
         return None, debug
@@ -352,35 +364,78 @@ def detect_barcode_band_box_with_debug(image: np.ndarray) -> Tuple[List[int] | N
     debug["dark_profile"] = [float(v) for v in dark_profile.tolist()]
     debug["smooth_edge_profile"] = [float(v) for v in smooth_edge.tolist()]
 
-    candidate_cols = (
-        (smooth_edge >= LOCAL_BARCODE_BAND_EDGE_MIN)
-        & (dark_profile >= LOCAL_BARCODE_BAND_DARK_MIN)
-        & (dark_profile <= LOCAL_BARCODE_BAND_DARK_MAX)
-    )
-    if not np.any(candidate_cols):
-        debug["candidate_mask"] = np.zeros((1, img_w), dtype=np.uint8)
-        return None, debug
-
-    candidate_img = (candidate_cols.astype(np.uint8) * 255)[None, :]
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (LOCAL_BARCODE_BAND_CLOSE_GAP, 1))
-    candidate_img = cv2.morphologyEx(candidate_img, cv2.MORPH_CLOSE, close_kernel)
-    candidate_cols = candidate_img[0] > 0
-    debug["candidate_mask"] = candidate_img.copy()
-
     min_width = max(56, int(round(img_w * LOCAL_BARCODE_BAND_MIN_WIDTH_RATIO)))
     min_start = int(round(img_w * LOCAL_BARCODE_BAND_MIN_START_RATIO))
-    segments: List[Tuple[int, int, float]] = []
-    start = None
-    for idx, is_on in enumerate(candidate_cols.tolist() + [False]):
-        if is_on and start is None:
-            start = idx
-        elif not is_on and start is not None:
-            end = idx
-            width = end - start
-            if width >= min_width and end >= min_start:
-                score = float(smooth_edge[start:end].mean() * width + end * 0.02)
-                segments.append((start, end, score))
-            start = None
+    dark_ok = (
+        (dark_profile >= LOCAL_BARCODE_BAND_DARK_MIN)
+        & (dark_profile <= LOCAL_BARCODE_BAND_DARK_MAX)
+    )
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (LOCAL_BARCODE_BAND_CLOSE_GAP, 1))
+
+    def build_segments(edge_threshold: float) -> Tuple[np.ndarray, List[Tuple[int, int, float]]]:
+        candidate_cols = (smooth_edge >= edge_threshold) & dark_ok
+        if not np.any(candidate_cols):
+            return np.zeros((1, img_w), dtype=np.uint8), []
+
+        candidate_img = (candidate_cols.astype(np.uint8) * 255)[None, :]
+        candidate_img = cv2.morphologyEx(candidate_img, cv2.MORPH_CLOSE, close_kernel)
+        candidate_cols = candidate_img[0] > 0
+
+        segments: List[Tuple[int, int, float]] = []
+        start = None
+        for idx, is_on in enumerate(candidate_cols.tolist() + [False]):
+            if is_on and start is None:
+                start = idx
+            elif not is_on and start is not None:
+                end = idx
+                width = end - start
+                if width >= min_width and end >= min_start:
+                    score = float(smooth_edge[start:end].mean() * width + end * 0.02)
+                    segments.append((start, end, score))
+                start = None
+        return candidate_img, segments
+
+    candidate_img, segments = build_segments(float(LOCAL_BARCODE_BAND_EDGE_MIN))
+    debug["candidate_mask"] = candidate_img.copy()
+
+    if not segments:
+        right_start = min(img_w - 1, max(0, int(round(img_w * LOCAL_BARCODE_BAND_ADAPTIVE_RIGHT_START_RATIO))))
+        adaptive_pool = smooth_edge[right_start:][dark_ok[right_start:]]
+        adaptive_pool = adaptive_pool[adaptive_pool > 0]
+        debug["adaptive_right_start"] = int(right_start)
+        debug["adaptive_pool_count"] = int(adaptive_pool.size)
+        if adaptive_pool.size >= LOCAL_BARCODE_BAND_ADAPTIVE_MIN_ACTIVE_COLS:
+            adaptive_percentile = float(
+                np.percentile(adaptive_pool, LOCAL_BARCODE_BAND_ADAPTIVE_PERCENTILE)
+            )
+            adaptive_mean = float(adaptive_pool.mean())
+            adaptive_std = float(adaptive_pool.std())
+            adaptive_threshold = max(
+                LOCAL_BARCODE_BAND_EDGE_FLOOR,
+                min(
+                    LOCAL_BARCODE_BAND_EDGE_MIN,
+                    max(
+                        adaptive_percentile * LOCAL_BARCODE_BAND_ADAPTIVE_SCALE,
+                        adaptive_mean + adaptive_std * 0.15,
+                    ),
+                ),
+            )
+            debug["adaptive_pool_stats"] = {
+                "mean": adaptive_mean,
+                "std": adaptive_std,
+                "percentile": adaptive_percentile,
+            }
+            debug["adaptive_edge_threshold"] = float(adaptive_threshold)
+
+            adaptive_candidate_img, adaptive_segments = build_segments(adaptive_threshold)
+            debug["candidate_mask"] = adaptive_candidate_img.copy()
+            debug["edge_threshold_mode"] = "adaptive_probe"
+            debug["edge_threshold"] = float(adaptive_threshold)
+            if adaptive_segments:
+                candidate_img = adaptive_candidate_img
+                segments = adaptive_segments
+                debug["edge_threshold_mode"] = "adaptive"
+                debug["edge_threshold"] = float(adaptive_threshold)
 
     debug["candidate_segments"] = [
         {"x1": int(seg_start), "x2": int(seg_end), "score": float(score)}
@@ -727,6 +782,13 @@ def save_salvage_region_debug(
         "local_barcode_boxes": local_barcode_boxes,
         "component_candidate_boxes": local_debug.get("component_candidate_boxes", []),
         "band_box": band_box,
+        "band_edge_threshold_mode": local_debug.get("band_debug", {}).get("edge_threshold_mode"),
+        "band_edge_threshold": local_debug.get("band_debug", {}).get("edge_threshold"),
+        "band_fixed_edge_threshold": local_debug.get("band_debug", {}).get("fixed_edge_threshold"),
+        "band_adaptive_edge_threshold": local_debug.get("band_debug", {}).get("adaptive_edge_threshold"),
+        "band_adaptive_pool_count": local_debug.get("band_debug", {}).get("adaptive_pool_count"),
+        "band_adaptive_right_start": local_debug.get("band_debug", {}).get("adaptive_right_start"),
+        "band_adaptive_pool_stats": local_debug.get("band_debug", {}).get("adaptive_pool_stats", {}),
         "band_candidate_segments": local_debug.get("band_debug", {}).get("candidate_segments", []),
         "merged_local_barcode_boxes": local_debug.get("merged_boxes", []),
         "salvage_boxes_local": salvage_boxes_local,
@@ -1624,10 +1686,15 @@ def main() -> int:
             "local_barcode_dilate_kernel": [LOCAL_BARCODE_DILATE_WIDTH, LOCAL_BARCODE_DILATE_HEIGHT],
             "local_barcode_band_window": LOCAL_BARCODE_BAND_WINDOW,
             "local_barcode_band_edge_min": LOCAL_BARCODE_BAND_EDGE_MIN,
+            "local_barcode_band_edge_floor": LOCAL_BARCODE_BAND_EDGE_FLOOR,
             "local_barcode_band_dark_range": [LOCAL_BARCODE_BAND_DARK_MIN, LOCAL_BARCODE_BAND_DARK_MAX],
             "local_barcode_band_min_width_ratio": LOCAL_BARCODE_BAND_MIN_WIDTH_RATIO,
             "local_barcode_band_min_start_ratio": LOCAL_BARCODE_BAND_MIN_START_RATIO,
             "local_barcode_band_close_gap": LOCAL_BARCODE_BAND_CLOSE_GAP,
+            "local_barcode_band_adaptive_percentile": LOCAL_BARCODE_BAND_ADAPTIVE_PERCENTILE,
+            "local_barcode_band_adaptive_scale": LOCAL_BARCODE_BAND_ADAPTIVE_SCALE,
+            "local_barcode_band_adaptive_right_start_ratio": LOCAL_BARCODE_BAND_ADAPTIVE_RIGHT_START_RATIO,
+            "local_barcode_band_adaptive_min_active_cols": LOCAL_BARCODE_BAND_ADAPTIVE_MIN_ACTIVE_COLS,
             "local_barcode_min_width_ratio": LOCAL_BARCODE_MIN_WIDTH_RATIO,
             "local_barcode_min_height_ratio": LOCAL_BARCODE_MIN_HEIGHT_RATIO,
             "local_barcode_min_area_ratio": LOCAL_BARCODE_MIN_AREA_RATIO,
