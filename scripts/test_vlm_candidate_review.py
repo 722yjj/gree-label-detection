@@ -321,13 +321,19 @@ def _smooth_1d(values: np.ndarray, window: int) -> np.ndarray:
     return np.convolve(values.astype(np.float32), kernel, mode="same")
 
 
-def detect_barcode_band_box(image: np.ndarray) -> List[int] | None:
+def detect_barcode_band_box_with_debug(image: np.ndarray) -> Tuple[List[int] | None, Dict[str, object]]:
+    debug: Dict[str, object] = {
+        "dark_profile": [],
+        "smooth_edge_profile": [],
+        "candidate_segments": [],
+        "candidate_mask": None,
+    }
     if image.size == 0:
-        return None
+        return None, debug
 
     img_h, img_w = image.shape[:2]
     if img_h < 24 or img_w < 64:
-        return None
+        return None, debug
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -336,13 +342,15 @@ def detect_barcode_band_box(image: np.ndarray) -> List[int] | None:
     upper_h = max(18, int(round(img_h * 0.72)))
     upper = (binary[:upper_h] > 0).astype(np.uint8)
     if upper.size == 0:
-        return None
+        return None, debug
 
     dark_profile = upper.mean(axis=0)
     edge_profile = np.zeros(img_w, dtype=np.float32)
     if img_w > 1:
         edge_profile[1:] = np.abs(np.diff(upper.astype(np.float32), axis=1)).mean(axis=0)
     smooth_edge = _smooth_1d(edge_profile, LOCAL_BARCODE_BAND_WINDOW)
+    debug["dark_profile"] = [float(v) for v in dark_profile.tolist()]
+    debug["smooth_edge_profile"] = [float(v) for v in smooth_edge.tolist()]
 
     candidate_cols = (
         (smooth_edge >= LOCAL_BARCODE_BAND_EDGE_MIN)
@@ -350,12 +358,14 @@ def detect_barcode_band_box(image: np.ndarray) -> List[int] | None:
         & (dark_profile <= LOCAL_BARCODE_BAND_DARK_MAX)
     )
     if not np.any(candidate_cols):
-        return None
+        debug["candidate_mask"] = np.zeros((1, img_w), dtype=np.uint8)
+        return None, debug
 
     candidate_img = (candidate_cols.astype(np.uint8) * 255)[None, :]
     close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (LOCAL_BARCODE_BAND_CLOSE_GAP, 1))
     candidate_img = cv2.morphologyEx(candidate_img, cv2.MORPH_CLOSE, close_kernel)
     candidate_cols = candidate_img[0] > 0
+    debug["candidate_mask"] = candidate_img.copy()
 
     min_width = max(56, int(round(img_w * LOCAL_BARCODE_BAND_MIN_WIDTH_RATIO)))
     min_start = int(round(img_w * LOCAL_BARCODE_BAND_MIN_START_RATIO))
@@ -372,17 +382,21 @@ def detect_barcode_band_box(image: np.ndarray) -> List[int] | None:
                 segments.append((start, end, score))
             start = None
 
+    debug["candidate_segments"] = [
+        {"x1": int(seg_start), "x2": int(seg_end), "score": float(score)}
+        for seg_start, seg_end, score in segments
+    ]
     if not segments:
-        return None
+        return None, debug
 
     x1, x2, _ = max(segments, key=lambda item: item[2])
     band_pixels = binary[:, x1:x2] > 0
     if not np.any(band_pixels):
-        return None
+        return None, debug
 
     rows = np.where(np.any(band_pixels, axis=1))[0]
     if rows.size == 0:
-        return None
+        return None, debug
 
     local_box = clip_box(
         [
@@ -393,6 +407,7 @@ def detect_barcode_band_box(image: np.ndarray) -> List[int] | None:
         ],
         image.shape[:2],
     )
+    debug["proposed_box"] = [int(v) for v in local_box]
 
     region = {
         "label": "image",
@@ -410,19 +425,33 @@ def detect_barcode_band_box(image: np.ndarray) -> List[int] | None:
         ]
         is_barcode, _ = detect_barcode_region(upper_region, image, ocr_boxes=None)
         if not is_barcode:
-            return None
+            return None, debug
 
-    return local_box
+    return local_box, debug
 
 
-def detect_local_barcode_boxes(image: np.ndarray) -> List[List[int]]:
+def detect_barcode_band_box(image: np.ndarray) -> List[int] | None:
+    box, _ = detect_barcode_band_box_with_debug(image)
+    return box
+
+
+def detect_local_barcode_boxes_with_debug(image: np.ndarray) -> Tuple[List[List[int]], Dict[str, object]]:
+    debug: Dict[str, object] = {
+        "binary_mask": None,
+        "morph_mask": None,
+        "component_candidate_boxes": [],
+        "band_box": None,
+        "band_debug": {},
+        "merged_boxes": [],
+    }
     if image.size == 0:
-        return []
+        return [], debug
 
     img_h, img_w = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    debug["binary_mask"] = binary.copy()
 
     close_kernel = cv2.getStructuringElement(
         cv2.MORPH_RECT,
@@ -434,6 +463,7 @@ def detect_local_barcode_boxes(image: np.ndarray) -> List[List[int]]:
     )
     merged = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_kernel)
     merged = cv2.dilate(merged, dilate_kernel, iterations=1)
+    debug["morph_mask"] = merged.copy()
 
     min_width = max(56, int(round(img_w * LOCAL_BARCODE_MIN_WIDTH_RATIO)))
     min_height = max(22, int(round(img_h * LOCAL_BARCODE_MIN_HEIGHT_RATIO)))
@@ -475,28 +505,49 @@ def detect_local_barcode_boxes(image: np.ndarray) -> List[List[int]]:
         )
         raw_boxes.append(padded)
 
-    band_box = detect_barcode_band_box(image)
+    debug["component_candidate_boxes"] = [[int(v) for v in box] for box in raw_boxes]
+    band_box, band_debug = detect_barcode_band_box_with_debug(image)
+    debug["band_debug"] = band_debug
     if band_box is not None:
         raw_boxes.append(band_box)
+        debug["band_box"] = [int(v) for v in band_box]
 
     if not raw_boxes:
-        return []
-    return merge_boxes(raw_boxes, LOCAL_BARCODE_MERGE_GAP)
+        return [], debug
+
+    merged_boxes = merge_boxes(raw_boxes, LOCAL_BARCODE_MERGE_GAP)
+    debug["merged_boxes"] = [[int(v) for v in box] for box in merged_boxes]
+    return merged_boxes, debug
+
+
+def detect_local_barcode_boxes(image: np.ndarray) -> List[List[int]]:
+    boxes, _ = detect_local_barcode_boxes_with_debug(image)
+    return boxes
 
 
 def salvage_non_barcode_subregions(
     region: Dict[str, object],
     image: np.ndarray,
-) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], Dict[str, object]]:
     crop = crop_region(image, region["coordinate"])
-    local_barcode_boxes = detect_local_barcode_boxes(crop)
+    local_barcode_boxes, local_debug = detect_local_barcode_boxes_with_debug(crop)
+    debug_payload: Dict[str, object] = {
+        "crop": crop,
+        "local_barcode_boxes": [[int(v) for v in box] for box in local_barcode_boxes],
+        "local_debug": local_debug,
+        "masked_image": crop.copy(),
+        "masked_mask": None,
+        "salvage_boxes_local": [],
+    }
     if not local_barcode_boxes:
-        return [], []
+        return [], [], debug_payload
 
     crop_mask = to_binary_mask(crop)
     crop_mask = apply_ignore_boxes_to_mask(crop_mask, local_barcode_boxes)
     crop_mask = cv2.morphologyEx(crop_mask, cv2.MORPH_OPEN, np.ones((3, 3), dtype=np.uint8))
     crop_mask = cv2.morphologyEx(crop_mask, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8))
+    debug_payload["masked_image"] = apply_ignore_boxes_to_image(crop, local_barcode_boxes)
+    debug_payload["masked_mask"] = crop_mask.copy()
 
     img_h, img_w = crop_mask.shape[:2]
     min_area = img_h * img_w * SALVAGE_COMPONENT_MIN_AREA_RATIO
@@ -519,10 +570,12 @@ def salvage_non_barcode_subregions(
         )
 
     if not raw_boxes:
-        return [], []
+        return [], [], debug_payload
 
     child_regions: List[Dict[str, object]] = []
-    for child_idx, local_box in enumerate(merge_boxes(raw_boxes, SALVAGE_COMPONENT_MERGE_GAP)):
+    merged_local_boxes = merge_boxes(raw_boxes, SALVAGE_COMPONENT_MERGE_GAP)
+    debug_payload["salvage_boxes_local"] = [[int(v) for v in box] for box in merged_local_boxes]
+    for child_idx, local_box in enumerate(merged_local_boxes):
         child_region = dict(region)
         child_region["coordinate"] = _map_local_box_to_global(region["coordinate"], local_box)
         child_region["salvaged_from_mixed_barcode"] = True
@@ -537,13 +590,15 @@ def salvage_non_barcode_subregions(
         skipped_region["salvaged_from_mixed_barcode"] = True
         skipped_regions.append(skipped_region)
 
-    return child_regions, skipped_regions
+    return child_regions, skipped_regions, debug_payload
 
 
 def filter_regions_with_barcode_salvage(
     regions: Sequence[Dict[str, object]],
     image: np.ndarray,
     ocr_boxes: Sequence[Tuple[object, str, float]] | None = None,
+    debug_dir: Path | None = None,
+    debug_prefix: str = "region",
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
     comparable: List[Dict[str, object]] = []
     skipped: List[Dict[str, object]] = []
@@ -556,7 +611,19 @@ def filter_regions_with_barcode_salvage(
         is_texture, texture_meta = is_repetitive_vertical_texture(crop)
 
         if is_barcode or is_texture:
-            salvaged_regions, salvaged_skipped = salvage_non_barcode_subregions(region_copy, image)
+            salvaged_regions, salvaged_skipped, salvage_debug = salvage_non_barcode_subregions(region_copy, image)
+            if debug_dir is not None:
+                save_salvage_region_debug(
+                    debug_dir / f"{debug_prefix}_region_{idx:02d}",
+                    region_copy,
+                    is_barcode,
+                    barcode_meta,
+                    is_texture,
+                    texture_meta,
+                    salvage_debug,
+                    salvaged_regions,
+                    salvaged_skipped,
+                )
             if salvaged_regions:
                 comparable.extend(salvaged_regions)
                 skipped.extend(salvaged_skipped)
@@ -590,6 +657,90 @@ def apply_ignore_boxes_to_image(image: np.ndarray, boxes: Sequence[Sequence[int]
         x1, y1, x2, y2 = clip_box(box, image.shape[:2])
         output[y1:y2, x1:x2] = 255
     return output
+
+
+def save_salvage_region_debug(
+    region_dir: Path,
+    region: Dict[str, object],
+    is_barcode: bool,
+    barcode_meta: Dict[str, object],
+    is_texture: bool,
+    texture_meta: Dict[str, float],
+    salvage_debug: Dict[str, object],
+    salvaged_regions: Sequence[Dict[str, object]],
+    salvaged_skipped: Sequence[Dict[str, object]],
+) -> None:
+    region_dir.mkdir(parents=True, exist_ok=True)
+    crop = np.asarray(salvage_debug.get("crop"))
+    if crop.size == 0:
+        return
+
+    local_barcode_boxes = [[int(v) for v in box] for box in salvage_debug.get("local_barcode_boxes", [])]
+    masked_image = np.asarray(salvage_debug.get("masked_image"))
+    masked_mask = salvage_debug.get("masked_mask")
+    local_debug = dict(salvage_debug.get("local_debug", {}))
+    salvage_boxes_local = [[int(v) for v in box] for box in salvage_debug.get("salvage_boxes_local", [])]
+
+    candidate_overlay = crop.copy()
+    for box in local_debug.get("component_candidate_boxes", []):
+        x1, y1, x2, y2 = [int(v) for v in box]
+        cv2.rectangle(candidate_overlay, (x1, y1), (x2, y2), (0, 255, 255), 2)
+    band_box = local_debug.get("band_box")
+    if band_box:
+        x1, y1, x2, y2 = [int(v) for v in band_box]
+        cv2.rectangle(candidate_overlay, (x1, y1), (x2, y2), (255, 255, 0), 2)
+    for box in local_debug.get("merged_boxes", []):
+        x1, y1, x2, y2 = [int(v) for v in box]
+        cv2.rectangle(candidate_overlay, (x1, y1), (x2, y2), (0, 165, 255), 2)
+
+    salvage_overlay = masked_image.copy() if masked_image.size else crop.copy()
+    for box in salvage_boxes_local:
+        x1, y1, x2, y2 = [int(v) for v in box]
+        cv2.rectangle(salvage_overlay, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    for box in local_barcode_boxes:
+        x1, y1, x2, y2 = [int(v) for v in box]
+        cv2.rectangle(salvage_overlay, (x1, y1), (x2, y2), (0, 165, 255), 2)
+
+    cv2.imwrite(str(region_dir / "crop.jpg"), crop)
+    cv2.imwrite(str(region_dir / "barcode_candidates_overlay.jpg"), candidate_overlay)
+    cv2.imwrite(str(region_dir / "masked_foreground.jpg"), masked_image if masked_image.size else crop)
+    cv2.imwrite(str(region_dir / "salvage_boxes_overlay.jpg"), salvage_overlay)
+
+    binary_mask = local_debug.get("binary_mask")
+    if isinstance(binary_mask, np.ndarray):
+        cv2.imwrite(str(region_dir / "binary_mask.jpg"), binary_mask)
+    morph_mask = local_debug.get("morph_mask")
+    if isinstance(morph_mask, np.ndarray):
+        cv2.imwrite(str(region_dir / "morph_mask.jpg"), morph_mask)
+    band_candidate_mask = local_debug.get("band_debug", {}).get("candidate_mask")
+    if isinstance(band_candidate_mask, np.ndarray):
+        cv2.imwrite(str(region_dir / "band_candidate_mask.jpg"), band_candidate_mask)
+    if isinstance(masked_mask, np.ndarray):
+        cv2.imwrite(str(region_dir / "masked_foreground_mask.jpg"), masked_mask)
+
+    debug_json = {
+        "region_coordinate": [int(v) for v in region.get("coordinate", [])],
+        "is_barcode": bool(is_barcode),
+        "barcode_meta": barcode_meta,
+        "is_texture": bool(is_texture),
+        "texture_meta": texture_meta,
+        "local_barcode_boxes": local_barcode_boxes,
+        "component_candidate_boxes": local_debug.get("component_candidate_boxes", []),
+        "band_box": band_box,
+        "band_candidate_segments": local_debug.get("band_debug", {}).get("candidate_segments", []),
+        "merged_local_barcode_boxes": local_debug.get("merged_boxes", []),
+        "salvage_boxes_local": salvage_boxes_local,
+        "salvaged_region_boxes": [
+            [int(v) for v in item.get("coordinate", [])]
+            for item in salvaged_regions
+        ],
+        "salvaged_skipped_boxes": [
+            [int(v) for v in item.get("coordinate", [])]
+            for item in salvaged_skipped
+        ],
+    }
+    with open(region_dir / "debug.json", "w", encoding="utf-8") as file_obj:
+        json.dump(debug_json, file_obj, ensure_ascii=False, indent=2)
 
 
 def foreground_bbox(mask: np.ndarray) -> List[int]:
@@ -1325,6 +1476,7 @@ def main() -> int:
     print(f"template prepared: {template_path}")
     print(f"target prepared:   {target_path}")
 
+    salvage_debug_dir = output_dir / "salvage_debug"
     template_all_regions = detect_layout_regions(str(template_path), threshold=LAYOUT_THRESHOLD)
     target_all_regions = detect_layout_regions(str(target_path), threshold=LAYOUT_THRESHOLD)
     template_regions = extract_regions_by_type(template_all_regions, REGION_TYPE)
@@ -1336,11 +1488,15 @@ def main() -> int:
         template_regions,
         template_image,
         template_boxes,
+        debug_dir=salvage_debug_dir,
+        debug_prefix="template",
     )
     target_regions, skipped_target_regions = filter_regions_with_barcode_salvage(
         target_regions,
         target_image,
         target_boxes,
+        debug_dir=salvage_debug_dir,
+        debug_prefix="target",
     )
 
     template_vis = draw_regions(template_image, template_regions, color=(0, 255, 0))
@@ -1454,6 +1610,7 @@ def main() -> int:
         "target_image_path": str(TARGET_IMAGE_PATH),
         "prepared_template_path": str(template_path),
         "prepared_target_path": str(target_path),
+        "salvage_debug_dir": str(salvage_debug_dir),
         "layout_threshold": LAYOUT_THRESHOLD,
         "match_cost_threshold": MATCH_COST_THRESHOLD,
         "pair_index": PAIR_INDEX,

@@ -22,6 +22,54 @@
 
 ---
 
+## 2026-03-23 - 混合条码抢救增加可视化调试输出
+
+- 背景：
+  连续两轮结果都显示“打印机 + 条码”混合框仍被整块跳过，但仅靠最终 `summary.json` 无法区分到底是“局部条码候选没找到”还是“找到了但 salvage 子区域被过滤掉”。继续改阈值已经变成盲调，需要先把混合框内部发生的事可视化出来。
+
+- 修改文件：
+  - `scripts/test_vlm_candidate_review.py`
+  - `AGENT_CHANGELOG.md`
+
+- 修改内容：
+  - 为局部条码检测新增 debug 结构：
+    - `detect_barcode_band_box_with_debug()`
+    - `detect_local_barcode_boxes_with_debug()`
+  - 对每个被判为 `barcode/texture` 的 region，在 `results/vlm_candidate_review/vlm_candidate_review/salvage_debug/` 下落单独目录。
+  - 每个目录输出：
+    - `crop.jpg`
+    - `barcode_candidates_overlay.jpg`
+    - `binary_mask.jpg`
+    - `morph_mask.jpg`
+    - `band_candidate_mask.jpg`
+    - `masked_foreground.jpg`
+    - `masked_foreground_mask.jpg`
+    - `salvage_boxes_overlay.jpg`
+    - `debug.json`
+  - `debug.json` 中记录：
+    - region 是否被判为 barcode / texture
+    - 条码候选框、band 候选段、最终合并框
+    - salvage 后的子区域框和 skipped 子框
+  - 在顶层 `summary.json` 中新增 `salvage_debug_dir` 字段，便于直接定位调试目录。
+
+- 修改原因：
+  - 先把失败模式观测清楚，再决定下一步是调条码带检测，还是调 salvage 组件阈值。
+  - 避免继续在黑盒状态下反复补规则。
+
+- 影响范围：
+  - 仅影响实验脚本，不影响主流程。
+  - 结果目录会新增 `salvage_debug/` 调试输出，但不会影响已有 `final_overview.jpg`、`summary.json` 和 pair 结果路径。
+
+- 验证情况：
+  - 已完成静态语法检查。
+  - 尚未在当前命令环境执行端到端运行，需在服务器复跑后查看调试目录内容。
+
+- 风险 / 待验证项：
+  - 调试目录会增加输出文件数量，但这是短期定位问题所需。
+  - 若后续确认失败点已清楚，应再考虑是否保留或收敛这些调试产物。
+
+---
+
 ## 2026-03-22 - 混合条码抢救增加按列条码带分割 fallback
 
 - 背景：
