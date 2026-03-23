@@ -22,6 +22,48 @@
 
 ---
 
+## 2026-03-23 - skipped 几何异常降级为 debug-only，final_overview 改为统一面板缩放
+
+- 背景：
+  最新结果表明，`skipped_region_geometry` 会把纯条码样本误判成 `mismatch`。根因是它直接比较预处理后两张图上的绝对像素框，跨尺度样本下宽高面积和中心偏移都会失真。同时，`final_overview.jpg` 直接拼接原始 prepared 图，没有统一显示比例，导致左右视觉比例明显不一致。
+
+- 修改文件：
+  - `scripts/test_vlm_candidate_review.py`
+  - `AGENT_CHANGELOG.md`
+
+- 修改内容：
+  - 将 `skipped_region_geometry` 从最终结果链路中移除：
+    - 不再参与 `overall_decision`
+    - 不再进入 `final_overview.jpg`
+    - 仅保留在 `summary.json` 里作为 debug 信息
+  - 在 `candidate_strategy` 中新增 `skipped_region_geometry_mode = "debug_only"`
+  - 重写 `draw_overview_diff_canvas()` 的显示方式：
+    - 左右图先分别缩放到统一大小的正方形面板
+    - 框坐标按同一缩放比例映射后再绘制
+    - 解决 `final_overview` 左右比例看起来怪异的问题
+  - 新增辅助函数 `fit_image_and_boxes_to_panel()`，专门用于 overview 可视化缩放与框映射。
+
+- 修改原因：
+  - 停止让一条明显不稳的 skipped 几何规则污染最终判定。
+  - 把 `final_overview` 恢复成“便于人工核对”的可视化，而不是由原图尺寸主导的失真拼图。
+
+- 影响范围：
+  - 仅影响实验脚本，不影响主流程。
+  - `summary.json` 仍会保留 `skipped_region_geometry`，但它只作调试参考。
+  - `final_overview.jpg` 的输出尺寸和显示样式会变化。
+
+- 验证情况：
+  - 已完成静态语法检查。
+  - 尚未在当前命令环境执行端到端运行，需在服务器复跑后确认：
+    - 纯条码样本不再被 `overall_decision` 误判
+    - `final_overview.jpg` 左右面板比例一致
+
+- 风险 / 待验证项：
+  - 降级为 debug-only 后，混合条码区的异常不再参与最终判定，这意味着当前方案会更保守。
+  - 如果后续仍需要利用 skipped 区域做差异发现，应重新设计成归一化后的局部比较，而不是恢复绝对几何规则。
+
+---
+
 ## 2026-03-23 - 新增跳过区几何异常判差异，不再依赖混合框 salvage 成功
 
 - 背景：

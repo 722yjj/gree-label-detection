@@ -113,6 +113,7 @@ MAX_CANDIDATES_PER_PAIR = 5
 REVIEW_MIN_DIFF_PIXELS = 130
 REVIEW_MIN_SIDE_DIFF_PIXELS = 90
 REVIEW_MIN_DOMINANCE_RATIO = 2.2
+OVERVIEW_PANEL_SIZE = 960
 SKIPPED_REGION_MATCH_COST_THRESHOLD = 0.95
 SKIPPED_REGION_WIDTH_RATIO_MIN = 0.74
 SKIPPED_REGION_WIDTH_RATIO_MAX = 1.35
@@ -1396,6 +1397,43 @@ def fit_image_to_panel(image: np.ndarray, panel_size: int) -> np.ndarray:
     return panel
 
 
+def fit_image_and_boxes_to_panel(
+    image: np.ndarray,
+    mismatch_boxes: Sequence[Sequence[int]],
+    unknown_boxes: Sequence[Sequence[int]],
+    panel_size: int,
+) -> np.ndarray:
+    panel = np.ones((panel_size, panel_size, 3), dtype=np.uint8) * 255
+    h, w = image.shape[:2]
+    if h == 0 or w == 0:
+        return panel
+
+    scale = panel_size / max(h, w)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    interpolation = cv2.INTER_LINEAR if scale >= 1.0 else cv2.INTER_AREA
+    resized = cv2.resize(image, (new_w, new_h), interpolation=interpolation)
+    x_offset = (panel_size - new_w) // 2
+    y_offset = (panel_size - new_h) // 2
+    panel[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
+
+    def map_box(box: Sequence[int]) -> List[int]:
+        x1, y1, x2, y2 = [int(v) for v in box]
+        mapped = [
+            x_offset + int(round(x1 * scale)),
+            y_offset + int(round(y1 * scale)),
+            x_offset + int(round(x2 * scale)),
+            y_offset + int(round(y2 * scale)),
+        ]
+        return clip_box(mapped, panel.shape[:2])
+
+    for box in mismatch_boxes:
+        panel = draw_single_box(panel, map_box(box), (0, 0, 255))
+    for box in unknown_boxes:
+        panel = draw_single_box(panel, map_box(box), (0, 165, 255))
+    return panel
+
+
 def create_candidate_review_canvas(
     template_full_marked: np.ndarray,
     target_full_marked: np.ndarray,
@@ -1693,25 +1731,27 @@ def draw_overview_diff_canvas(
     unknown_template_boxes: Sequence[Sequence[int]],
     unknown_target_boxes: Sequence[Sequence[int]],
 ) -> np.ndarray:
-    template_canvas = template_image.copy()
-    target_canvas = target_image.copy()
-    for box in mismatch_template_boxes:
-        template_canvas = draw_single_box(template_canvas, box, (0, 0, 255))
-    for box in mismatch_target_boxes:
-        target_canvas = draw_single_box(target_canvas, box, (0, 0, 255))
-    for box in unknown_template_boxes:
-        template_canvas = draw_single_box(template_canvas, box, (0, 165, 255))
-    for box in unknown_target_boxes:
-        target_canvas = draw_single_box(target_canvas, box, (0, 165, 255))
+    panel_size = OVERVIEW_PANEL_SIZE
+    gap = 20
+    header = 40
+    template_canvas = fit_image_and_boxes_to_panel(
+        template_image,
+        mismatch_template_boxes,
+        unknown_template_boxes,
+        panel_size,
+    )
+    target_canvas = fit_image_and_boxes_to_panel(
+        target_image,
+        mismatch_target_boxes,
+        unknown_target_boxes,
+        panel_size,
+    )
 
-    canvas = np.ones(
-        (max(template_canvas.shape[0], target_canvas.shape[0]) + 40, template_canvas.shape[1] + target_canvas.shape[1] + 20, 3),
-        dtype=np.uint8,
-    ) * 255
+    canvas = np.ones((panel_size + header, panel_size * 2 + gap, 3), dtype=np.uint8) * 255
     cv2.putText(canvas, "Template", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
-    cv2.putText(canvas, "Target", (template_canvas.shape[1] + 30, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
-    canvas[40:40 + template_canvas.shape[0], 0:template_canvas.shape[1]] = template_canvas
-    canvas[40:40 + target_canvas.shape[0], template_canvas.shape[1] + 20:template_canvas.shape[1] + 20 + target_canvas.shape[1]] = target_canvas
+    cv2.putText(canvas, "Target", (panel_size + gap + 10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+    canvas[header:header + panel_size, 0:panel_size] = template_canvas
+    canvas[header:header + panel_size, panel_size + gap:panel_size + gap + panel_size] = target_canvas
     return canvas
 
 
@@ -1939,7 +1979,7 @@ def main() -> int:
     print(f"matched pairs:               {len(matched_pairs)}")
     print(f"unmatched template:          {len(unmatched_template)}")
     print(f"unmatched target:            {len(unmatched_target)}")
-    print(f"skipped geometry mismatches: {len(skipped_geometry['mismatch_template_boxes']) + len(skipped_geometry['unmatched_records'])}")
+    print(f"skipped geometry mismatches(debug only): {len(skipped_geometry['mismatch_template_boxes']) + len(skipped_geometry['unmatched_records'])}")
 
     selected_pairs = matched_pairs
     if PAIR_INDEX is not None:
@@ -1985,9 +2025,6 @@ def main() -> int:
     ] + [
         [int(v) for v in template_regions[idx]["coordinate"]]
         for idx in unmatched_template
-    ] + [
-        [int(v) for v in box]
-        for box in skipped_geometry["mismatch_template_boxes"]
     ]
     overview_mismatch_target_boxes = [
         [int(v) for v in item["target_box"]]
@@ -1996,9 +2033,6 @@ def main() -> int:
     ] + [
         [int(v) for v in target_regions[idx]["coordinate"]]
         for idx in unmatched_target
-    ] + [
-        [int(v) for v in box]
-        for box in skipped_geometry["mismatch_target_boxes"]
     ]
     overview_unknown_template_boxes = [
         [int(v) for v in item["template_box"]]
@@ -2012,14 +2046,7 @@ def main() -> int:
     ]
 
     overall_decision = "match"
-    if (
-        unmatched_template
-        or unmatched_target
-        or skipped_geometry["mismatch_template_boxes"]
-        or skipped_geometry["mismatch_target_boxes"]
-        or skipped_geometry["unmatched_records"]
-        or any(item == "mismatch" for item in pair_decisions)
-    ):
+    if unmatched_template or unmatched_target or any(item == "mismatch" for item in pair_decisions):
         overall_decision = "mismatch"
     elif any(item == "unknown" for item in pair_decisions):
         overall_decision = "unknown"
@@ -2048,8 +2075,9 @@ def main() -> int:
         "vlm_api_base": VLM_API_BASE,
         "vlm_timeout_seconds": VLM_TIMEOUT_SECONDS,
         "candidate_strategy": {
-            "method": "skipped_barcode_texture_geometry_review + internal_barcode_ignore -> tolerant_diff_union -> merged candidate boxes -> local VLM review",
+            "method": "internal_barcode_ignore -> tolerant_diff_union -> merged candidate boxes -> local VLM review",
             "tolerance_kernel": DIFF_TOLERANCE_KERNEL,
+            "skipped_region_geometry_mode": "debug_only",
             "skipped_region_match_cost_threshold": SKIPPED_REGION_MATCH_COST_THRESHOLD,
             "skipped_region_width_ratio_range": [SKIPPED_REGION_WIDTH_RATIO_MIN, SKIPPED_REGION_WIDTH_RATIO_MAX],
             "skipped_region_height_ratio_range": [SKIPPED_REGION_HEIGHT_RATIO_MIN, SKIPPED_REGION_HEIGHT_RATIO_MAX],
