@@ -22,6 +22,52 @@
 
 ---
 
+## 2026-03-23 - 条码候选框改为主体行带裁剪，避免纵向高度过宽
+
+- 背景：
+  上一轮结果已经证明右侧条码列窗能被找出来，但 `detect_barcode_region()` 仍拒绝该候选。根因在于条码框的纵向范围仍使用整列前景的 `rows.min()/rows.max()`，把条码下方数字和其他杂散前景一起吃进来了，导致 `height_ratio` 达到 `0.89 / 0.65`，超过条码校验阈值。
+
+- 修改文件：
+  - `scripts/test_vlm_candidate_review.py`
+  - `AGENT_CHANGELOG.md`
+
+- 修改内容：
+  - 为已选中的条码列窗新增“主体行带”提取：
+    - 只在 `upper_h` 内部统计条码列窗的行向前景密度；
+    - 对行密度做平滑后提取最像条码主体的连续行带；
+    - 为纵向高度加上最小高度、最大高度和较小的底部 padding 约束。
+  - 新增参数：
+    - `LOCAL_BARCODE_ROW_WINDOW`
+    - `LOCAL_BARCODE_ROW_MIN_DARK`
+    - `LOCAL_BARCODE_ROW_THRESHOLD_PERCENTILE`
+    - `LOCAL_BARCODE_ROW_THRESHOLD_SCALE`
+    - `LOCAL_BARCODE_ROW_MIN_HEIGHT_RATIO`
+    - `LOCAL_BARCODE_ROW_MAX_HEIGHT_RATIO`
+    - `LOCAL_BARCODE_ROW_PAD_TOP`
+    - `LOCAL_BARCODE_ROW_PAD_BOTTOM_RATIO`
+  - `debug.json` 新增：
+    - `band_row_threshold`
+    - `band_row_box`
+    - `band_row_segments`
+  - 顶层 `summary.json` 的 `candidate_strategy` 同步记录新增行带裁剪参数。
+
+- 修改原因：
+  - 把问题从“找不到条码窗”收敛到“条码窗太高”之后，优先压缩候选框的纵向高度，让其满足 `detect_barcode_region()` 的几何约束。
+
+- 影响范围：
+  - 仅影响实验脚本中的 mixed barcode salvage 分支，不影响主流程。
+  - `salvage_debug` 的 `debug.json` 会新增行带裁剪相关字段。
+
+- 验证情况：
+  - 已完成静态语法检查。
+  - 尚未在当前命令环境执行端到端运行，需在服务器复跑后查看 `band_row_box`、`band_validation_passed` 和 `local_barcode_boxes`。
+
+- 风险 / 待验证项：
+  - 若行带裁剪过紧，可能截掉部分有效条码条纹；但这比继续保留过高框更容易诊断。
+  - 若这轮候选框高度已收窄但仍验证失败，下一步应直接检查 `detect_barcode_region()` 的局部几何阈值是否不适用于混合框子区域。
+
+---
+
 ## 2026-03-23 - 局部条码带检测增加右侧滑窗评分 fallback
 
 - 背景：

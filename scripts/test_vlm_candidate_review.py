@@ -82,6 +82,14 @@ LOCAL_BARCODE_BAND_WINDOW_WIDTH_RATIOS = [0.18, 0.22, 0.26, 0.30, 0.34]
 LOCAL_BARCODE_BAND_WINDOW_MIN_ACTIVE_RATIO = 0.55
 LOCAL_BARCODE_BAND_WINDOW_MIN_EDGE_FACTOR = 0.72
 LOCAL_BARCODE_BAND_WINDOW_STRONG_EDGE_FACTOR = 0.90
+LOCAL_BARCODE_ROW_WINDOW = 9
+LOCAL_BARCODE_ROW_MIN_DARK = 0.10
+LOCAL_BARCODE_ROW_THRESHOLD_PERCENTILE = 72
+LOCAL_BARCODE_ROW_THRESHOLD_SCALE = 0.80
+LOCAL_BARCODE_ROW_MIN_HEIGHT_RATIO = 0.18
+LOCAL_BARCODE_ROW_MAX_HEIGHT_RATIO = 0.52
+LOCAL_BARCODE_ROW_PAD_TOP = 4
+LOCAL_BARCODE_ROW_PAD_BOTTOM_RATIO = 0.12
 LOCAL_BARCODE_MIN_WIDTH_RATIO = 0.16
 LOCAL_BARCODE_MIN_HEIGHT_RATIO = 0.16
 LOCAL_BARCODE_MIN_AREA_RATIO = 0.008
@@ -349,6 +357,11 @@ def detect_barcode_band_box_with_debug(image: np.ndarray) -> Tuple[List[int] | N
         "validation_meta": {},
         "upper_validation_passed": False,
         "upper_validation_meta": {},
+        "row_profile": [],
+        "smooth_row_profile": [],
+        "row_threshold": None,
+        "row_segments": [],
+        "row_box": None,
     }
     if image.size == 0:
         return None, debug
@@ -481,6 +494,94 @@ def detect_barcode_band_box_with_debug(image: np.ndarray) -> Tuple[List[int] | N
         candidate_img[0, int(best_window["x1"]):int(best_window["x2"])] = 255
         return candidate_img, (int(best_window["x1"]), int(best_window["x2"]), float(best_window["score"]))
 
+    def build_row_band(local_x1: int, local_x2: int) -> Tuple[int, int] | None:
+        band_upper = (binary[:upper_h, local_x1:local_x2] > 0).astype(np.uint8)
+        if band_upper.size == 0 or not np.any(band_upper):
+            return None
+
+        row_profile = band_upper.mean(axis=1).astype(np.float32)
+        smooth_row = _smooth_1d(row_profile, LOCAL_BARCODE_ROW_WINDOW)
+        debug["row_profile"] = [float(v) for v in row_profile.tolist()]
+        debug["smooth_row_profile"] = [float(v) for v in smooth_row.tolist()]
+
+        non_zero = smooth_row[smooth_row > 0]
+        if non_zero.size == 0:
+            rows = np.where(np.any(band_upper, axis=1))[0]
+            if rows.size == 0:
+                return None
+            top = int(rows.min())
+            bottom = int(rows.max() + 1)
+        else:
+            row_threshold = max(
+                LOCAL_BARCODE_ROW_MIN_DARK,
+                min(
+                    0.75,
+                    max(
+                        float(np.percentile(non_zero, LOCAL_BARCODE_ROW_THRESHOLD_PERCENTILE))
+                        * LOCAL_BARCODE_ROW_THRESHOLD_SCALE,
+                        float(non_zero.mean()) * 0.92,
+                    ),
+                ),
+            )
+            debug["row_threshold"] = float(row_threshold)
+            active_rows = smooth_row >= row_threshold
+            min_row_height = max(18, int(round(img_h * LOCAL_BARCODE_ROW_MIN_HEIGHT_RATIO)))
+            segments: List[Tuple[int, int, float]] = []
+            start = None
+            for idx, is_on in enumerate(active_rows.tolist() + [False]):
+                if is_on and start is None:
+                    start = idx
+                elif not is_on and start is not None:
+                    end = idx
+                    height = end - start
+                    if height <= 0:
+                        start = None
+                        continue
+                    score = float(smooth_row[start:end].mean() * height + max(0, upper_h - start) * 0.03)
+                    segments.append((start, end, score))
+                    start = None
+
+            debug["row_segments"] = [
+                {"y1": int(seg_start), "y2": int(seg_end), "score": float(score)}
+                for seg_start, seg_end, score in segments
+            ]
+
+            if segments:
+                top, bottom, _ = max(segments, key=lambda item: item[2])
+            else:
+                rows = np.where(smooth_row >= max(LOCAL_BARCODE_ROW_MIN_DARK, float(non_zero.mean()) * 0.82))[0]
+                if rows.size == 0:
+                    rows = np.where(np.any(band_upper, axis=1))[0]
+                if rows.size == 0:
+                    return None
+                top = int(rows.min())
+                bottom = int(rows.max() + 1)
+
+            min_row_height = max(18, int(round(img_h * LOCAL_BARCODE_ROW_MIN_HEIGHT_RATIO)))
+            if bottom - top < min_row_height:
+                center = int(round((top + bottom) / 2.0))
+                half = int(np.ceil(min_row_height / 2.0))
+                top = max(0, center - half)
+                bottom = min(upper_h, top + min_row_height)
+                top = max(0, bottom - min_row_height)
+
+        pad_bottom = max(4, int(round((bottom - top) * LOCAL_BARCODE_ROW_PAD_BOTTOM_RATIO)))
+        top = max(0, int(top) - LOCAL_BARCODE_ROW_PAD_TOP)
+        bottom = min(upper_h, int(bottom) + pad_bottom)
+
+        max_row_height = max(
+            max(18, int(round(img_h * LOCAL_BARCODE_ROW_MIN_HEIGHT_RATIO))),
+            int(round(img_h * LOCAL_BARCODE_ROW_MAX_HEIGHT_RATIO)),
+        )
+        if bottom - top > max_row_height:
+            bottom = min(upper_h, top + max_row_height)
+
+        if bottom - top < 12:
+            return None
+
+        debug["row_box"] = [int(local_x1), int(top), int(local_x2), int(bottom)]
+        return int(top), int(bottom)
+
     candidate_img, segments = build_segments(float(LOCAL_BARCODE_BAND_EDGE_MIN))
     debug["candidate_mask"] = candidate_img.copy()
 
@@ -540,20 +641,29 @@ def detect_barcode_band_box_with_debug(image: np.ndarray) -> Tuple[List[int] | N
         return None, debug
 
     x1, x2, _ = max(segments, key=lambda item: item[2])
-    band_pixels = binary[:, x1:x2] > 0
-    if not np.any(band_pixels):
-        return None, debug
+    row_band = build_row_band(int(x1), int(x2))
+    if row_band is None:
+        band_pixels = binary[:upper_h, x1:x2] > 0
+        if not np.any(band_pixels):
+            return None, debug
+        rows = np.where(np.any(band_pixels, axis=1))[0]
+        if rows.size == 0:
+            return None, debug
+        row_top = int(rows.min())
+        row_bottom = int(rows.max() + 1)
+    else:
+        row_top, row_bottom = row_band
 
-    rows = np.where(np.any(band_pixels, axis=1))[0]
-    if rows.size == 0:
+    band_pixels = binary[row_top:row_bottom, x1:x2] > 0
+    if not np.any(band_pixels):
         return None, debug
 
     local_box = clip_box(
         [
             int(x1 - LOCAL_BARCODE_BOX_PAD_X),
-            int(rows.min() - LOCAL_BARCODE_BOX_PAD_TOP),
+            int(row_top),
             int(x2 + LOCAL_BARCODE_BOX_PAD_X),
-            int(rows.max() + 1 + max(10, int(round((rows.max() - rows.min() + 1) * LOCAL_BARCODE_BOX_PAD_BOTTOM_RATIO)))),
+            int(row_bottom),
         ],
         image.shape[:2],
     )
@@ -894,6 +1004,9 @@ def save_salvage_region_debug(
         "band_validation_meta": local_debug.get("band_debug", {}).get("validation_meta", {}),
         "band_upper_validation_passed": local_debug.get("band_debug", {}).get("upper_validation_passed"),
         "band_upper_validation_meta": local_debug.get("band_debug", {}).get("upper_validation_meta", {}),
+        "band_row_threshold": local_debug.get("band_debug", {}).get("row_threshold"),
+        "band_row_box": local_debug.get("band_debug", {}).get("row_box"),
+        "band_row_segments": local_debug.get("band_debug", {}).get("row_segments", []),
         "band_candidate_segments": local_debug.get("band_debug", {}).get("candidate_segments", []),
         "merged_local_barcode_boxes": local_debug.get("merged_boxes", []),
         "salvage_boxes_local": salvage_boxes_local,
@@ -1804,6 +1917,14 @@ def main() -> int:
             "local_barcode_band_window_min_active_ratio": LOCAL_BARCODE_BAND_WINDOW_MIN_ACTIVE_RATIO,
             "local_barcode_band_window_min_edge_factor": LOCAL_BARCODE_BAND_WINDOW_MIN_EDGE_FACTOR,
             "local_barcode_band_window_strong_edge_factor": LOCAL_BARCODE_BAND_WINDOW_STRONG_EDGE_FACTOR,
+            "local_barcode_row_window": LOCAL_BARCODE_ROW_WINDOW,
+            "local_barcode_row_min_dark": LOCAL_BARCODE_ROW_MIN_DARK,
+            "local_barcode_row_threshold_percentile": LOCAL_BARCODE_ROW_THRESHOLD_PERCENTILE,
+            "local_barcode_row_threshold_scale": LOCAL_BARCODE_ROW_THRESHOLD_SCALE,
+            "local_barcode_row_min_height_ratio": LOCAL_BARCODE_ROW_MIN_HEIGHT_RATIO,
+            "local_barcode_row_max_height_ratio": LOCAL_BARCODE_ROW_MAX_HEIGHT_RATIO,
+            "local_barcode_row_pad_top": LOCAL_BARCODE_ROW_PAD_TOP,
+            "local_barcode_row_pad_bottom_ratio": LOCAL_BARCODE_ROW_PAD_BOTTOM_RATIO,
             "local_barcode_min_width_ratio": LOCAL_BARCODE_MIN_WIDTH_RATIO,
             "local_barcode_min_height_ratio": LOCAL_BARCODE_MIN_HEIGHT_RATIO,
             "local_barcode_min_area_ratio": LOCAL_BARCODE_MIN_AREA_RATIO,
