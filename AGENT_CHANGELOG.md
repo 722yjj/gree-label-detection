@@ -22,6 +22,51 @@
 
 ---
 
+## 2026-03-23 - 新增跳过区几何异常判差异，不再依赖混合框 salvage 成功
+
+- 背景：
+  连续多轮实验表明，针对“图形 + 条码”混合框去做 salvage 会不断暴露新的局部几何边界条件。对当前业务目标来说，这条路线过于间接，因为我们真正需要的是“发现差异”，并不需要从混合框里把图形完整救出来。
+
+- 修改文件：
+  - `scripts/test_vlm_candidate_review.py`
+  - `AGENT_CHANGELOG.md`
+
+- 修改内容：
+  - 为 `skipped_template_regions` / `skipped_target_regions` 新增单独的几何异常分析分支：
+    - 先对被跳过的条码/纹理区域做配对；
+    - 再按宽度比、高度比、面积比、左右扩张比例、中心偏移比例判断是否异常。
+  - 新增参数：
+    - `SKIPPED_REGION_MATCH_COST_THRESHOLD`
+    - `SKIPPED_REGION_WIDTH_RATIO_MIN / MAX`
+    - `SKIPPED_REGION_HEIGHT_RATIO_MIN / MAX`
+    - `SKIPPED_REGION_AREA_RATIO_MIN / MAX`
+    - `SKIPPED_REGION_LEFT_EXTENSION_MAX`
+    - `SKIPPED_REGION_RIGHT_EXTENSION_MAX`
+    - `SKIPPED_REGION_CENTER_SHIFT_MAX`
+  - 将这些 skipped-region 异常直接并入：
+    - `overall_decision`
+    - `final_overview.jpg`
+    - `summary.json` 中的 `skipped_region_geometry`
+  - 保留现有 pair 内部的 VLM 差异复核逻辑，但它不再是处理混合框异常的唯一入口。
+
+- 修改原因：
+  - 把问题从“如何把混合框里的图形抠出来”改成“为什么本应是条码/纹理区的区域几何形态和模板差这么大”。
+  - 这更贴近“只要发现差异”的业务目标，也更少依赖脆弱的 salvage 规则链。
+
+- 影响范围：
+  - 仅影响实验脚本，不影响主流程。
+  - `summary.json` 会新增 `skipped_region_geometry` 字段，`final_overview.jpg` 可能直接把异常的 skipped region 标成红框。
+
+- 验证情况：
+  - 已完成静态语法检查。
+  - 尚未在当前命令环境执行端到端运行，需在服务器复跑后查看 `summary.json` 中 `skipped_region_geometry.pair_results` 和 `final_overview.jpg`。
+
+- 风险 / 待验证项：
+  - 这条规则对视角和检测框尺度变化更敏感，需要用多张正常样本验证误报率。
+  - 如果正常样本上误报较多，下一步应收紧到“只对 target 相对 template 明显扩张的 skipped region 判差异”，而不是重新回到 salvage。
+
+---
+
 ## 2026-03-23 - 条码候选框改为主体行带裁剪，避免纵向高度过宽
 
 - 背景：

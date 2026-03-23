@@ -113,6 +113,16 @@ MAX_CANDIDATES_PER_PAIR = 5
 REVIEW_MIN_DIFF_PIXELS = 130
 REVIEW_MIN_SIDE_DIFF_PIXELS = 90
 REVIEW_MIN_DOMINANCE_RATIO = 2.2
+SKIPPED_REGION_MATCH_COST_THRESHOLD = 0.95
+SKIPPED_REGION_WIDTH_RATIO_MIN = 0.74
+SKIPPED_REGION_WIDTH_RATIO_MAX = 1.35
+SKIPPED_REGION_HEIGHT_RATIO_MIN = 0.75
+SKIPPED_REGION_HEIGHT_RATIO_MAX = 1.25
+SKIPPED_REGION_AREA_RATIO_MIN = 0.60
+SKIPPED_REGION_AREA_RATIO_MAX = 1.65
+SKIPPED_REGION_LEFT_EXTENSION_MAX = 0.16
+SKIPPED_REGION_RIGHT_EXTENSION_MAX = 0.16
+SKIPPED_REGION_CENTER_SHIFT_MAX = 0.22
 FINAL_SINGLE_SIDED_HINTS = {"target_extra", "template_extra"}
 FINAL_BACKGROUND_REJECT_MAX_DIFF_PIXELS = 320
 FINAL_BACKGROUND_REJECT_MAX_SIDE_PIXELS = 220
@@ -1111,6 +1121,126 @@ def box_area(box: Sequence[int]) -> int:
     return max(0, int(box[2]) - int(box[0])) * max(0, int(box[3]) - int(box[1]))
 
 
+def compare_skipped_region_pair(
+    template_region: Dict[str, object],
+    target_region: Dict[str, object],
+    match_cost: float,
+) -> Dict[str, object]:
+    template_box = [int(v) for v in template_region["coordinate"]]
+    target_box = [int(v) for v in target_region["coordinate"]]
+    tw = max(1, template_box[2] - template_box[0])
+    th = max(1, template_box[3] - template_box[1])
+    sw = max(1, target_box[2] - target_box[0])
+    sh = max(1, target_box[3] - target_box[1])
+
+    template_area = box_area(template_box)
+    target_area = box_area(target_box)
+    template_center_x = (template_box[0] + template_box[2]) / 2.0
+    target_center_x = (target_box[0] + target_box[2]) / 2.0
+
+    width_ratio = float(sw / max(1.0, tw))
+    height_ratio = float(sh / max(1.0, th))
+    area_ratio = float(target_area / max(1.0, template_area))
+    left_extension_ratio = float(max(0, template_box[0] - target_box[0]) / max(1.0, tw))
+    right_extension_ratio = float(max(0, target_box[2] - template_box[2]) / max(1.0, tw))
+    center_shift_ratio = float(abs(target_center_x - template_center_x) / max(1.0, tw))
+
+    reasons: List[str] = []
+    if width_ratio < SKIPPED_REGION_WIDTH_RATIO_MIN or width_ratio > SKIPPED_REGION_WIDTH_RATIO_MAX:
+        reasons.append("width_ratio_out_of_range")
+    if height_ratio < SKIPPED_REGION_HEIGHT_RATIO_MIN or height_ratio > SKIPPED_REGION_HEIGHT_RATIO_MAX:
+        reasons.append("height_ratio_out_of_range")
+    if area_ratio < SKIPPED_REGION_AREA_RATIO_MIN or area_ratio > SKIPPED_REGION_AREA_RATIO_MAX:
+        reasons.append("area_ratio_out_of_range")
+    if left_extension_ratio > SKIPPED_REGION_LEFT_EXTENSION_MAX:
+        reasons.append("left_extension")
+    if right_extension_ratio > SKIPPED_REGION_RIGHT_EXTENSION_MAX:
+        reasons.append("right_extension")
+    if center_shift_ratio > SKIPPED_REGION_CENTER_SHIFT_MAX:
+        reasons.append("center_shift")
+
+    return {
+        "template_box": template_box,
+        "target_box": target_box,
+        "match_cost": float(match_cost),
+        "width_ratio": width_ratio,
+        "height_ratio": height_ratio,
+        "area_ratio": area_ratio,
+        "left_extension_ratio": left_extension_ratio,
+        "right_extension_ratio": right_extension_ratio,
+        "center_shift_ratio": center_shift_ratio,
+        "template_skip_reason": str(template_region.get("skip_reason", "")),
+        "target_skip_reason": str(target_region.get("skip_reason", "")),
+        "reasons": reasons,
+        "is_mismatch": bool(reasons),
+    }
+
+
+def analyze_skipped_region_geometry(
+    template_skipped_regions: Sequence[Dict[str, object]],
+    target_skipped_regions: Sequence[Dict[str, object]],
+    template_shape: Sequence[int],
+    target_shape: Sequence[int],
+) -> Dict[str, object]:
+    matched_pairs, unmatched_template, unmatched_target = match_regions(
+        template_skipped_regions,
+        target_skipped_regions,
+        template_shape,
+        target_shape,
+        cost_threshold=SKIPPED_REGION_MATCH_COST_THRESHOLD,
+    )
+
+    pair_results: List[Dict[str, object]] = []
+    mismatch_template_boxes: List[List[int]] = []
+    mismatch_target_boxes: List[List[int]] = []
+    for template_idx, target_idx, cost in matched_pairs:
+        comparison = compare_skipped_region_pair(
+            template_skipped_regions[template_idx],
+            target_skipped_regions[target_idx],
+            match_cost=float(cost),
+        )
+        comparison["template_idx"] = int(template_idx)
+        comparison["target_idx"] = int(target_idx)
+        pair_results.append(comparison)
+        if bool(comparison["is_mismatch"]):
+            mismatch_template_boxes.append([int(v) for v in comparison["template_box"]])
+            mismatch_target_boxes.append([int(v) for v in comparison["target_box"]])
+
+    unmatched_records: List[Dict[str, object]] = []
+    for idx in unmatched_template:
+        box = [int(v) for v in template_skipped_regions[idx]["coordinate"]]
+        mismatch_template_boxes.append(box)
+        unmatched_records.append(
+            {
+                "side": "template",
+                "idx": int(idx),
+                "box": box,
+                "skip_reason": str(template_skipped_regions[idx].get("skip_reason", "")),
+            }
+        )
+    for idx in unmatched_target:
+        box = [int(v) for v in target_skipped_regions[idx]["coordinate"]]
+        mismatch_target_boxes.append(box)
+        unmatched_records.append(
+            {
+                "side": "target",
+                "idx": int(idx),
+                "box": box,
+                "skip_reason": str(target_skipped_regions[idx].get("skip_reason", "")),
+            }
+        )
+
+    return {
+        "matched_pairs": matched_pairs,
+        "unmatched_template": unmatched_template,
+        "unmatched_target": unmatched_target,
+        "pair_results": pair_results,
+        "unmatched_records": unmatched_records,
+        "mismatch_template_boxes": mismatch_template_boxes,
+        "mismatch_target_boxes": mismatch_target_boxes,
+    }
+
+
 def merge_boxes(boxes: Sequence[Sequence[int]], gap: int) -> List[List[int]]:
     pending = [[int(v) for v in box] for box in boxes]
     merged = True
@@ -1795,6 +1925,12 @@ def main() -> int:
         target_image.shape[:2],
         cost_threshold=MATCH_COST_THRESHOLD,
     )
+    skipped_geometry = analyze_skipped_region_geometry(
+        skipped_template_regions,
+        skipped_target_regions,
+        template_image.shape[:2],
+        target_image.shape[:2],
+    )
 
     print(f"template comparable regions: {len(template_regions)}")
     print(f"target comparable regions:   {len(target_regions)}")
@@ -1803,6 +1939,7 @@ def main() -> int:
     print(f"matched pairs:               {len(matched_pairs)}")
     print(f"unmatched template:          {len(unmatched_template)}")
     print(f"unmatched target:            {len(unmatched_target)}")
+    print(f"skipped geometry mismatches: {len(skipped_geometry['mismatch_template_boxes']) + len(skipped_geometry['unmatched_records'])}")
 
     selected_pairs = matched_pairs
     if PAIR_INDEX is not None:
@@ -1848,6 +1985,9 @@ def main() -> int:
     ] + [
         [int(v) for v in template_regions[idx]["coordinate"]]
         for idx in unmatched_template
+    ] + [
+        [int(v) for v in box]
+        for box in skipped_geometry["mismatch_template_boxes"]
     ]
     overview_mismatch_target_boxes = [
         [int(v) for v in item["target_box"]]
@@ -1856,6 +1996,9 @@ def main() -> int:
     ] + [
         [int(v) for v in target_regions[idx]["coordinate"]]
         for idx in unmatched_target
+    ] + [
+        [int(v) for v in box]
+        for box in skipped_geometry["mismatch_target_boxes"]
     ]
     overview_unknown_template_boxes = [
         [int(v) for v in item["template_box"]]
@@ -1869,7 +2012,14 @@ def main() -> int:
     ]
 
     overall_decision = "match"
-    if unmatched_template or unmatched_target or any(item == "mismatch" for item in pair_decisions):
+    if (
+        unmatched_template
+        or unmatched_target
+        or skipped_geometry["mismatch_template_boxes"]
+        or skipped_geometry["mismatch_target_boxes"]
+        or skipped_geometry["unmatched_records"]
+        or any(item == "mismatch" for item in pair_decisions)
+    ):
         overall_decision = "mismatch"
     elif any(item == "unknown" for item in pair_decisions):
         overall_decision = "unknown"
@@ -1898,8 +2048,15 @@ def main() -> int:
         "vlm_api_base": VLM_API_BASE,
         "vlm_timeout_seconds": VLM_TIMEOUT_SECONDS,
         "candidate_strategy": {
-            "method": "internal_barcode_ignore -> tolerant_diff_union -> merged candidate boxes -> local VLM review",
+            "method": "skipped_barcode_texture_geometry_review + internal_barcode_ignore -> tolerant_diff_union -> merged candidate boxes -> local VLM review",
             "tolerance_kernel": DIFF_TOLERANCE_KERNEL,
+            "skipped_region_match_cost_threshold": SKIPPED_REGION_MATCH_COST_THRESHOLD,
+            "skipped_region_width_ratio_range": [SKIPPED_REGION_WIDTH_RATIO_MIN, SKIPPED_REGION_WIDTH_RATIO_MAX],
+            "skipped_region_height_ratio_range": [SKIPPED_REGION_HEIGHT_RATIO_MIN, SKIPPED_REGION_HEIGHT_RATIO_MAX],
+            "skipped_region_area_ratio_range": [SKIPPED_REGION_AREA_RATIO_MIN, SKIPPED_REGION_AREA_RATIO_MAX],
+            "skipped_region_left_extension_max": SKIPPED_REGION_LEFT_EXTENSION_MAX,
+            "skipped_region_right_extension_max": SKIPPED_REGION_RIGHT_EXTENSION_MAX,
+            "skipped_region_center_shift_max": SKIPPED_REGION_CENTER_SHIFT_MAX,
             "local_barcode_close_kernel": [LOCAL_BARCODE_CLOSE_WIDTH, LOCAL_BARCODE_CLOSE_HEIGHT],
             "local_barcode_dilate_kernel": [LOCAL_BARCODE_DILATE_WIDTH, LOCAL_BARCODE_DILATE_HEIGHT],
             "local_barcode_band_window": LOCAL_BARCODE_BAND_WINDOW,
@@ -1951,6 +2108,7 @@ def main() -> int:
         "target_regions": target_regions,
         "skipped_template_regions": skipped_template_regions,
         "skipped_target_regions": skipped_target_regions,
+        "skipped_region_geometry": skipped_geometry,
         "matched_pairs": matched_pairs,
         "unmatched_template": unmatched_template,
         "unmatched_target": unmatched_target,
