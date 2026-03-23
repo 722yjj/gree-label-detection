@@ -22,6 +22,52 @@
 
 ---
 
+## 2026-03-23 - 局部条码带检测增加右侧滑窗评分 fallback
+
+- 背景：
+  上一轮自适应阈值已经触发，但 `band_candidate_segments` 仍为空，说明问题不只是固定阈值过高，而是“按列二值化后要求形成长连续段”这件事本身太脆。拍照条码在混合框里经常会碎成多段，阈值降下来也拼不成满足宽度约束的 segment。
+
+- 修改文件：
+  - `scripts/test_vlm_candidate_review.py`
+  - `AGENT_CHANGELOG.md`
+
+- 修改内容：
+  - 为条码带检测新增右侧滑窗评分 fallback：
+    - 在固定阈值和自适应阈值都无法形成有效 `segment` 时，
+    - 改为在右半区对多个窗口宽度滑动打分，
+    - 依据 `smooth_edge`、`dark_profile`、强边比例和靠右位置综合选出最像条码的一段。
+  - 为该 fallback 新增参数：
+    - `LOCAL_BARCODE_BAND_WINDOW_WIDTH_RATIOS`
+    - `LOCAL_BARCODE_BAND_WINDOW_MIN_ACTIVE_RATIO`
+    - `LOCAL_BARCODE_BAND_WINDOW_MIN_EDGE_FACTOR`
+    - `LOCAL_BARCODE_BAND_WINDOW_STRONG_EDGE_FACTOR`
+  - 在 `debug.json` 中新增：
+    - `band_window_box`
+    - `band_window_candidates`
+    - `band_validation_passed`
+    - `band_validation_meta`
+    - `band_upper_validation_passed`
+    - `band_upper_validation_meta`
+  - 顶层 `summary.json` 的 `candidate_strategy` 同步记录新增滑窗参数。
+
+- 修改原因：
+  - 避免条码列信号碎裂时直接失去候选。
+  - 如果这轮仍失败，就能明确区分是“滑窗候选都没选出来”，还是“候选选出来了，但被 `detect_barcode_region()` 二次验证拒掉”。
+
+- 影响范围：
+  - 仅影响实验脚本中的 mixed barcode salvage 分支，不影响主流程。
+  - `salvage_debug` 的 `debug.json` 会增加滑窗候选和验证结果字段。
+
+- 验证情况：
+  - 已完成静态语法检查。
+  - 尚未在当前命令环境执行端到端运行，需在服务器复跑后查看 `salvage_debug/target_region_01/debug.json` 中的 `band_window_box`、`band_validation_passed` 和 `local_barcode_boxes`。
+
+- 风险 / 待验证项：
+  - 若滑窗 fallback 过宽，可能把右侧非条码纹理也选进来，但后面仍有 `detect_barcode_region()` 二次验证兜底。
+  - 若滑窗候选存在但验证失败，下一步应收窄到 `detect_barcode_region()` 的局部 box 校验，而不是继续调整滑窗评分。
+
+---
+
 ## 2026-03-23 - 局部条码带检测改为固定阈值优先 + 自适应回退
 
 - 背景：

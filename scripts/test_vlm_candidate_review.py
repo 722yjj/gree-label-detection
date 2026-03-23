@@ -78,6 +78,10 @@ LOCAL_BARCODE_BAND_ADAPTIVE_PERCENTILE = 72
 LOCAL_BARCODE_BAND_ADAPTIVE_SCALE = 0.92
 LOCAL_BARCODE_BAND_ADAPTIVE_RIGHT_START_RATIO = 0.28
 LOCAL_BARCODE_BAND_ADAPTIVE_MIN_ACTIVE_COLS = 18
+LOCAL_BARCODE_BAND_WINDOW_WIDTH_RATIOS = [0.18, 0.22, 0.26, 0.30, 0.34]
+LOCAL_BARCODE_BAND_WINDOW_MIN_ACTIVE_RATIO = 0.55
+LOCAL_BARCODE_BAND_WINDOW_MIN_EDGE_FACTOR = 0.72
+LOCAL_BARCODE_BAND_WINDOW_STRONG_EDGE_FACTOR = 0.90
 LOCAL_BARCODE_MIN_WIDTH_RATIO = 0.16
 LOCAL_BARCODE_MIN_HEIGHT_RATIO = 0.16
 LOCAL_BARCODE_MIN_AREA_RATIO = 0.008
@@ -339,6 +343,12 @@ def detect_barcode_band_box_with_debug(image: np.ndarray) -> Tuple[List[int] | N
         "adaptive_pool_count": 0,
         "adaptive_right_start": 0,
         "adaptive_pool_stats": {},
+        "window_candidates": [],
+        "window_box": None,
+        "validation_passed": False,
+        "validation_meta": {},
+        "upper_validation_passed": False,
+        "upper_validation_meta": {},
     }
     if image.size == 0:
         return None, debug
@@ -395,6 +405,82 @@ def detect_barcode_band_box_with_debug(image: np.ndarray) -> Tuple[List[int] | N
                 start = None
         return candidate_img, segments
 
+    def build_window_candidate(edge_threshold: float) -> Tuple[np.ndarray | None, Tuple[int, int, float] | None]:
+        right_start = min(
+            img_w - 1,
+            max(min_start, int(round(img_w * LOCAL_BARCODE_BAND_ADAPTIVE_RIGHT_START_RATIO))),
+        )
+        debug["adaptive_right_start"] = int(right_start)
+        relaxed_min_edge = max(LOCAL_BARCODE_BAND_EDGE_FLOOR, edge_threshold * LOCAL_BARCODE_BAND_WINDOW_MIN_EDGE_FACTOR)
+        strong_edge_threshold = max(relaxed_min_edge, edge_threshold * LOCAL_BARCODE_BAND_WINDOW_STRONG_EDGE_FACTOR)
+        window_widths = sorted(
+            {
+                max(min_width, min(img_w - right_start, int(round(img_w * ratio))))
+                for ratio in LOCAL_BARCODE_BAND_WINDOW_WIDTH_RATIOS
+                if img_w - right_start >= max(min_width, int(round(img_w * ratio)))
+            }
+        )
+        if not window_widths:
+            return None, None
+
+        step = max(4, min_width // 8)
+        best_window: Dict[str, float] | None = None
+        candidates: List[Dict[str, float]] = []
+        for width in window_widths:
+            for start in range(right_start, max(right_start + 1, img_w - width + 1), step):
+                end = start + width
+                if end > img_w:
+                    break
+
+                window_dark_ok = dark_ok[start:end]
+                active_ratio = float(window_dark_ok.mean()) if window_dark_ok.size else 0.0
+                if active_ratio < LOCAL_BARCODE_BAND_WINDOW_MIN_ACTIVE_RATIO:
+                    continue
+
+                window_edges = smooth_edge[start:end]
+                valid_edges = window_edges[window_dark_ok]
+                if valid_edges.size == 0:
+                    continue
+
+                mean_edge = float(valid_edges.mean())
+                if mean_edge < relaxed_min_edge:
+                    continue
+
+                edge_p75 = float(np.percentile(valid_edges, 75))
+                strong_ratio = float((valid_edges >= strong_edge_threshold).mean())
+                if edge_p75 < relaxed_min_edge * 0.92 and strong_ratio < 0.30:
+                    continue
+
+                dark_mean = float(dark_profile[start:end].mean())
+                score = float(
+                    ((mean_edge * 0.65) + (edge_p75 * 0.35)) * width * active_ratio
+                    + strong_ratio * width * 0.40
+                    + (end / max(1.0, img_w)) * 3.0
+                )
+                candidate_info = {
+                    "x1": int(start),
+                    "x2": int(end),
+                    "width": int(width),
+                    "score": score,
+                    "active_ratio": active_ratio,
+                    "mean_edge": mean_edge,
+                    "edge_p75": edge_p75,
+                    "strong_ratio": strong_ratio,
+                    "dark_mean": dark_mean,
+                }
+                candidates.append(candidate_info)
+                if best_window is None or score > float(best_window["score"]):
+                    best_window = candidate_info
+
+        candidates.sort(key=lambda item: float(item["score"]), reverse=True)
+        debug["window_candidates"] = candidates[:12]
+        if best_window is None:
+            return None, None
+
+        candidate_img = np.zeros((1, img_w), dtype=np.uint8)
+        candidate_img[0, int(best_window["x1"]):int(best_window["x2"])] = 255
+        return candidate_img, (int(best_window["x1"]), int(best_window["x2"]), float(best_window["score"]))
+
     candidate_img, segments = build_segments(float(LOCAL_BARCODE_BAND_EDGE_MIN))
     debug["candidate_mask"] = candidate_img.copy()
 
@@ -437,6 +523,15 @@ def detect_barcode_band_box_with_debug(image: np.ndarray) -> Tuple[List[int] | N
                 debug["edge_threshold_mode"] = "adaptive"
                 debug["edge_threshold"] = float(adaptive_threshold)
 
+    if not segments:
+        window_candidate_img, window_segment = build_window_candidate(float(debug["edge_threshold"]))
+        if window_candidate_img is not None and window_segment is not None:
+            candidate_img = window_candidate_img
+            segments = [window_segment]
+            debug["candidate_mask"] = window_candidate_img.copy()
+            debug["window_box"] = [int(window_segment[0]), 0, int(window_segment[1]), int(img_h)]
+            debug["edge_threshold_mode"] = "window_fallback"
+
     debug["candidate_segments"] = [
         {"x1": int(seg_start), "x2": int(seg_end), "score": float(score)}
         for seg_start, seg_end, score in segments
@@ -469,7 +564,9 @@ def detect_barcode_band_box_with_debug(image: np.ndarray) -> Tuple[List[int] | N
         "score": 1.0,
         "coordinate": [int(v) for v in local_box],
     }
-    is_barcode, _ = detect_barcode_region(region, image, ocr_boxes=None)
+    is_barcode, validation_meta = detect_barcode_region(region, image, ocr_boxes=None)
+    debug["validation_passed"] = bool(is_barcode)
+    debug["validation_meta"] = validation_meta
     if not is_barcode:
         upper_region = dict(region)
         upper_region["coordinate"] = [
@@ -478,7 +575,9 @@ def detect_barcode_band_box_with_debug(image: np.ndarray) -> Tuple[List[int] | N
             int(local_box[2]),
             int(min(image.shape[0], local_box[1] + max(18, int(round((local_box[3] - local_box[1]) * 0.72))))),
         ]
-        is_barcode, _ = detect_barcode_region(upper_region, image, ocr_boxes=None)
+        is_barcode, upper_validation_meta = detect_barcode_region(upper_region, image, ocr_boxes=None)
+        debug["upper_validation_passed"] = bool(is_barcode)
+        debug["upper_validation_meta"] = upper_validation_meta
         if not is_barcode:
             return None, debug
 
@@ -789,6 +888,12 @@ def save_salvage_region_debug(
         "band_adaptive_pool_count": local_debug.get("band_debug", {}).get("adaptive_pool_count"),
         "band_adaptive_right_start": local_debug.get("band_debug", {}).get("adaptive_right_start"),
         "band_adaptive_pool_stats": local_debug.get("band_debug", {}).get("adaptive_pool_stats", {}),
+        "band_window_box": local_debug.get("band_debug", {}).get("window_box"),
+        "band_window_candidates": local_debug.get("band_debug", {}).get("window_candidates", []),
+        "band_validation_passed": local_debug.get("band_debug", {}).get("validation_passed"),
+        "band_validation_meta": local_debug.get("band_debug", {}).get("validation_meta", {}),
+        "band_upper_validation_passed": local_debug.get("band_debug", {}).get("upper_validation_passed"),
+        "band_upper_validation_meta": local_debug.get("band_debug", {}).get("upper_validation_meta", {}),
         "band_candidate_segments": local_debug.get("band_debug", {}).get("candidate_segments", []),
         "merged_local_barcode_boxes": local_debug.get("merged_boxes", []),
         "salvage_boxes_local": salvage_boxes_local,
@@ -1695,6 +1800,10 @@ def main() -> int:
             "local_barcode_band_adaptive_scale": LOCAL_BARCODE_BAND_ADAPTIVE_SCALE,
             "local_barcode_band_adaptive_right_start_ratio": LOCAL_BARCODE_BAND_ADAPTIVE_RIGHT_START_RATIO,
             "local_barcode_band_adaptive_min_active_cols": LOCAL_BARCODE_BAND_ADAPTIVE_MIN_ACTIVE_COLS,
+            "local_barcode_band_window_width_ratios": LOCAL_BARCODE_BAND_WINDOW_WIDTH_RATIOS,
+            "local_barcode_band_window_min_active_ratio": LOCAL_BARCODE_BAND_WINDOW_MIN_ACTIVE_RATIO,
+            "local_barcode_band_window_min_edge_factor": LOCAL_BARCODE_BAND_WINDOW_MIN_EDGE_FACTOR,
+            "local_barcode_band_window_strong_edge_factor": LOCAL_BARCODE_BAND_WINDOW_STRONG_EDGE_FACTOR,
             "local_barcode_min_width_ratio": LOCAL_BARCODE_MIN_WIDTH_RATIO,
             "local_barcode_min_height_ratio": LOCAL_BARCODE_MIN_HEIGHT_RATIO,
             "local_barcode_min_area_ratio": LOCAL_BARCODE_MIN_AREA_RATIO,
