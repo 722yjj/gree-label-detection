@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from label_detection.core.config import PROJECT_ROOT, SAMPLES_DIR
 from label_detection.extraction.template_source import SUPPORTED_TEMPLATE_IMAGE_SUFFIXES
+from label_detection.matching.ocr import field_values_match
 
 
 DEFAULT_TEMPLATE_ROOTS = (SAMPLES_DIR / "pdfs",)
@@ -26,6 +27,7 @@ TEMPLATE_SUFFIXES = (".pdf",) + TARGET_IMAGE_SUFFIXES
 RESULT_JSON_NAME = "result.json"
 RESULT_VIS_NAME = "visualization_diff.jpg"
 SUMMARY_JSON_NAME = "summary.json"
+REPORT_INTERMEDIATE_NAMES = ("template_preprocessed.jpg", "target_preprocessed.jpg")
 
 _RUN_UNIFIED_DETECTION = None
 
@@ -224,7 +226,7 @@ def compute_text_summary(result: Dict[str, object]) -> Dict[str, object]:
     different_fields = [
         field_name
         for field_name in field_names
-        if template_data.get(field_name) != target_data.get(field_name)
+        if not field_values_match(template_data.get(field_name), target_data.get(field_name))
     ]
 
     summary = {
@@ -246,12 +248,19 @@ def compute_graphic_summary(result: Dict[str, object]) -> Dict[str, object]:
     comparison_results = list(graphic.get("comparison_results") or [])
     mismatch_count = sum(1 for item in comparison_results if item.get("decision") == "mismatch")
     review_count = sum(1 for item in comparison_results if item.get("decision") == "unknown")
+    matched_count = int(graphic.get("matched_count") or 0)
+    recovered_match_count = int(graphic.get("recovered_match_count") or 0)
+    resolved_match_count = int(
+        graphic.get("resolved_match_count") or (matched_count + recovered_match_count)
+    )
 
     return {
         "template_regions_count": graphic.get("template_regions_count"),
         "target_regions_count": graphic.get("target_regions_count"),
-        "matched_count": graphic.get("matched_count"),
-        "effective_matched_count": graphic.get("effective_matched_count"),
+        "matched_count": matched_count,
+        "recovered_match_count": recovered_match_count,
+        "resolved_match_count": resolved_match_count,
+        "effective_matched_count": resolved_match_count,
         "remaining_unmatched_template": list(graphic.get("remaining_unmatched_template") or []),
         "remaining_unmatched_target": list(graphic.get("remaining_unmatched_target") or []),
         "mismatch_count": mismatch_count,
@@ -315,6 +324,12 @@ def write_json(path: Path, payload: Dict[str, object]) -> None:
         json.dump(payload, file, ensure_ascii=False, indent=2)
 
 
+def cleanup_report_intermediates(output_root: Path) -> None:
+    for path in output_root.rglob("*"):
+        if path.is_file() and path.name in REPORT_INTERMEDIATE_NAMES:
+            path.unlink()
+
+
 def get_case_output_dir(output_root: Path, case: BatchCase) -> Path:
     return output_root / case.code / case.case_id
 
@@ -346,7 +361,11 @@ def load_existing_record(case: BatchCase, output_root: Path) -> Optional[CaseRun
     )
 
 
-def run_case(case: BatchCase, output_root: Path) -> CaseRunRecord:
+def run_case(
+    case: BatchCase,
+    output_root: Path,
+    preserve_report_intermediates: bool = False,
+) -> CaseRunRecord:
     case_dir = get_case_output_dir(output_root, case)
     case_dir.mkdir(parents=True, exist_ok=True)
 
@@ -380,6 +399,12 @@ def run_case(case: BatchCase, output_root: Path) -> CaseRunRecord:
         if temp_visualization.exists():
             shutil.copy2(temp_visualization, visualization_path)
             final_visualization = visualization_path
+
+        if preserve_report_intermediates:
+            for fname in REPORT_INTERMEDIATE_NAMES:
+                src = work_dir / fname
+                if src.exists():
+                    shutil.copy2(src, case_dir / fname)
 
         payload = build_saved_payload(
             case,
@@ -544,6 +569,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Only print discovered cases without running the workflow.",
     )
     parser.add_argument(
+        "--no-report",
+        action="store_true",
+        help="Skip generating the Excel summary report.",
+    )
+    parser.add_argument(
         "--min-code-length",
         type=int,
         default=6,
@@ -597,7 +627,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 continue
 
         print(f"[run  {index:03d}/{len(cases):03d}] {case.case_id}")
-        record = run_case(case, output_dir)
+        record = run_case(
+            case,
+            output_dir,
+            preserve_report_intermediates=not args.no_report,
+        )
         records.append(record)
         if record.success:
             print(
@@ -623,6 +657,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     temp_root = output_dir / "_tmp"
     if temp_root.exists() and not any(temp_root.iterdir()):
         temp_root.rmdir()
+
+    try:
+        # Generate Excel report with thumbnails
+        if not args.no_report:
+            from label_detection.batch_report import generate_batch_excel_report
+
+            report_path = generate_batch_excel_report(output_dir, records, summary)
+            print(f"Excel report saved: {repo_relative(report_path)}")
+    finally:
+        cleanup_report_intermediates(output_dir)
 
     print("=" * 70)
     print(f"Summary saved: {repo_relative(summary_path)}")

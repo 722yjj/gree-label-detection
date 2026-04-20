@@ -25,6 +25,7 @@ from label_detection.core.config import (
     DEFAULT_TARGET_PATH,
     USE_VLM_FOR_GRAPHIC,
     ENABLE_IMAGE_REGION_SPLIT,
+    ensure_local_ollama_no_proxy,
 )
 from label_detection.extraction.template_source import resolve_template_input
 from label_detection.extraction.text import (
@@ -43,6 +44,8 @@ from label_detection.matching.layout import (
     draw_regions,
     split_barcode_regions,
     split_composite_image_regions,
+    merge_fragmented_split_regions,
+    filter_split_image_regions,
     infer_corresponding_region,
     estimate_region_foreground_ratio,
 )
@@ -59,6 +62,7 @@ def get_llm():
     """Lazily initialize the Ollama client when the workflow actually runs."""
     global _llm
     if _llm is None:
+        ensure_local_ollama_no_proxy(OLLAMA_API_BASE)
         from langchain_ollama import ChatOllama
 
         _llm = ChatOllama(
@@ -179,6 +183,42 @@ def _extract_structured_from_text(
 
     print(f"    [规则提取] 紧凑标签命中 {count_populated_fields(extracted)} 个字段")
     return extracted
+
+
+def build_final_verdict(
+    *,
+    match_count: int,
+    total_fields: int,
+    graphic_pass: bool,
+    review_count: int,
+    mismatch_count: int,
+    unresolved_graphics: int,
+) -> str:
+    text_diff_count = max(total_fields - match_count, 0)
+    has_review = review_count > 0
+
+    if text_diff_count == 0 and graphic_pass and not has_review:
+        return "✅ 标签完全一致"
+    if text_diff_count == 0 and graphic_pass and has_review:
+        return f"⚠️ 标签基本一致，{review_count} 处图形需人工复核"
+    if text_diff_count > 0 and graphic_pass and has_review:
+        return f"⚠️ 文字存在差异 ({text_diff_count} 处)，另有 {review_count} 处图形需人工复核"
+    if text_diff_count > 0 and graphic_pass:
+        return f"⚠️ 文字存在差异 ({text_diff_count} 处)，图形一致"
+    if text_diff_count == 0 and not graphic_pass:
+        if unresolved_graphics > 0 and mismatch_count == 0:
+            return f"⚠️ 文字一致，但图形有 {unresolved_graphics} 个区域未恢复"
+        return (
+            "⚠️ 文字一致，图形存在差异 "
+            f"({mismatch_count} 处不匹配, {unresolved_graphics} 个未恢复)"
+        )
+
+    review_suffix = f", {review_count} 处待复核" if has_review else ""
+    return (
+        "❌ 标签差异较大 "
+        f"(文字 {match_count}/{total_fields}，图形 {mismatch_count} 处不匹配, "
+        f"{unresolved_graphics} 个未恢复{review_suffix})"
+    )
 
 
 def run_llm_extraction(
@@ -361,26 +401,51 @@ def _make_unresolved_recovery_result(
     if reason == "inference_failed":
         summary = f"{subject} 无法推理对应区域，{side_hint}"
         error_type = "recovery_inference_failed"
+        decision = "unknown"
+        confidence = 0.0
+        needs_review = True
+        judgment_source = "recovery_failed"
+        unresolved_unmatched = True
     elif reason == "low_foreground":
-        summary = f"{subject} 推理区域前景过少 ({foreground_ratio:.3f})，{side_hint}"
-        error_type = "recovery_low_foreground"
+        if source_side == "实拍":
+            summary = (
+                f"{subject} 对应模板区域前景过少 ({foreground_ratio:.3f})，"
+                "判定实拍多出图形"
+            )
+            error_type = "recovery_extra_target_graphic"
+        else:
+            summary = (
+                f"{subject} 对应实拍区域前景过少 ({foreground_ratio:.3f})，"
+                "判定实拍缺失图形"
+            )
+            error_type = "recovery_missing_target_graphic"
+        decision = "mismatch"
+        confidence = 0.95
+        needs_review = False
+        judgment_source = "recovery_low_foreground"
+        unresolved_unmatched = False
     else:
         summary = f"{subject} 恢复对比失败，{side_hint}"
         if exc is not None:
             summary = f"{summary} ({exc})"
         error_type = "recovery_compare_error"
+        decision = "unknown"
+        confidence = 0.0
+        needs_review = True
+        judgment_source = "recovery_failed"
+        unresolved_unmatched = True
 
     return {
-        "decision": "unknown",
+        "decision": decision,
         "is_match": False,
-        "confidence": 0.0,
-        "needs_review": True,
+        "confidence": confidence,
+        "needs_review": needs_review,
         "error_type": error_type,
         "differences": [summary],
         "summary": summary,
-        "judgment_source": "recovery_failed",
+        "judgment_source": judgment_source,
         "recovered": True,
-        "unresolved_unmatched": True,
+        "unresolved_unmatched": unresolved_unmatched,
         "recovery_source_side": source_side,
         "recovery_foreground_ratio": foreground_ratio,
         "template_idx": None,
@@ -446,6 +511,16 @@ def _recover_unmatched_regions(
             recovery_results.append(result)
             _print_graphic_decision("      恢复判定: ", result)
 
+            if result.get("decision") in {"match", "mismatch"} and not result.get("needs_review", False):
+                if source_side == "实拍":
+                    resolved_unmatched2.add(source_idx)
+                    if result.get("decision") == "match" and inferred_region is not None:
+                        recovered_template_regions.append(inferred_region)
+                else:
+                    resolved_unmatched1.add(source_idx)
+                    if result.get("decision") == "match" and inferred_region is not None:
+                        recovered_target_regions.append(inferred_region)
+
         if inferred_region is None:
             print(f"    - {source_side} 未匹配区域 #{source_idx}: 无法推理对应区域")
             _finalize_result(
@@ -506,14 +581,6 @@ def _recover_unmatched_regions(
 
         _finalize_result(result)
         pair_idx += 1
-
-        if result.get("decision") == "match" and not result.get("needs_review", False):
-            if source_side == "实拍":
-                resolved_unmatched2.add(source_idx)
-                recovered_template_regions.append(inferred_region)
-            else:
-                resolved_unmatched1.add(source_idx)
-                recovered_target_regions.append(inferred_region)
 
     if unmatched2:
         print("  - 尝试根据实拍未匹配区域恢复模板漏检...")
@@ -729,6 +796,8 @@ def run_unified_detection(
     skipped_target_regions: List[Dict] = []
     split_template_regions: List[Dict] = []
     split_target_regions: List[Dict] = []
+    skipped_split_template_regions: List[Dict] = []
+    skipped_split_target_regions: List[Dict] = []
     template_regions, skipped_template_regions = split_barcode_regions(
         template_regions,
         template_cropped,
@@ -745,7 +814,19 @@ def run_unified_detection(
             template_cropped,
             template_boxes,
         )
+        template_regions = merge_fragmented_split_regions(template_regions)
+        template_regions, skipped_split_template_regions = filter_split_image_regions(
+            template_regions,
+            template_cropped,
+            template_boxes,
+        )
         target_regions, split_target_regions = split_composite_image_regions(
+            target_regions,
+            target_cropped,
+            target_boxes,
+        )
+        target_regions = merge_fragmented_split_regions(target_regions)
+        target_regions, skipped_split_target_regions = filter_split_image_regions(
             target_regions,
             target_cropped,
             target_boxes,
@@ -766,6 +847,11 @@ def run_unified_detection(
             "  - 图片区域二次拆分: "
             f"模板拆分 {len(split_template_regions)} 个大框, "
             f"实拍拆分 {len(split_target_regions)} 个大框"
+        )
+        print(
+            "  - 拆分后过滤: "
+            f"模板跳过 {len(skipped_split_template_regions)} 个子框, "
+            f"实拍跳过 {len(skipped_split_target_regions)} 个子框"
         )
 
     # 3.2 区域匹配
@@ -861,12 +947,18 @@ def run_unified_detection(
         template_vis = draw_regions(template_vis, skipped_template_regions, color=(0, 165, 255))
     if skipped_target_regions:
         target_vis = draw_regions(target_vis, skipped_target_regions, color=(0, 165, 255))
+    if skipped_split_template_regions:
+        template_vis = draw_regions(template_vis, skipped_split_template_regions, color=(0, 0, 255))
+    if skipped_split_target_regions:
+        target_vis = draw_regions(target_vis, skipped_split_target_regions, color=(0, 0, 255))
     if recovered_template_regions:
         template_vis = draw_regions(template_vis, recovered_template_regions, color=(255, 128, 0))
     if recovered_target_regions:
         target_vis = draw_regions(target_vis, recovered_target_regions, color=(255, 128, 0))
     cv2.imwrite(os.path.join(graphic_output_dir, "template_regions_detected.jpg"), template_vis)
     cv2.imwrite(os.path.join(graphic_output_dir, "target_regions_detected.jpg"), target_vis)
+
+    resolved_match_count = len(matched_pairs) + len(recovered_template_regions) + len(recovered_target_regions)
 
     results["graphic_comparison"] = {
         "template_regions_total_count": len(extract_regions_by_type(template_all_regions, "image")),
@@ -877,13 +969,16 @@ def run_unified_detection(
         "skipped_target_regions": skipped_target_regions,
         "split_template_regions": split_template_regions,
         "split_target_regions": split_target_regions,
+        "skipped_split_template_regions": skipped_split_template_regions,
+        "skipped_split_target_regions": skipped_split_target_regions,
         "recovered_template_regions": recovered_template_regions,
         "recovered_target_regions": recovered_target_regions,
         "remaining_unmatched_template": remaining_unmatched1,
         "remaining_unmatched_target": remaining_unmatched2,
         "matched_count": len(matched_pairs),
         "recovered_match_count": len(recovered_template_regions) + len(recovered_target_regions),
-        "effective_matched_count": len(matched_pairs) + len(recovered_template_regions) + len(recovered_target_regions),
+        "resolved_match_count": resolved_match_count,
+        "effective_matched_count": resolved_match_count,
         "comparison_results": comparison_results,
         "region_type": "image"
     }
@@ -901,6 +996,8 @@ def run_unified_detection(
     # 在实拍预处理图上绘制
     vis_image = target_cropped.copy()
     diff_count = 0
+
+    alert_color = (0, 0, 255)
 
     # 1. 标注差异的文字区域 (红色)
     print("  寻找并标注差异文字区域...")
@@ -934,7 +1031,7 @@ def run_unified_detection(
                         poly = np.array([[x1,y1], [x2,y1], [x2,y2], [x1,y2]], dtype=np.int32)
                     else:
                         poly = pts.reshape((-1, 1, 2))
-                    cv2.polylines(vis_image, [poly], isClosed=True, color=(0, 0, 255), thickness=3)
+                    cv2.polylines(vis_image, [poly], isClosed=True, color=alert_color, thickness=3)
                     diff_count += 1
             else:
                 print(f"    - 字段 '{k}' 差异 (值: {target_val}) -> 未找到对应 OCR 框")
@@ -958,14 +1055,12 @@ def run_unified_detection(
 
             if decision == "mismatch":
                 # 确认差异：红框
-                cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                cv2.putText(vis_image, "Diff", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.rectangle(vis_image, (x1, y1), (x2, y2), alert_color, 3)
                 diff_count += 1
                 print(f"    - 图形差异: 区域 #{target_idx if target_idx is not None else 'recovered'} (确认不匹配)")
             elif res.get("unresolved_unmatched"):
-                # 未恢复区域：橙框
-                cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 128, 255), 3)
-                cv2.putText(vis_image, "Unmatched", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 128, 255), 2)
+                # 未恢复区域：统一使用红框
+                cv2.rectangle(vis_image, (x1, y1), (x2, y2), alert_color, 3)
                 unresolved_regions.append(res)
                 print(
                     "    - 图形未恢复: 区域 "
@@ -973,9 +1068,8 @@ def run_unified_detection(
                     f"({res.get('summary', '')})"
                 )
             elif decision == "unknown":
-                # 需复核：黄框
-                cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 200, 255), 3)
-                cv2.putText(vis_image, "Review", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+                # 需复核：统一使用红框
+                cv2.rectangle(vis_image, (x1, y1), (x2, y2), alert_color, 3)
                 needs_review_regions.append(res)
                 print(
                     "    - 图形需复核: 区域 "
@@ -1011,7 +1105,7 @@ def run_unified_detection(
     print(f"\n🖼️ 图形比较 (基于区域):")
     effective_template_regions = len(template_regions) + len(recovered_template_regions)
     effective_target_regions = len(target_regions) + len(recovered_target_regions)
-    effective_matched_pairs = len(matched_pairs) + len(recovered_template_regions) + len(recovered_target_regions)
+    resolved_match_pairs = len(matched_pairs) + len(recovered_template_regions) + len(recovered_target_regions)
 
     print(
         f"   - 检测区域数: 模板 {len(template_regions)} / 实拍 {len(target_regions)}"
@@ -1021,7 +1115,10 @@ def run_unified_detection(
         print(f"   - 条码跳过: 模板 {len(skipped_template_regions)} / 实拍 {len(skipped_target_regions)}")
     if recovered_template_regions or recovered_target_regions:
         print(f"   - 漏检恢复: 模板 +{len(recovered_template_regions)} / 实拍 +{len(recovered_target_regions)}")
-    print(f"   - 成功匹配: {effective_matched_pairs} 对")
+    print(f"   - 直接匹配: {len(matched_pairs)} 对")
+    if recovered_template_regions or recovered_target_regions:
+        print(f"   - 恢复补配: {len(recovered_template_regions) + len(recovered_target_regions)} 对")
+    print(f"   - 已解决配对: {resolved_match_pairs} 对")
 
     # 统计分为三类
     confirmed_match = [r for r in comparison_results if r.get("decision") == "match"]
@@ -1048,9 +1145,9 @@ def run_unified_detection(
         for res in review_needed:
             print(f"   - ⚠️ 需复核: {res.get('summary')}")
 
-    if confirmed_match and not confirmed_mismatch and not review_needed and effective_matched_pairs > 0:
+    if confirmed_match and not confirmed_mismatch and not review_needed and resolved_match_pairs > 0:
         print("   - ✅ 所有匹配区域均判定一致")
-    elif effective_matched_pairs == 0:
+    elif resolved_match_pairs == 0:
          print("   - ⚠️ 无可见图形区域参与对比")
 
     print(f"   - 统计: 一致 {len(confirmed_match)}, 不一致 {len(confirmed_mismatch)}, 待复核 {len(review_needed)}")
@@ -1062,29 +1159,15 @@ def run_unified_detection(
     print(f"   - 可视化图: {vis_path}")
 
     # 综合判定
-    text_match_ratio = match_count / total_fields
     unresolved_graphics = len(remaining_unmatched1) + len(remaining_unmatched2)
-
-    if text_match_ratio == 1.0 and graphic_pass and not has_review:
-        verdict = "✅ 标签完全一致"
-    elif text_match_ratio == 1.0 and graphic_pass and has_review:
-        verdict = f"⚠️ 标签基本一致，{len(review_needed)} 处图形需人工复核"
-    elif text_match_ratio >= 0.8 and graphic_pass:
-        verdict = f"⚠️ 文字存在差异 ({int((1-text_match_ratio)*total_fields)} 处)，图形一致"
-    elif text_match_ratio == 1.0 and not graphic_pass:
-        if unresolved_graphics > 0 and not confirmed_mismatch:
-            verdict = f"⚠️ 文字一致，但图形有 {unresolved_graphics} 个区域未恢复"
-        else:
-            verdict = (
-                "⚠️ 文字一致，图形存在差异 "
-                f"({len(confirmed_mismatch)} 处不匹配, {unresolved_graphics} 个未恢复)"
-            )
-    else:
-        verdict = (
-            "❌ 标签差异较大 "
-            f"(文字 {match_count}/{total_fields}，图形 {len(confirmed_mismatch)} 处不匹配, "
-            f"{unresolved_graphics} 个未恢复)"
-        )
+    verdict = build_final_verdict(
+        match_count=match_count,
+        total_fields=total_fields,
+        graphic_pass=graphic_pass,
+        review_count=len(review_needed),
+        mismatch_count=len(confirmed_mismatch),
+        unresolved_graphics=unresolved_graphics,
+    )
 
     print(f"\n🏷️ 综合判定: {verdict}")
 

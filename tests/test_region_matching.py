@@ -19,6 +19,8 @@ from label_detection.matching.layout import (
     _compute_match_cost,
     split_barcode_regions,
     split_composite_image_regions,
+    merge_fragmented_split_regions,
+    filter_split_image_regions,
     infer_corresponding_region,
 )
 
@@ -356,3 +358,80 @@ class TestCompositeImageRegionSplit:
         assert len(refined) == 1
         assert refined[0]["coordinate"] == region["coordinate"]
         assert split_parents == []
+
+
+class TestSplitRegionPostFilter:
+    def _make_region(self, x1, y1, x2, y2, parent_box=None, child_idx=None):
+        region = {"coordinate": [x1, y1, x2, y2], "label": "image", "score": 0.9}
+        if parent_box is not None:
+            region["split_parent_coordinate"] = list(parent_box)
+        if child_idx is not None:
+            region["split_child_idx"] = child_idx
+        return region
+
+    def test_merge_fragmented_split_regions_merges_vertical_siblings(self):
+        parent = [20, 40, 340, 190]
+        regions = [
+            self._make_region(40, 60, 110, 140, parent_box=parent, child_idx=0),
+            self._make_region(48, 150, 102, 162, parent_box=parent, child_idx=1),
+            self._make_region(250, 55, 320, 175, parent_box=parent, child_idx=2),
+        ]
+
+        merged = merge_fragmented_split_regions(regions)
+
+        assert len(merged) == 2
+        merged = sorted(merged, key=lambda item: item["coordinate"][0])
+        assert merged[0]["coordinate"] == [40, 60, 110, 162]
+        assert merged[1]["coordinate"] == [250, 55, 320, 175]
+
+    def test_filter_split_image_regions_skips_barcode_clusters(self):
+        img = np.full((240, 360, 3), 255, dtype=np.uint8)
+        for x in range(140, 310, 8):
+            img[92:138, x : x + 4] = 0
+
+        parent = [130, 88, 320, 142]
+        regions = [
+            self._make_region(142, 92, 154, 138, parent_box=parent, child_idx=0),
+            self._make_region(178, 92, 190, 138, parent_box=parent, child_idx=1),
+            self._make_region(214, 92, 226, 138, parent_box=parent, child_idx=2),
+            self._make_region(250, 92, 262, 138, parent_box=parent, child_idx=3),
+        ]
+
+        kept, skipped = filter_split_image_regions(regions, img, None)
+
+        assert kept == []
+        assert len(skipped) == 4
+        assert all(item["skip_reason"] == "barcode_cluster" for item in skipped)
+
+    def test_filter_split_image_regions_skips_compact_right_side_barcode_cluster(self):
+        img = np.full((260, 420, 3), 255, dtype=np.uint8)
+        for x in range(280, 388, 7):
+            img[110:150, x : x + 3] = 0
+
+        parent = [250, 104, 395, 152]
+        regions = [
+            self._make_region(262, 108, 320, 150, parent_box=parent, child_idx=0),
+            self._make_region(324, 110, 356, 150, parent_box=parent, child_idx=1),
+            self._make_region(360, 112, 392, 148, parent_box=parent, child_idx=2),
+        ]
+
+        kept, skipped = filter_split_image_regions(regions, img, None)
+
+        assert kept == []
+        assert len(skipped) == 3
+        assert all(item["skip_reason"] == "barcode_cluster" for item in skipped)
+
+    def test_filter_split_image_regions_skips_thin_sliver_child(self):
+        img = np.full((220, 360, 3), 255, dtype=np.uint8)
+        parent = [20, 40, 270, 190]
+        regions = [
+            self._make_region(40, 60, 110, 150, parent_box=parent, child_idx=0),
+            self._make_region(130, 158, 240, 178, parent_box=parent, child_idx=1),
+        ]
+
+        kept, skipped = filter_split_image_regions(regions, img, None)
+
+        assert len(kept) == 1
+        assert kept[0]["coordinate"] == [40, 60, 110, 150]
+        assert len(skipped) == 1
+        assert skipped[0]["skip_reason"] == "thin_sliver"

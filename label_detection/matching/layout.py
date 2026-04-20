@@ -11,6 +11,7 @@
 STATUS: main
 """
 
+from collections import defaultdict
 import json
 import os
 import re
@@ -313,7 +314,15 @@ def split_barcode_regions(
             region_copy["barcode_hint"] = meta
             skipped.append(region_copy)
         else:
-            comparable.append(region_copy)
+            salvaged_regions, salvaged_skipped = _salvage_mixed_barcode_region(
+                region_copy,
+                image,
+            )
+            if salvaged_regions and salvaged_skipped:
+                comparable.extend(salvaged_regions)
+                skipped.extend(salvaged_skipped)
+            else:
+                comparable.append(region_copy)
 
     return comparable, skipped
 
@@ -345,6 +354,29 @@ def _box_union(box1: Sequence[int], box2: Sequence[int]) -> List[int]:
         int(max(box1[2], box2[2])),
         int(max(box1[3], box2[3])),
     ]
+
+
+def _box_key(box: Sequence[float]) -> Tuple[int, int, int, int]:
+    return tuple(int(round(float(v))) for v in box)
+
+
+def _box_metrics(box: Sequence[float]) -> Dict[str, float]:
+    width = max(1.0, float(box[2]) - float(box[0]))
+    height = max(1.0, float(box[3]) - float(box[1]))
+    return {
+        "width": width,
+        "height": height,
+        "area": width * height,
+        "aspect_ratio": width / height,
+    }
+
+
+def _vertical_gap(box1: Sequence[float], box2: Sequence[float]) -> float:
+    if float(box1[1]) > float(box2[3]):
+        return float(box1[1]) - float(box2[3])
+    if float(box2[1]) > float(box1[3]):
+        return float(box2[1]) - float(box1[3])
+    return 0.0
 
 
 def _boxes_should_merge(
@@ -491,6 +523,180 @@ def _extract_split_candidate_boxes(crop: np.ndarray) -> List[List[int]]:
     return meaningful_boxes
 
 
+def _is_local_barcode_box(local_box: Sequence[int], crop: np.ndarray) -> Tuple[bool, Dict[str, float]]:
+    """Detect barcode-like child boxes inside one mixed region."""
+    x1, y1, x2, y2 = [int(v) for v in local_box]
+    local_crop = crop[y1:y2, x1:x2]
+    if local_crop.size == 0:
+        return False, {}
+
+    parent_h, parent_w = crop.shape[:2]
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+    aspect_ratio = width / max(1.0, height)
+    width_ratio = width / max(1.0, parent_w)
+    height_ratio = height / max(1.0, parent_h)
+    start_ratio = x1 / max(1.0, parent_w)
+    texture = _compute_barcode_texture(local_crop)
+
+    is_barcode = (
+        aspect_ratio >= 2.2
+        and width_ratio >= 0.28
+        and height_ratio <= 0.92
+        and texture["transition_density"] >= 0.15
+        and 0.08 <= texture["dark_column_ratio"] <= 0.90
+        and texture["vertical_bias"] >= 4.5
+    ) or (
+        aspect_ratio >= 2.8
+        and width_ratio >= 0.35
+        and start_ratio >= 0.20
+        and texture["transition_density"] >= 0.12
+        and texture["vertical_bias"] >= 6.0
+        and texture["dark_column_ratio"] >= 0.10
+    )
+
+    return bool(is_barcode), {
+        "aspect_ratio": float(aspect_ratio),
+        "width_ratio": float(width_ratio),
+        "height_ratio": float(height_ratio),
+        "start_ratio": float(start_ratio),
+        "transition_density": texture["transition_density"],
+        "dark_column_ratio": texture["dark_column_ratio"],
+        "vertical_bias": texture["vertical_bias"],
+    }
+
+
+def _trim_local_box_against_barcode(
+    local_box: Sequence[int],
+    barcode_boxes: Sequence[Sequence[int]],
+    crop_shape: Tuple[int, int],
+) -> List[int] | None:
+    """Trim a salvaged child box so it does not absorb nearby barcode stripes."""
+    crop_h, crop_w = crop_shape
+    x1, y1, x2, y2 = [int(v) for v in local_box]
+    trimmed = [x1, y1, x2, y2]
+
+    right_side_barcodes = [int(box[0]) for box in barcode_boxes if int(box[0]) >= x1]
+    if right_side_barcodes:
+        trimmed[2] = min(
+            trimmed[2],
+            min(right_side_barcodes) - max(2, int(round(crop_w * 0.01))),
+        )
+
+    min_width = max(8, int(round(crop_w * 0.04)))
+    min_height = max(8, int(round(crop_h * 0.10)))
+    if trimmed[2] - trimmed[0] < min_width or trimmed[3] - trimmed[1] < min_height:
+        return None
+
+    return trimmed
+
+
+def _salvage_mixed_barcode_region(
+    region: Dict,
+    image: np.ndarray,
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Split one mixed region into non-barcode children and skipped barcode children.
+
+    This only triggers when a wide, low-height layout box clearly contains both a
+    barcode-like child and at least one non-barcode child. It avoids the broader
+    side effects of enabling experimental image-region splitting globally.
+    """
+    img_h, img_w = image.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in region["coordinate"]]
+    x1 = max(0, min(x1, img_w))
+    x2 = max(0, min(x2, img_w))
+    y1 = max(0, min(y1, img_h))
+    y2 = max(0, min(y2, img_h))
+    crop = image[y1:y2, x1:x2]
+    if crop.size == 0:
+        return [], []
+
+    crop_h, crop_w = crop.shape[:2]
+    if crop_w / max(1.0, crop_h) < 2.0:
+        return [], []
+
+    local_boxes = _extract_split_candidate_boxes(crop)
+    if len(local_boxes) < 2:
+        return [], []
+
+    barcode_children: List[Tuple[List[int], Dict[str, float]]] = []
+    non_barcode_children: List[List[int]] = []
+    for local_box in local_boxes:
+        child_is_barcode, child_meta = _is_local_barcode_box(local_box, crop)
+        if child_is_barcode:
+            barcode_children.append((list(local_box), child_meta))
+        else:
+            non_barcode_children.append(list(local_box))
+
+    if not barcode_children or not non_barcode_children:
+        return [], []
+
+    comparable: List[Dict] = []
+    skipped: List[Dict] = []
+
+    for child_idx, local_box in enumerate(non_barcode_children):
+        trimmed_box = _trim_local_box_against_barcode(
+            local_box,
+            [box for box, _ in barcode_children],
+            crop.shape[:2],
+        )
+        if trimmed_box is None:
+            continue
+
+        local_width = max(1, trimmed_box[2] - trimmed_box[0])
+        local_height = max(1, trimmed_box[3] - trimmed_box[1])
+        pad_x = max(2, int(round(local_width * 0.04)))
+        pad_y = max(2, int(round(local_height * 0.05)))
+        child_box = clip_box_to_image(
+            [
+                x1 + trimmed_box[0] - pad_x,
+                y1 + trimmed_box[1] - pad_y,
+                x1 + trimmed_box[2] + pad_x,
+                y1 + trimmed_box[3] + pad_y,
+            ],
+            image.shape[:2],
+            min_size=8,
+        )
+        if child_box is None:
+            continue
+
+        child_region = dict(region)
+        child_region["coordinate"] = child_box
+        child_region["salvaged_from_mixed_barcode"] = True
+        child_region["salvage_child_idx"] = child_idx
+        child_region["split_parent_coordinate"] = list(region["coordinate"])
+        comparable.append(child_region)
+
+    for child_idx, (local_box, child_meta) in enumerate(barcode_children):
+        child_box = clip_box_to_image(
+            [
+                x1 + local_box[0],
+                y1 + local_box[1],
+                x1 + local_box[2],
+                y1 + local_box[3],
+            ],
+            image.shape[:2],
+            min_size=8,
+        )
+        if child_box is None:
+            continue
+
+        child_region = dict(region)
+        child_region["coordinate"] = child_box
+        child_region["skip_reason"] = "local_barcode_subregion"
+        child_region["barcode_hint"] = child_meta
+        child_region["salvaged_from_mixed_barcode"] = True
+        child_region["salvage_child_idx"] = child_idx
+        child_region["split_parent_coordinate"] = list(region["coordinate"])
+        skipped.append(child_region)
+
+    if not comparable or not skipped:
+        return [], []
+
+    return comparable, skipped
+
+
 def split_composite_image_regions(
     regions: Sequence[Dict],
     image: np.ndarray,
@@ -572,6 +778,211 @@ def split_composite_image_regions(
         refined.extend(child_regions)
 
     return refined, split_parents
+
+
+def merge_fragmented_split_regions(regions: Sequence[Dict]) -> List[Dict]:
+    """Merge vertically fragmented child regions belonging to the same split parent."""
+    grouped: Dict[Tuple[int, int, int, int], List[Dict]] = defaultdict(list)
+    passthrough: List[Dict] = []
+    for region in regions:
+        parent_box = region.get("split_parent_coordinate")
+        if parent_box is None:
+            passthrough.append(dict(region))
+            continue
+        grouped[_box_key(parent_box)].append(dict(region))
+
+    merged_regions: List[Dict] = list(passthrough)
+
+    for siblings in grouped.values():
+        pending = sorted(
+            siblings,
+            key=lambda item: (item["coordinate"][0], item["coordinate"][1]),
+        )
+        changed = True
+        while changed:
+            changed = False
+            next_pending: List[Dict] = []
+            used = [False] * len(pending)
+            for idx, region in enumerate(pending):
+                if used[idx]:
+                    continue
+
+                current = dict(region)
+                current_indices = set(current.get("merged_child_indices") or [current.get("split_child_idx")])
+                used[idx] = True
+
+                for other_idx in range(idx + 1, len(pending)):
+                    if used[other_idx]:
+                        continue
+                    candidate = pending[other_idx]
+                    if current.get("split_parent_coordinate") != candidate.get("split_parent_coordinate"):
+                        continue
+
+                    parent_metrics = _box_metrics(current["split_parent_coordinate"])
+                    gap = _vertical_gap(current["coordinate"], candidate["coordinate"])
+                    overlap = _horizontal_overlap_ratio(current["coordinate"], candidate["coordinate"])
+                    current_metrics = _box_metrics(current["coordinate"])
+                    candidate_metrics = _box_metrics(candidate["coordinate"])
+                    min_area = min(current_metrics["area"], candidate_metrics["area"])
+                    max_area = max(current_metrics["area"], candidate_metrics["area"])
+                    mergeable = (
+                        overlap >= 0.60
+                        and gap <= max(14.0, parent_metrics["height"] * 0.14)
+                        and min_area / max(1.0, max_area) <= 0.70
+                    )
+                    if not mergeable:
+                        continue
+
+                    current["coordinate"] = _box_union(current["coordinate"], candidate["coordinate"])
+                    current_indices.update(
+                        candidate.get("merged_child_indices") or [candidate.get("split_child_idx")]
+                    )
+                    current["merged_child_indices"] = sorted(
+                        int(item) for item in current_indices if item is not None
+                    )
+                    used[other_idx] = True
+                    changed = True
+
+                next_pending.append(current)
+            pending = sorted(next_pending, key=lambda item: (item["coordinate"][0], item["coordinate"][1]))
+
+        merged_regions.extend(pending)
+
+    return merged_regions
+
+
+def _looks_like_barcode_cluster(
+    parent_box: Sequence[float],
+    children: Sequence[Dict],
+    image: np.ndarray,
+    ocr_boxes: Sequence[Tuple[object, str, float]] | None = None,
+) -> bool:
+    if len(children) < 3:
+        return False
+
+    _, barcode_meta = detect_barcode_region({"coordinate": list(parent_box)}, image, ocr_boxes)
+    parent_metrics = _box_metrics(parent_box)
+    if parent_metrics["aspect_ratio"] < 2.8:
+        return False
+
+    child_metrics = [_box_metrics(region["coordinate"]) for region in children]
+    narrow_children = sum(1 for item in child_metrics if item["aspect_ratio"] < 0.7)
+    tall_children = sum(
+        1 for item in child_metrics
+        if item["height"] >= parent_metrics["height"] * 0.65
+    )
+    parent_texture_barcode = (
+        float(barcode_meta["transition_density"]) >= 0.18
+        and float(barcode_meta["vertical_bias"]) >= 3.0
+        and 0.08 <= float(barcode_meta["dark_column_ratio"]) <= 0.85
+    )
+    center_x_ratio = ((float(parent_box[0]) + float(parent_box[2])) / 2.0) / max(1.0, image.shape[1])
+    right_side_barcode = (
+        len(children) >= 5
+        and center_x_ratio >= 0.62
+        and narrow_children / max(1, len(child_metrics)) >= 0.75
+        and parent_metrics["aspect_ratio"] >= 3.0
+    )
+    compact_right_side_barcode = (
+        len(children) >= 3
+        and center_x_ratio >= 0.72
+        and parent_metrics["aspect_ratio"] >= 2.6
+        and tall_children / max(1, len(child_metrics)) >= 0.66
+        and any(item["aspect_ratio"] <= 0.9 for item in child_metrics)
+    )
+    return bool(
+        (
+            (parent_texture_barcode and tall_children / max(1, len(child_metrics)) >= 0.6)
+            or right_side_barcode
+            or compact_right_side_barcode
+        )
+        and (
+            narrow_children / max(1, len(child_metrics)) >= 0.6
+            or compact_right_side_barcode
+        )
+    )
+
+
+def _classify_split_fragment(
+    region: Dict,
+    min_child_area_ratio: float,
+    min_child_side: int,
+    thin_sliver_aspect: float,
+    thin_sliver_height_ratio: float,
+) -> str | None:
+    parent_box = region.get("split_parent_coordinate")
+    if parent_box is None:
+        return None
+
+    child_metrics = _box_metrics(region["coordinate"])
+    parent_metrics = _box_metrics(parent_box)
+
+    if child_metrics["area"] < parent_metrics["area"] * min_child_area_ratio:
+        return "small_child_area"
+    if child_metrics["width"] < min_child_side or child_metrics["height"] < min_child_side:
+        return "small_child_side"
+    if (
+        child_metrics["aspect_ratio"] >= thin_sliver_aspect
+        and child_metrics["height"] < parent_metrics["height"] * thin_sliver_height_ratio
+    ):
+        return "thin_sliver"
+    return None
+
+
+def filter_split_image_regions(
+    regions: Sequence[Dict],
+    image: np.ndarray,
+    ocr_boxes: Sequence[Tuple[object, str, float]] | None = None,
+    min_child_area_ratio: float = 0.02,
+    min_child_side: int = 18,
+    thin_sliver_aspect: float = 3.0,
+    thin_sliver_height_ratio: float = 0.28,
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Filter split image children by removing barcode-like parent clusters and tiny fragments.
+
+    Returns:
+        kept_regions, skipped_regions
+    """
+    grouped_children: Dict[Tuple[int, int, int, int], List[Dict]] = defaultdict(list)
+    for region in regions:
+        parent_box = region.get("split_parent_coordinate")
+        if parent_box is None:
+            continue
+        grouped_children[_box_key(parent_box)].append(dict(region))
+
+    barcode_like_parents = {
+        parent_key
+        for parent_key, children in grouped_children.items()
+        if _looks_like_barcode_cluster(parent_key, children, image, ocr_boxes)
+    }
+
+    kept: List[Dict] = []
+    skipped: List[Dict] = []
+
+    for region in regions:
+        region_copy = dict(region)
+        parent_box = region_copy.get("split_parent_coordinate")
+        if parent_box is not None and _box_key(parent_box) in barcode_like_parents:
+            region_copy["skip_reason"] = "barcode_cluster"
+            skipped.append(region_copy)
+            continue
+
+        skip_reason = _classify_split_fragment(
+            region_copy,
+            min_child_area_ratio=min_child_area_ratio,
+            min_child_side=min_child_side,
+            thin_sliver_aspect=thin_sliver_aspect,
+            thin_sliver_height_ratio=thin_sliver_height_ratio,
+        )
+        if skip_reason:
+            region_copy["skip_reason"] = skip_reason
+            skipped.append(region_copy)
+            continue
+
+        kept.append(region_copy)
+
+    return kept, skipped
 
 
 def calculate_iou(box1: List[float], box2: List[float]) -> float:
@@ -1436,6 +1847,8 @@ def run_layout_comparison(
     skipped_target_regions: List[Dict] = []
     split_template_regions: List[Dict] = []
     split_target_regions: List[Dict] = []
+    skipped_split_template_regions: List[Dict] = []
+    skipped_split_target_regions: List[Dict] = []
     if region_type == "image":
         _, template_boxes = get_ocr_with_boxes(template_path)
         _, target_boxes = get_ocr_with_boxes(target_preprocessed_path)
@@ -1455,7 +1868,19 @@ def run_layout_comparison(
                 template_cropped,
                 template_boxes,
             )
+            template_regions = merge_fragmented_split_regions(template_regions)
+            template_regions, skipped_split_template_regions = filter_split_image_regions(
+                template_regions,
+                template_cropped,
+                template_boxes,
+            )
             target_regions, split_target_regions = split_composite_image_regions(
+                target_regions,
+                target_cropped,
+                target_boxes,
+            )
+            target_regions = merge_fragmented_split_regions(target_regions)
+            target_regions, skipped_split_target_regions = filter_split_image_regions(
                 target_regions,
                 target_cropped,
                 target_boxes,
@@ -1471,6 +1896,11 @@ def run_layout_comparison(
                 f"模板拆分 {len(split_template_regions)} 个大框, "
                 f"实拍拆分 {len(split_target_regions)} 个大框"
             )
+            print(
+                "  拆分过滤后: "
+                f"模板跳过 {len(skipped_split_template_regions)} 个子框, "
+                f"实拍跳过 {len(skipped_split_target_regions)} 个子框"
+            )
 
     results["template_regions"] = template_regions
     results["target_regions"] = target_regions
@@ -1480,6 +1910,8 @@ def run_layout_comparison(
     results["skipped_target_regions"] = skipped_target_regions
     results["split_template_regions"] = split_template_regions
     results["split_target_regions"] = split_target_regions
+    results["skipped_split_template_regions"] = skipped_split_template_regions
+    results["skipped_split_target_regions"] = skipped_split_target_regions
     
     # 保存检测可视化
     template_vis = draw_regions(template_cropped, template_regions, (0, 255, 0))
@@ -1488,6 +1920,10 @@ def run_layout_comparison(
         template_vis = draw_regions(template_vis, skipped_template_regions, (0, 165, 255))
     if skipped_target_regions:
         target_vis = draw_regions(target_vis, skipped_target_regions, (0, 165, 255))
+    if skipped_split_template_regions:
+        template_vis = draw_regions(template_vis, skipped_split_template_regions, (0, 0, 255))
+    if skipped_split_target_regions:
+        target_vis = draw_regions(target_vis, skipped_split_target_regions, (0, 0, 255))
     cv2.imwrite(os.path.join(output_dir, "template_regions.jpg"), template_vis)
     cv2.imwrite(os.path.join(output_dir, "target_regions.jpg"), target_vis)
     
