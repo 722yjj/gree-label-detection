@@ -254,12 +254,19 @@ def compute_graphic_summary(result: Dict[str, object]) -> Dict[str, object]:
         for item in comparison_results
         if item.get("decision") == "unknown" or item.get("needs_review", False)
     )
+    matched_count = int(graphic.get("matched_count") or 0)
+    recovered_match_count = int(graphic.get("recovered_match_count") or 0)
+    resolved_match_count = int(
+        graphic.get("resolved_match_count") or (matched_count + recovered_match_count)
+    )
 
     return {
         "template_regions_count": graphic.get("template_regions_count"),
         "target_regions_count": graphic.get("target_regions_count"),
-        "matched_count": graphic.get("matched_count"),
-        "effective_matched_count": graphic.get("effective_matched_count"),
+        "matched_count": matched_count,
+        "recovered_match_count": recovered_match_count,
+        "resolved_match_count": resolved_match_count,
+        "effective_matched_count": resolved_match_count,
         "remaining_unmatched_template": list(graphic.get("remaining_unmatched_template") or []),
         "remaining_unmatched_target": list(graphic.get("remaining_unmatched_target") or []),
         "mismatch_count": mismatch_count,

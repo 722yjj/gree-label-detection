@@ -8,6 +8,8 @@ from label_detection.batch_samples import (
     BatchCase,
     SampleAsset,
     build_cases,
+    cleanup_report_intermediates,
+    compute_text_summary,
     discover_samples,
     extract_label_code,
     run_case,
@@ -108,6 +110,8 @@ def test_run_case_keeps_only_json_and_visualization(monkeypatch):
         def fake_runner(template: str, target: str, output_dir: str):
             output_path = Path(output_dir)
             (output_path / "visualization_diff.jpg").write_bytes(b"vis")
+            (output_path / "template_preprocessed.jpg").write_bytes(b"template")
+            (output_path / "target_preprocessed.jpg").write_bytes(b"target")
             (output_path / "text_comparison.xlsx").write_bytes(b"xlsx")
             with (output_path / "final_result.json").open("w", encoding="utf-8") as file:
                 json.dump(
@@ -146,3 +150,41 @@ def test_run_case_keeps_only_json_and_visualization(monkeypatch):
         assert payload["artifacts"]["visualization_diff"].endswith("visualization_diff.jpg")
         assert payload["text_detection"]["different_fields"] == ["model_number"]
         assert payload["graphic_comparison"]["mismatch_count"] == 1
+        assert payload["graphic_comparison"]["resolved_match_count"] == 1
+
+
+def test_compute_text_summary_uses_normalized_field_matching():
+    summary = compute_text_summary(
+        {
+            "text_detection": {
+                "fields": ["manufacturer", "mfg_date"],
+                "template_data": {
+                    "manufacturer": "GREE ELECTRIC APPLIANCES,INC.OF ZHUHAI",
+                    "mfg_date": "2026.01",
+                },
+                "target_data": {
+                    "manufacturer": "GREE ELECTRIC APPLIANCES, INC. OF ZHUHAI",
+                    "mfg_date": "YYYY.MM",
+                },
+            }
+        }
+    )
+
+    assert summary["match_count"] == 1
+    assert summary["different_fields"] == ["mfg_date"]
+
+
+def test_cleanup_report_intermediates_removes_preprocessed_images():
+    with workspace_tmp_dir() as tmp_path:
+        case_dir = tmp_path / "600004075219" / "case_1"
+        case_dir.mkdir(parents=True, exist_ok=True)
+        keep_path = case_dir / "result.json"
+        keep_path.write_text("{}", encoding="utf-8")
+        for name in ("template_preprocessed.jpg", "target_preprocessed.jpg"):
+            (case_dir / name).write_bytes(b"img")
+
+        cleanup_report_intermediates(tmp_path)
+
+        assert keep_path.exists()
+        assert not (case_dir / "template_preprocessed.jpg").exists()
+        assert not (case_dir / "target_preprocessed.jpg").exists()

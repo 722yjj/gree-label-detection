@@ -16,6 +16,7 @@
 - Filename matching is code-based: extract the main numeric code from the filename and treat suffixes like `-01` or `_1` as variants of the same label.
 - Default pairing mode is `all`: every template variant for a code is compared with every target variant for the same code.
 - Batch results should keep only `result.json`, `visualization_diff.jpg`, and the top-level `summary.json`. Intermediate Excel files and debug images should not be preserved in final batch output directories.
+- The current default graphic-comparison flow includes composite `image` region splitting; disable it only if you explicitly set `ENABLE_IMAGE_REGION_SPLIT=0`.
 
 ## Output Expectations
 

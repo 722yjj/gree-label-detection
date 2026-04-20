@@ -19,6 +19,8 @@ from label_detection.core.config import (
     OLLAMA_MODEL,
     VLM_NUM_PREDICT,
     VLM_TIMEOUT,
+    ensure_local_ollama_no_proxy,
+    is_local_ollama,
 )
 
 
@@ -60,13 +62,17 @@ class VLMObjectDetector:
         self.model_name = model_name or OLLAMA_MODEL
         self.api_base = (api_base or OLLAMA_API_BASE).rstrip("/")
         self.timeout = timeout or VLM_TIMEOUT
+        ensure_local_ollama_no_proxy(self.api_base)
+        self.session = requests.Session()
+        if is_local_ollama(self.api_base):
+            self.session.trust_env = False
         if check_model:
             self._check_model()
 
     def _check_model(self) -> bool:
         """Check whether the requested Ollama model is available."""
         try:
-            response = requests.get(f"{self.api_base}/api/tags", timeout=5)
+            response = self.session.get(f"{self.api_base}/api/tags", timeout=5)
             response.raise_for_status()
             models = response.json().get("models", [])
             names = [item.get("name", "") for item in models]
@@ -130,7 +136,7 @@ class VLMObjectDetector:
         ]
 
         try:
-            response = requests.post(
+            response = self.session.post(
                 f"{self.api_base}/api/chat",
                 json={
                     "model": self.model_name,

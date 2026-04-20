@@ -1,6 +1,7 @@
 """Project-wide configuration."""
 
 from pathlib import Path
+from urllib.parse import urlparse
 import os
 
 
@@ -11,6 +12,7 @@ SAMPLES_DIR = PROJECT_ROOT / "samples"
 OLLAMA_API_BASE = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
 # OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-vl:8b")
+LOCAL_OLLAMA_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 # VLM 请求超时（秒）
 VLM_TIMEOUT = int(os.getenv("VLM_TIMEOUT", "120"))
@@ -49,8 +51,8 @@ DEFAULT_OUTPUT_DIR = os.getenv(
 # 是否默认启用 VLM 进行图形比对
 USE_VLM_FOR_GRAPHIC = True
 
-# 是否对版面模型的 image 大区域做二次拆分（默认关闭，按需实验性开启）
-ENABLE_IMAGE_REGION_SPLIT = os.getenv("ENABLE_IMAGE_REGION_SPLIT", "0").strip().lower() not in {
+# 是否对版面模型的 image 大区域做二次拆分（默认开启，可用环境变量显式关闭）
+ENABLE_IMAGE_REGION_SPLIT = os.getenv("ENABLE_IMAGE_REGION_SPLIT", "1").strip().lower() not in {
     "0",
     "false",
     "no",
@@ -71,3 +73,39 @@ DEFAULT_TARGET_PATH = os.getenv(
     "DEFAULT_TARGET_PATH",
     str(SAMPLES_DIR / "images" / "test.jpg"),
 )
+
+
+def get_ollama_host(api_base: str | None = None) -> str:
+    """Extract the hostname from the configured Ollama base URL."""
+    parsed = urlparse((api_base or OLLAMA_API_BASE).strip())
+    return (parsed.hostname or "").strip().lower()
+
+
+def is_local_ollama(api_base: str | None = None) -> bool:
+    """Return whether the Ollama endpoint points to the local machine."""
+    return get_ollama_host(api_base) in LOCAL_OLLAMA_HOSTS
+
+
+def _merge_no_proxy(existing: str | None) -> str:
+    entries = []
+    for item in (existing or "").split(","):
+        value = item.strip()
+        if value and value not in entries:
+            entries.append(value)
+
+    for host in LOCAL_OLLAMA_HOSTS:
+        if host not in entries:
+            entries.append(host)
+
+    return ",".join(entries)
+
+
+def ensure_local_ollama_no_proxy(api_base: str | None = None) -> bool:
+    """Ensure localhost Ollama traffic bypasses any configured HTTP proxy."""
+    if not is_local_ollama(api_base):
+        return False
+
+    merged = _merge_no_proxy(os.getenv("NO_PROXY") or os.getenv("no_proxy"))
+    os.environ["NO_PROXY"] = merged
+    os.environ["no_proxy"] = merged
+    return True
