@@ -12,6 +12,12 @@ python main.py --template samples/pdfs/600004075219-01.pdf --target samples/imag
 
 实际主流程位于 `label_detection/workflows/unified.py`，`main.py` 只是根目录 CLI 包装器。
 
+桌面端入口为：
+
+```bash
+uv run python -m desktop_app.main
+```
+
 ## 核心流程
 
 ```text
@@ -39,7 +45,11 @@ project/
 ├── main.py                       # 根入口文件
 ├── AGENT_CHANGELOG.md            # agent 关键改动追溯记录
 ├── README.md
+├── pyproject.toml
+├── uv.lock
 ├── requirements.txt
+├── desktop_app/                  # PySide6 桌面端骨架
+├── docs/                         # 开发方案与补充文档
 ├── label_detection/              # 业务代码
 │   ├── core/                     # 配置与兼容层
 │   ├── extraction/               # 模板输入解析 / PDF 提取
@@ -60,17 +70,34 @@ project/
 
 ## 环境依赖
 
-安装 Python 依赖：
+推荐使用 `uv` 管理本地开发环境：
+
+```bash
+uv venv
+uv sync
+```
+
+这套 `uv` 配置当前固定在 Python 3.12。
+
+如果要启动桌面端，再安装桌面依赖组：
+
+```bash
+uv sync --extra desktop
+```
+
+兼容旧方式时，仍可使用：
 
 ```bash
 pip install -r requirements.txt
 ```
 
+当前服务器侧原有 `conda run -n ocr ...` 流程暂不改动；新引入的 `uv` 主要用于本地新版本开发。
+
 模型和服务依赖：
 
 | 组件 | 用途 | 说明 |
 |------|------|------|
-| Ollama + `qwen3-vl:8b` | VLM 图形比对、结构化提取 | 需要本地启动 Ollama 服务 |
+| Ollama + `qwen3.5:9b` | VLM 图形比对、结构化提取 | 需要本地启动 Ollama 服务 |
 | PaddleOCR | 文字识别 | 首次运行会下载模型 |
 | PP-DocLayoutV3 / PaddleX | 布局区域检测 | 首次运行会下载模型 |
 
@@ -78,7 +105,13 @@ pip install -r requirements.txt
 
 ```bash
 ollama serve
-ollama pull qwen3-vl:8b
+ollama pull qwen3.5:9b
+```
+
+如果使用 `uv`，推荐通过 `uv run` 启动命令：
+
+```bash
+uv run python main.py --template samples/pdfs/600004075219-01.pdf --target samples/images/produce/type1/600004075219_1.jpg
 ```
 
 ## 运行参数

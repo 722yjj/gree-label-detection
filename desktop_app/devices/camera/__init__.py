@@ -1,0 +1,2 @@
+"""Camera adapter implementations."""
+

@@ -2,9 +2,11 @@
 
 ## Working Mode
 
-- This project is usually edited locally, then pushed to the remote repository, and finally pulled and executed on the server.
-- Unless the user explicitly asks for local end-to-end execution, prefer static checks, unit tests, and dry-run validation locally.
-- After code changes, provide the exact server-side command the user can run after pulling the latest code.
+- This project is developed directly on the server in the current working checkout.
+- Use Git to manage the repository state on the server: create or switch branches as needed, keep `main` stable, and make changes through normal commit-based workflows.
+- Unless the user explicitly asks for a separate local workflow, do not assume code will be edited locally first and then pulled to the server.
+- Prefer static checks, unit tests, and dry-run validation in the current server environment; run end-to-end jobs directly on the server when the user asks for them or when the task requires real in-environment verification.
+- After code changes, provide the exact command that can be run in the current server checkout to verify the result.
 
 ## Batch Sample Testing
 
@@ -17,5 +19,5 @@
 ## Output Expectations
 
 - Keep result directories stable and easy to sync to the server.
-- Prefer paths and commands that work both locally and after the repository is pulled on the server.
-- If batch execution cannot be completed locally because OCR/VLM services are unavailable, leave the script ready for server execution and document the recommended command.
+- Prefer paths and commands that work directly in the current server checkout and remain compatible with future Git pulls or fresh clones.
+- If batch execution cannot be completed in the current environment because OCR/VLM services are unavailable, leave the script ready and document the recommended server-side command.

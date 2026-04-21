@@ -9,8 +9,8 @@ SAMPLES_DIR = PROJECT_ROOT / "samples"
 
 # ==================== Ollama / VLM 配置 ====================
 OLLAMA_API_BASE = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
-# OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-vl:8b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
+# OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-vl:8b")
 
 # VLM 请求超时（秒）
 VLM_TIMEOUT = int(os.getenv("VLM_TIMEOUT", "120"))
