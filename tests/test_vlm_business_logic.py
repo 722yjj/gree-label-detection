@@ -153,3 +153,21 @@ class TestBusinessDecisionCounting:
 
         assert graphic_pass is True
         assert has_review is True
+
+    def test_needs_review_mismatch_not_counted_as_confirmed_diff(self):
+        """带 needs_review 的 mismatch 应进入复核，不应计入 confirmed diff"""
+        results = [
+            self._make_result("mismatch", needs_review=True),
+        ]
+
+        confirmed_mismatch = [
+            r for r in results
+            if r["decision"] == "mismatch" and not r.get("needs_review", False)
+        ]
+        review_needed = [
+            r for r in results
+            if r["decision"] == "unknown" or r.get("needs_review", False)
+        ]
+
+        assert len(confirmed_mismatch) == 0
+        assert len(review_needed) == 1

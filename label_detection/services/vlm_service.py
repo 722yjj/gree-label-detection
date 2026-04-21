@@ -41,38 +41,72 @@ class VLMComparator:
 # class VLMComparator:
     """使用 Qwen3-VL (Ollama) 进行图形对比的类"""
 
-    # 优化后的提示词模板
-    PROMPT_TEMPLATE = """你是图形一致性判定器。
-你将看到左右两张局部图形区域图：左图是 Template，右图是 Target。
+    # Original Chinese prompt kept for reference:
+    # 你是图形一致性判定器。
+    # 你将看到左右两张局部图形区域图：左图是 Template，右图是 Target。
+    #
+    # 判定目标：
+    # 只比较前景图标/符号本身是否一致。
+    # 不要把以下因素视为差异：
+    # - 裁剪位置偏移
+    # - 留白差异
+    # - 轻微模糊
+    # - 亮度或颜色变化
+    # - 小于15%的缩放差异
+    # - 条形码、二维码、条码下方数字或纯编码区域
+    #
+    # 重点检查：
+    # 1. 图标数量是否一致
+    # 2. 是否有缺失或多余图标
+    # 3. 图标主体形状是否明显不同
+    #
+    # 输出规则（必须严格遵守）：
+    # 1. 只输出一个 JSON 对象，不要输出任何其他文本。
+    # 2. 禁止输出思考过程、解释、分析、推理、注释、Markdown、代码块、标签（例如 <think>）。
+    # 3. JSON 必须且仅包含以下 4 个键：
+    #    - "decision": "match" | "mismatch" | "unknown"
+    #    - "confidence": 0.0 到 1.0 的数字
+    #    - "differences": 字符串数组
+    #    - "summary": 字符串
+    # 4. 如果区域主体是条形码、二维码、条码数字或纯编码，直接输出 "decision":"match"，并将 "summary" 固定为 "barcode_ignored"。
+    # 5. 如果无法可靠判断，必须输出 "decision": "unknown"，不要猜测。
+    # 6. 当 decision 为 "match" 时，differences 必须是空数组 []。
+    #
+    # 仅输出如下格式的 JSON：
+    # {"decision":"match|mismatch|unknown","confidence":0.0,"differences":[],"summary":"..."}
+    PROMPT_TEMPLATE = """You are a graphic consistency judge.
+You will see two local graphic regions side by side:
+- left: Template
+- right: Target
 
-判定目标：
-只比较前景图标/符号本身是否一致。
-不要把以下因素视为差异：
-- 裁剪位置偏移
-- 留白差异
-- 轻微模糊
-- 亮度或颜色变化
-- 小于15%的缩放差异
-- 条形码、二维码、条码下方数字或纯编码区域
+Task:
+Compare only the foreground icons / symbols themselves.
+Do NOT treat the following as differences:
+- crop offset
+- whitespace difference
+- slight blur
+- brightness or color change
+- scaling difference smaller than 15%
+- barcode, QR code, barcode digits, or pure code regions
 
-重点检查：
-1. 图标数量是否一致
-2. 是否有缺失或多余图标
-3. 图标主体形状是否明显不同
+Focus on:
+1. whether the number of icons is the same
+2. whether any icon is missing or extra
+3. whether the main icon shapes are clearly different
 
-输出规则（必须严格遵守）：
-1. 只输出一个 JSON 对象，不要输出任何其他文本。
-2. 禁止输出思考过程、解释、分析、推理、注释、Markdown、代码块、标签（例如 <think>）。
-3. JSON 必须且仅包含以下 4 个键：
+Output rules (must follow strictly):
+1. Output exactly one JSON object and nothing else.
+2. Do not output thinking, explanation, analysis, reasoning, comments, Markdown, code fences, or tags such as <think>.
+3. The JSON must contain exactly these 4 keys:
    - "decision": "match" | "mismatch" | "unknown"
-   - "confidence": 0.0 到 1.0 的数字
-   - "differences": 字符串数组
-   - "summary": 字符串
-4. 如果区域主体是条形码、二维码、条码数字或纯编码，直接输出 "decision":"match"，并将 "summary" 固定为 "barcode_ignored"。
-5. 如果无法可靠判断，必须输出 "decision": "unknown"，不要猜测。
-6. 当 decision 为 "match" 时，differences 必须是空数组 []。
+   - "confidence": a number from 0.0 to 1.0
+   - "differences": an array of strings
+   - "summary": a string
+4. If the region is mainly a barcode, QR code, barcode digits, or pure code, output "decision":"match" and set "summary" to "barcode_ignored".
+5. If you cannot judge reliably, output "decision":"unknown". Do not guess.
+6. If decision is "match", then differences must be [].
 
-仅输出如下格式的 JSON：
+Output only JSON in this format:
 {"decision":"match|mismatch|unknown","confidence":0.0,"differences":[],"summary":"..."}"""
 
     def __init__(
@@ -330,6 +364,8 @@ class VLMComparator:
 
         返回结果始终包含: decision, is_match, confidence, differences, summary, needs_review
         """
+        response = str(response or "").strip()
+
         # 尝试解析 JSON
         try:
             # 优先匹配包含 decision 字段的 JSON
@@ -352,6 +388,19 @@ class VLMComparator:
         except json.JSONDecodeError:
             pass
 
+        if "<think>" in response.lower():
+            return {
+                "decision": "unknown",
+                "is_match": False,
+                "confidence": 0.0,
+                "needs_review": True,
+                "error_type": "parse_error",
+                "differences": [],
+                "summary": "模型输出了思考内容，但未返回可解析 JSON",
+                "raw_response": response[:500],
+                "parse_error": True,
+            }
+
         # 关键词兜底推断
         response_lower = response.lower()
 
@@ -371,28 +420,32 @@ class VLMComparator:
         # 差异关键词优先（"不一致" 同时包含 "一致"，但语义是否定的）
         if has_diff_keyword:
             return {
-                "decision": "mismatch",
+                "decision": "unknown",
                 "is_match": False,
-                "confidence": 0.6,
-                "needs_review": True,  # 关键词推断不够可靠，标记需复核
-                "error_type": None,
+                "confidence": 0.0,
+                "needs_review": True,
+                "error_type": "parse_error",
                 "differences": ["从模型文本推断存在差异"],
-                "summary": "基于关键词推断不匹配（建议复核）",
+                "summary": "基于关键词推断可能不匹配（建议复核）",
                 "raw_response": response[:500],
                 "inferred": True,
+                "tentative_decision": "mismatch",
+                "parse_error": True,
             }
 
         if has_match_keyword:
             return {
-                "decision": "match",
-                "is_match": True,
-                "confidence": 0.6,
-                "needs_review": True,  # 关键词推断不够可靠
-                "error_type": None,
+                "decision": "unknown",
+                "is_match": False,
+                "confidence": 0.0,
+                "needs_review": True,
+                "error_type": "parse_error",
                 "differences": [],
-                "summary": "基于关键词推断匹配（建议复核）",
+                "summary": "基于关键词推断可能匹配（建议复核）",
                 "raw_response": response[:500],
                 "inferred": True,
+                "tentative_decision": "match",
+                "parse_error": True,
             }
 
         # 完全无法解析

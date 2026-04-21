@@ -95,19 +95,29 @@ class TestParseResponse:
         """测试关键词兜底 — 不一致"""
         response = "两张图的图标数量不一致，第一张有3个认证标志，第二张缺少CE标志"
         result = parser._parse_response(response)
-        assert result["decision"] == "mismatch"
+        assert result["decision"] == "unknown"
         assert result["is_match"] is False
         assert result.get("inferred") is True
         assert result["needs_review"] is True  # 关键词推断应标记需复核
+        assert result.get("tentative_decision") == "mismatch"
 
     def test_parse_match_keyword_fallback(self, parser):
         """测试关键词兜底 — 一致"""
         response = "两张标签的图形内容完全相同，所有图标匹配"
         result = parser._parse_response(response)
-        assert result["decision"] == "match"
-        assert result["is_match"] is True
+        assert result["decision"] == "unknown"
+        assert result["is_match"] is False
         assert result.get("inferred") is True
         assert result["needs_review"] is True  # 关键词推断应标记需复核
+        assert result.get("tentative_decision") == "match"
+
+    def test_parse_think_only_without_json(self, parser):
+        """只有思考内容且没有 JSON 时，应进入复核，不得直接判差异"""
+        response = "<think>我需要先分析图标是否一致，可能存在差异，需要继续判断。</think>"
+        result = parser._parse_response(response)
+        assert result["decision"] == "unknown"
+        assert result["needs_review"] is True
+        assert result.get("parse_error") is True
 
     # === 解析失败 ===
 

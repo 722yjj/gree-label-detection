@@ -244,8 +244,16 @@ def compute_text_summary(result: Dict[str, object]) -> Dict[str, object]:
 def compute_graphic_summary(result: Dict[str, object]) -> Dict[str, object]:
     graphic = dict(result.get("graphic_comparison") or {})
     comparison_results = list(graphic.get("comparison_results") or [])
-    mismatch_count = sum(1 for item in comparison_results if item.get("decision") == "mismatch")
-    review_count = sum(1 for item in comparison_results if item.get("decision") == "unknown")
+    mismatch_count = sum(
+        1
+        for item in comparison_results
+        if item.get("decision") == "mismatch" and not item.get("needs_review", False)
+    )
+    review_count = sum(
+        1
+        for item in comparison_results
+        if item.get("decision") == "unknown" or item.get("needs_review", False)
+    )
 
     return {
         "template_regions_count": graphic.get("template_regions_count"),

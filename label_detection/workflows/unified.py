@@ -945,6 +945,7 @@ def run_unified_detection(
     unresolved_regions = []
     for res in comparison_results:
         decision = res.get("decision", "unknown")
+        needs_review = bool(res.get("needs_review", False))
         target_idx = res.get("target_idx")
         region_box = None
 
@@ -956,13 +957,7 @@ def run_unified_detection(
         if region_box is not None:
             x1, y1, x2, y2 = [int(v) for v in region_box]
 
-            if decision == "mismatch":
-                # 确认差异：红框
-                cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                cv2.putText(vis_image, "Diff", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                diff_count += 1
-                print(f"    - 图形差异: 区域 #{target_idx if target_idx is not None else 'recovered'} (确认不匹配)")
-            elif res.get("unresolved_unmatched"):
+            if res.get("unresolved_unmatched"):
                 # 未恢复区域：橙框
                 cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 128, 255), 3)
                 cv2.putText(vis_image, "Unmatched", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 128, 255), 2)
@@ -972,7 +967,7 @@ def run_unified_detection(
                     f"#{target_idx if target_idx is not None else 'recovered'} "
                     f"({res.get('summary', '')})"
                 )
-            elif decision == "unknown":
+            elif needs_review or decision == "unknown":
                 # 需复核：黄框
                 cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 200, 255), 3)
                 cv2.putText(vis_image, "Review", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
@@ -982,6 +977,12 @@ def run_unified_detection(
                     f"#{target_idx if target_idx is not None else 'recovered'} "
                     f"({res.get('summary', '')})"
                 )
+            elif decision == "mismatch":
+                # 确认差异：红框
+                cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                cv2.putText(vis_image, "Diff", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                diff_count += 1
+                print(f"    - 图形差异: 区域 #{target_idx if target_idx is not None else 'recovered'} (确认不匹配)")
 
     # 保存可视化结果
     vis_path = os.path.join(output_dir, "visualization_diff.jpg")
@@ -1024,9 +1025,18 @@ def run_unified_detection(
     print(f"   - 成功匹配: {effective_matched_pairs} 对")
 
     # 统计分为三类
-    confirmed_match = [r for r in comparison_results if r.get("decision") == "match"]
-    confirmed_mismatch = [r for r in comparison_results if r.get("decision") == "mismatch"]
-    review_needed = [r for r in comparison_results if r.get("decision") == "unknown"]
+    confirmed_match = [
+        r for r in comparison_results
+        if r.get("decision") == "match" and not r.get("needs_review", False)
+    ]
+    confirmed_mismatch = [
+        r for r in comparison_results
+        if r.get("decision") == "mismatch" and not r.get("needs_review", False)
+    ]
+    review_needed = [
+        r for r in comparison_results
+        if r.get("decision") == "unknown" or r.get("needs_review", False)
+    ]
 
     graphic_pass = True
     has_review = len(review_needed) > 0
