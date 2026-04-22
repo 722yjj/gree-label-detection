@@ -523,47 +523,144 @@ def _extract_split_candidate_boxes(crop: np.ndarray) -> List[List[int]]:
     return meaningful_boxes
 
 
-def _is_local_barcode_box(local_box: Sequence[int], crop: np.ndarray) -> Tuple[bool, Dict[str, float]]:
-    """Detect barcode-like child boxes inside one mixed region."""
+def _describe_local_box_barcode_features(
+    local_box: Sequence[int],
+    crop: np.ndarray,
+) -> Dict[str, float]:
     x1, y1, x2, y2 = [int(v) for v in local_box]
     local_crop = crop[y1:y2, x1:x2]
     if local_crop.size == 0:
-        return False, {}
+        return {
+            "aspect_ratio": 0.0,
+            "width_ratio": 0.0,
+            "height_ratio": 0.0,
+            "start_ratio": 0.0,
+            "transition_density": 0.0,
+            "dark_column_ratio": 0.0,
+            "vertical_bias": 0.0,
+        }
 
     parent_h, parent_w = crop.shape[:2]
     width = max(1, x2 - x1)
     height = max(1, y2 - y1)
-    aspect_ratio = width / max(1.0, height)
-    width_ratio = width / max(1.0, parent_w)
-    height_ratio = height / max(1.0, parent_h)
-    start_ratio = x1 / max(1.0, parent_w)
     texture = _compute_barcode_texture(local_crop)
+    return {
+        "aspect_ratio": float(width / max(1.0, height)),
+        "width_ratio": float(width / max(1.0, parent_w)),
+        "height_ratio": float(height / max(1.0, parent_h)),
+        "start_ratio": float(x1 / max(1.0, parent_w)),
+        "transition_density": texture["transition_density"],
+        "dark_column_ratio": texture["dark_column_ratio"],
+        "vertical_bias": texture["vertical_bias"],
+    }
+
+
+def _is_local_barcode_box(local_box: Sequence[int], crop: np.ndarray) -> Tuple[bool, Dict[str, float]]:
+    """Detect barcode-like child boxes inside one mixed region."""
+    meta = _describe_local_box_barcode_features(local_box, crop)
+    aspect_ratio = meta["aspect_ratio"]
+    width_ratio = meta["width_ratio"]
+    height_ratio = meta["height_ratio"]
+    start_ratio = meta["start_ratio"]
 
     is_barcode = (
         aspect_ratio >= 2.2
         and width_ratio >= 0.28
         and height_ratio <= 0.92
-        and texture["transition_density"] >= 0.15
-        and 0.08 <= texture["dark_column_ratio"] <= 0.90
-        and texture["vertical_bias"] >= 4.5
+        and meta["transition_density"] >= 0.15
+        and 0.08 <= meta["dark_column_ratio"] <= 0.90
+        and meta["vertical_bias"] >= 4.5
     ) or (
         aspect_ratio >= 2.8
         and width_ratio >= 0.35
         and start_ratio >= 0.20
-        and texture["transition_density"] >= 0.12
-        and texture["vertical_bias"] >= 6.0
-        and texture["dark_column_ratio"] >= 0.10
+        and meta["transition_density"] >= 0.12
+        and meta["vertical_bias"] >= 6.0
+        and meta["dark_column_ratio"] >= 0.10
     )
 
-    return bool(is_barcode), {
-        "aspect_ratio": float(aspect_ratio),
-        "width_ratio": float(width_ratio),
-        "height_ratio": float(height_ratio),
-        "start_ratio": float(start_ratio),
-        "transition_density": texture["transition_density"],
-        "dark_column_ratio": texture["dark_column_ratio"],
-        "vertical_bias": texture["vertical_bias"],
-    }
+    return bool(is_barcode), meta
+
+
+def _recover_barcode_cluster_from_upper_band(
+    crop: np.ndarray,
+) -> Tuple[List[List[int]], List[Tuple[List[int], Dict[str, float]]]]:
+    crop_h, crop_w = crop.shape[:2]
+    if crop_h < 40 or crop_w < 120:
+        return [], []
+
+    for band_ratio in (0.72, 0.70, 0.68, 0.65, 0.60):
+        band_h = max(1, min(crop_h, int(round(crop_h * band_ratio))))
+        band_crop = crop[:band_h, :]
+        local_boxes = _extract_split_candidate_boxes(band_crop)
+        if len(local_boxes) < 3:
+            continue
+
+        for split_idx in range(1, len(local_boxes) - 1):
+            comparable_boxes = [list(box) for box in local_boxes[:split_idx]]
+            barcode_parts = [list(box) for box in local_boxes[split_idx:]]
+            if not comparable_boxes or len(barcode_parts) < 2:
+                continue
+
+            comparable_union = list(comparable_boxes[0])
+            for part_box in comparable_boxes[1:]:
+                comparable_union = _box_union(comparable_union, part_box)
+
+            comparable_metrics = _box_metrics(comparable_union)
+            comparable_area_ratio = comparable_metrics["area"] / max(1.0, crop_w * band_h)
+            comparable_width_ratio = comparable_metrics["width"] / max(1.0, crop_w)
+            comparable_height_ratio = comparable_metrics["height"] / max(1.0, band_h)
+            comparable_meta = _describe_local_box_barcode_features(comparable_union, band_crop)
+            comparable_looks_like_barcode = (
+                comparable_meta["transition_density"] >= 0.05
+                and comparable_meta["vertical_bias"] >= 3.0
+                and 0.18 <= comparable_meta["dark_column_ratio"] <= 0.88
+            )
+            if (
+                comparable_width_ratio < 0.10
+                or comparable_area_ratio < 0.08
+                or comparable_height_ratio < 0.45
+                or comparable_metrics["aspect_ratio"] < 0.45
+                or comparable_looks_like_barcode
+            ):
+                continue
+
+            cluster_box = list(barcode_parts[0])
+            for part_box in barcode_parts[1:]:
+                cluster_box = _box_union(cluster_box, part_box)
+
+            cluster_metrics = _box_metrics(cluster_box)
+            child_metrics = [_box_metrics(box) for box in barcode_parts]
+            tall_ratio = sum(
+                1 for item in child_metrics if item["height"] >= band_h * 0.55
+            ) / max(1, len(child_metrics))
+            narrow_ratio = sum(
+                1 for item in child_metrics if item["aspect_ratio"] <= 1.1
+            ) / max(1, len(child_metrics))
+            meta = _describe_local_box_barcode_features(cluster_box, band_crop)
+
+            is_cluster_barcode = (
+                cluster_metrics["aspect_ratio"] >= 2.4
+                and meta["start_ratio"] >= 0.22
+                and meta["width_ratio"] >= 0.32
+                and meta["transition_density"] >= 0.05
+                and meta["vertical_bias"] >= 3.0
+                and 0.18 <= meta["dark_column_ratio"] <= 0.88
+                and tall_ratio >= 0.75
+                and (narrow_ratio >= 0.55 or len(barcode_parts) >= 4)
+            )
+            if not is_cluster_barcode:
+                continue
+
+            barcode_box = [
+                max(0, cluster_box[0] - max(2, int(round(crop_w * 0.01)))),
+                max(0, cluster_box[1] - max(2, int(round(crop_h * 0.02)))),
+                min(crop_w, cluster_box[2] + max(2, int(round(crop_w * 0.01)))),
+                crop_h,
+            ]
+            return comparable_boxes, [(barcode_box, meta)]
+
+    return [], []
 
 
 def _trim_local_box_against_barcode(
@@ -617,17 +714,18 @@ def _salvage_mixed_barcode_region(
         return [], []
 
     local_boxes = _extract_split_candidate_boxes(crop)
-    if len(local_boxes) < 2:
-        return [], []
-
     barcode_children: List[Tuple[List[int], Dict[str, float]]] = []
     non_barcode_children: List[List[int]] = []
-    for local_box in local_boxes:
-        child_is_barcode, child_meta = _is_local_barcode_box(local_box, crop)
-        if child_is_barcode:
-            barcode_children.append((list(local_box), child_meta))
-        else:
-            non_barcode_children.append(list(local_box))
+    if len(local_boxes) >= 2:
+        for local_box in local_boxes:
+            child_is_barcode, child_meta = _is_local_barcode_box(local_box, crop)
+            if child_is_barcode:
+                barcode_children.append((list(local_box), child_meta))
+            else:
+                non_barcode_children.append(list(local_box))
+
+    if not barcode_children or not non_barcode_children:
+        non_barcode_children, barcode_children = _recover_barcode_cluster_from_upper_band(crop)
 
     if not barcode_children or not non_barcode_children:
         return [], []
