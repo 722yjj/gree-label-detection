@@ -1,10 +1,5 @@
-"""Scanner input helpers."""
+"""Backward-compatible scanner input exports."""
 
+from desktop_app.devices.scanner.keyboard_wedge import KeyboardWedgeScannerInput
 
-class KeyboardWedgeScannerInput:
-    """Normalize keyboard-wedge scanner input for the UI."""
-
-    @staticmethod
-    def normalize(raw_value: str) -> str:
-        return str(raw_value or "").strip()
-
+__all__ = ["KeyboardWedgeScannerInput"]

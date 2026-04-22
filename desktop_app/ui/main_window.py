@@ -31,7 +31,8 @@ from desktop_app.models import TemplateRecord
 class MainWindow(QMainWindow):
     """Desktop UI shell for code lookup and detection runs."""
 
-    query_code_requested = Signal()
+    manual_query_requested = Signal()
+    simulate_scan_requested = Signal()
     browse_target_requested = Signal()
     capture_mock_requested = Signal()
     run_detection_requested = Signal()
@@ -39,7 +40,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("格力标签检测桌面端")
+        self.setWindowTitle("标签检测桌面端")
         self.resize(1280, 820)
 
         self.code_input = QLineEdit()
@@ -68,6 +69,7 @@ class MainWindow(QMainWindow):
         self._template_preview_path: Path | None = None
         self._target_preview_path: Path | None = None
         self._result_preview_path: Path | None = None
+        self._did_auto_focus_code_input = False
 
         self._build_layout()
         self._connect_signals()
@@ -180,9 +182,9 @@ class MainWindow(QMainWindow):
         splitter.setSizes([320, 960])
 
     def _connect_signals(self) -> None:
-        self.query_button.clicked.connect(self.query_code_requested)
-        self.mock_scan_button.clicked.connect(self.query_code_requested)
-        self.code_input.returnPressed.connect(self.query_code_requested)
+        self.query_button.clicked.connect(self.manual_query_requested)
+        self.mock_scan_button.clicked.connect(self.simulate_scan_requested)
+        self.code_input.returnPressed.connect(self.simulate_scan_requested)
         self.browse_button.clicked.connect(self.browse_target_requested)
         self.capture_button.clicked.connect(self.capture_mock_requested)
         self.run_button.clicked.connect(self.run_detection_requested)
@@ -193,6 +195,17 @@ class MainWindow(QMainWindow):
 
     def set_code_text(self, value: str) -> None:
         self.code_input.setText(value)
+
+    def focus_code_input(self, select_all: bool = False) -> None:
+        if not self.code_input.isEnabled():
+            return
+
+        self.code_input.setFocus(Qt.FocusReason.OtherFocusReason)
+        if select_all:
+            self.code_input.selectAll()
+
+    def set_code_input_enabled(self, enabled: bool) -> None:
+        self.code_input.setEnabled(enabled)
 
     def selected_template(self) -> TemplateRecord | None:
         item = self.template_list.currentItem()
@@ -271,6 +284,7 @@ class MainWindow(QMainWindow):
         self.history_list.insertItem(0, value)
 
     def set_busy(self, busy: bool) -> None:
+        self.set_code_input_enabled(not busy)
         self.query_button.setDisabled(busy)
         self.mock_scan_button.setDisabled(busy)
         self.browse_button.setDisabled(busy)
@@ -313,6 +327,14 @@ class MainWindow(QMainWindow):
             self._result_preview_path,
             "检测完成后显示画框结果图",
         )
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._did_auto_focus_code_input:
+            return
+
+        self._did_auto_focus_code_input = True
+        self.focus_code_input(select_all=True)
 
     @staticmethod
     def _build_image_label(placeholder: str) -> QLabel:
