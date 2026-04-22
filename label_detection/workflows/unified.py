@@ -28,6 +28,7 @@ from label_detection.core.config import (
     DEFAULT_TARGET_PATH,
     USE_VLM_FOR_GRAPHIC,
     ENABLE_IMAGE_REGION_SPLIT,
+    ensure_local_ollama_no_proxy,
 )
 from label_detection.extraction.template_source import resolve_template_input
 from label_detection.extraction.text import (
@@ -46,6 +47,8 @@ from label_detection.matching.layout import (
     draw_regions,
     split_barcode_regions,
     split_composite_image_regions,
+    merge_fragmented_split_regions,
+    filter_split_image_regions,
     infer_corresponding_region,
     estimate_region_foreground_ratio,
 )
@@ -92,6 +95,7 @@ def get_llm():
     """Lazily initialize the Ollama client when the workflow actually runs."""
     global _llm
     if _llm is None:
+        ensure_local_ollama_no_proxy(OLLAMA_API_BASE)
         from langchain_ollama import ChatOllama
 
         _llm = ChatOllama(
@@ -212,6 +216,42 @@ def _extract_structured_from_text(
 
     print(f"    [规则提取] 紧凑标签命中 {count_populated_fields(extracted)} 个字段")
     return extracted
+
+
+def build_final_verdict(
+    *,
+    match_count: int,
+    total_fields: int,
+    graphic_pass: bool,
+    review_count: int,
+    mismatch_count: int,
+    unresolved_graphics: int,
+) -> str:
+    text_diff_count = max(total_fields - match_count, 0)
+    has_review = review_count > 0
+
+    if text_diff_count == 0 and graphic_pass and not has_review:
+        return "✅ 标签完全一致"
+    if text_diff_count == 0 and graphic_pass and has_review:
+        return f"⚠️ 标签基本一致，{review_count} 处图形需人工复核"
+    if text_diff_count > 0 and graphic_pass and has_review:
+        return f"⚠️ 文字存在差异 ({text_diff_count} 处)，另有 {review_count} 处图形需人工复核"
+    if text_diff_count > 0 and graphic_pass:
+        return f"⚠️ 文字存在差异 ({text_diff_count} 处)，图形一致"
+    if text_diff_count == 0 and not graphic_pass:
+        if unresolved_graphics > 0 and mismatch_count == 0:
+            return f"⚠️ 文字一致，但图形有 {unresolved_graphics} 个区域未恢复"
+        return (
+            "⚠️ 文字一致，图形存在差异 "
+            f"({mismatch_count} 处不匹配, {unresolved_graphics} 个未恢复)"
+        )
+
+    review_suffix = f", {review_count} 处待复核" if has_review else ""
+    return (
+        "❌ 标签差异较大 "
+        f"(文字 {match_count}/{total_fields}，图形 {mismatch_count} 处不匹配, "
+        f"{unresolved_graphics} 个未恢复{review_suffix})"
+    )
 
 
 def run_llm_extraction(
@@ -394,26 +434,51 @@ def _make_unresolved_recovery_result(
     if reason == "inference_failed":
         summary = f"{subject} 无法推理对应区域，{side_hint}"
         error_type = "recovery_inference_failed"
+        decision = "unknown"
+        confidence = 0.0
+        needs_review = True
+        judgment_source = "recovery_failed"
+        unresolved_unmatched = True
     elif reason == "low_foreground":
-        summary = f"{subject} 推理区域前景过少 ({foreground_ratio:.3f})，{side_hint}"
-        error_type = "recovery_low_foreground"
+        if source_side == "实拍":
+            summary = (
+                f"{subject} 对应模板区域前景过少 ({foreground_ratio:.3f})，"
+                "判定实拍多出图形"
+            )
+            error_type = "recovery_extra_target_graphic"
+        else:
+            summary = (
+                f"{subject} 对应实拍区域前景过少 ({foreground_ratio:.3f})，"
+                "判定实拍缺失图形"
+            )
+            error_type = "recovery_missing_target_graphic"
+        decision = "mismatch"
+        confidence = 0.95
+        needs_review = False
+        judgment_source = "recovery_low_foreground"
+        unresolved_unmatched = False
     else:
         summary = f"{subject} 恢复对比失败，{side_hint}"
         if exc is not None:
             summary = f"{summary} ({exc})"
         error_type = "recovery_compare_error"
+        decision = "unknown"
+        confidence = 0.0
+        needs_review = True
+        judgment_source = "recovery_failed"
+        unresolved_unmatched = True
 
     return {
-        "decision": "unknown",
+        "decision": decision,
         "is_match": False,
-        "confidence": 0.0,
-        "needs_review": True,
+        "confidence": confidence,
+        "needs_review": needs_review,
         "error_type": error_type,
         "differences": [summary],
         "summary": summary,
-        "judgment_source": "recovery_failed",
+        "judgment_source": judgment_source,
         "recovered": True,
-        "unresolved_unmatched": True,
+        "unresolved_unmatched": unresolved_unmatched,
         "recovery_source_side": source_side,
         "recovery_foreground_ratio": foreground_ratio,
         "template_idx": None,
@@ -479,6 +544,18 @@ def _recover_unmatched_regions(
             recovery_results.append(result)
             _print_graphic_decision("      恢复判定: ", result)
 
+            if result.get("decision") in {"match", "mismatch"} and not result.get(
+                "needs_review", False
+            ):
+                if source_side == "实拍":
+                    resolved_unmatched2.add(source_idx)
+                    if result.get("decision") == "match" and inferred_region is not None:
+                        recovered_template_regions.append(inferred_region)
+                else:
+                    resolved_unmatched1.add(source_idx)
+                    if result.get("decision") == "match" and inferred_region is not None:
+                        recovered_target_regions.append(inferred_region)
+
         if inferred_region is None:
             print(f"    - {source_side} 未匹配区域 #{source_idx}: 无法推理对应区域")
             _finalize_result(
@@ -539,14 +616,6 @@ def _recover_unmatched_regions(
 
         _finalize_result(result)
         pair_idx += 1
-
-        if result.get("decision") == "match" and not result.get("needs_review", False):
-            if source_side == "实拍":
-                resolved_unmatched2.add(source_idx)
-                recovered_template_regions.append(inferred_region)
-            else:
-                resolved_unmatched1.add(source_idx)
-                recovered_target_regions.append(inferred_region)
 
     if unmatched2:
         print("  - 尝试根据实拍未匹配区域恢复模板漏检...")
@@ -1079,7 +1148,6 @@ def run_unified_detection(
         unresolved_regions = []
         for res in comparison_results:
             decision = res.get("decision", "unknown")
-            needs_review = bool(res.get("needs_review", False))
             target_idx = res.get("target_idx")
             region_box = None
 
@@ -1108,7 +1176,7 @@ def run_unified_detection(
                         f"#{target_idx if target_idx is not None else 'recovered'} "
                         f"({res.get('summary', '')})"
                     )
-                elif needs_review or decision == "unknown":
+                elif decision == "unknown":
                     cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 200, 255), 3)
                     cv2.putText(
                         vis_image,
@@ -1206,17 +1274,17 @@ def run_unified_detection(
         confirmed_match = [
             r
             for r in comparison_results
-            if r.get("decision") == "match" and not r.get("needs_review", False)
+            if r.get("decision") == "match"
         ]
         confirmed_mismatch = [
             r
             for r in comparison_results
-            if r.get("decision") == "mismatch" and not r.get("needs_review", False)
+            if r.get("decision") == "mismatch"
         ]
         review_needed = [
             r
             for r in comparison_results
-            if r.get("decision") == "unknown" or r.get("needs_review", False)
+            if r.get("decision") == "unknown"
         ]
 
         graphic_pass = True
