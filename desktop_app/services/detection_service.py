@@ -25,6 +25,7 @@ class DetectionService:
             str(request.template.source_path),
             str(request.target_image_path),
             output_dir=str(output_dir),
+            output_mode=request.output_mode,
         )
         resolved_output_dir = Path(result.get("output_dir") or output_dir)
         summary = self._summarize_result(result)

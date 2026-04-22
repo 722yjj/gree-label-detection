@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,7 @@ class DetectionJobRequest:
 
     template: TemplateRecord
     target_image_path: Path
+    output_mode: Literal["final", "debug"] = "final"
 
 
 @dataclass(frozen=True)

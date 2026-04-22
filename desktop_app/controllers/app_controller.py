@@ -225,6 +225,7 @@ class AppController(QObject):
         request = DetectionJobRequest(
             template=template,
             target_image_path=target_path,
+            output_mode="debug" if self.view.detailed_output_enabled() else "final",
         )
         self._start_worker(request)
 

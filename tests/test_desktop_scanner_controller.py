@@ -140,3 +140,24 @@ def test_set_busy_disables_code_input(qapp):
         assert window.code_input.isEnabled() is True
     finally:
         window.close()
+
+
+def test_run_detection_uses_output_mode_toggle(tmp_path, qapp):
+    window, controller, _repository = build_controller(tmp_path, qapp)
+    captured_requests = []
+    target_path = tmp_path / "target.jpg"
+    target_path.write_bytes(b"not-an-image")
+
+    try:
+        controller.handle_scanned_code("600004075219")
+        window.set_target_image_path(target_path)
+        controller._start_worker = captured_requests.append
+
+        controller.run_detection()
+        assert captured_requests[-1].output_mode == "final"
+
+        window.detailed_output_checkbox.setChecked(True)
+        controller.run_detection()
+        assert captured_requests[-1].output_mode == "debug"
+    finally:
+        window.close()

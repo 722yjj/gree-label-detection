@@ -7,6 +7,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication, QPixmap
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFileDialog,
     QFrame,
     QFormLayout,
@@ -51,6 +52,7 @@ class MainWindow(QMainWindow):
         self.browse_button = QPushButton("选择图片")
         self.capture_button = QPushButton("Mock 相机取图")
         self.run_button = QPushButton("开始检测")
+        self.detailed_output_checkbox = QCheckBox("保存详细调试结果")
         self.open_template_button = QPushButton("打开模板")
         self.copy_template_button = QPushButton("复制路径")
         self.open_output_dir_button = QPushButton("打开目录")
@@ -105,6 +107,7 @@ class MainWindow(QMainWindow):
         toolbar_layout.addWidget(self.target_path_input, 1)
         toolbar_layout.addWidget(self.browse_button)
         toolbar_layout.addWidget(self.capture_button)
+        toolbar_layout.addWidget(self.detailed_output_checkbox)
         toolbar_layout.addWidget(self.run_button)
 
         code_group = QGroupBox("Step 1  编码输入")
@@ -421,6 +424,9 @@ class MainWindow(QMainWindow):
     def target_image_path(self) -> str:
         return self.target_path_input.text().strip()
 
+    def detailed_output_enabled(self) -> bool:
+        return self.detailed_output_checkbox.isChecked()
+
     def set_status(self, value: str) -> None:
         self.status_value.setText(value)
         if "失败" in value:
@@ -485,6 +491,7 @@ class MainWindow(QMainWindow):
         self.query_button.setDisabled(busy)
         self.browse_button.setDisabled(busy)
         self.capture_button.setDisabled(busy)
+        self.detailed_output_checkbox.setDisabled(busy)
         self.template_list.setDisabled(busy)
         self._sync_run_button()
 

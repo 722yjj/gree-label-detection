@@ -6,6 +6,9 @@ import json
 import os
 import re
 import time
+from dataclasses import dataclass
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Dict, List, Optional, Type
 
 import cv2
@@ -53,6 +56,36 @@ from label_detection.preprocessing.pipeline import preprocess_target
 from label_detection.services.ocr_service import get_ocr_with_boxes
 
 _llm = None
+
+
+@dataclass(frozen=True)
+class WorkflowOutputOptions:
+    """Control which workflow artifacts should persist in the result directory."""
+
+    mode: str = "debug"
+    save_template_assets: bool = True
+    save_preprocess_images: bool = True
+    save_text_excel: bool = True
+    save_graphic_debug: bool = True
+    save_region_crops: bool = True
+    save_vlm_debug: bool = True
+
+    @classmethod
+    def from_mode(cls, mode: Optional[str]) -> "WorkflowOutputOptions":
+        normalized = str(mode or "debug").strip().lower()
+        if normalized not in {"final", "debug"}:
+            raise ValueError(f"不支持的 output_mode: {mode}")
+
+        detailed = normalized == "debug"
+        return cls(
+            mode=normalized,
+            save_template_assets=detailed,
+            save_preprocess_images=detailed,
+            save_text_excel=detailed,
+            save_graphic_debug=detailed,
+            save_region_crops=detailed,
+            save_vlm_debug=detailed,
+        )
 
 
 def get_llm():
@@ -403,7 +436,7 @@ def _recover_unmatched_regions(
     unmatched2: List[int],
     template_image: np.ndarray,
     target_image: np.ndarray,
-    output_dir: str,
+    output_dir: Optional[str],
     use_vlm: bool,
 ) -> Dict[str, object]:
     recovery_results: List[Dict] = []
@@ -594,6 +627,7 @@ def run_unified_detection(
     template_input_path,
     target_image_path,
     output_dir=DEFAULT_OUTPUT_DIR,
+    output_mode="debug",
 ):
     """
     完整的整合检测流程（使用 VLM 进行图形对比）
@@ -602,11 +636,14 @@ def run_unified_detection(
         template_input_path: 模板文件路径（支持 PDF 或图片）
         target_image_path: 实拍图片路径
         output_dir: 输出目录
+        output_mode: 输出模式，`final` 仅保留最终结果，`debug` 保留详细中间产物
 
     Returns:
         dict: 包含文字和图形检测结果
     """
-    os.makedirs(output_dir, exist_ok=True)
+    output_options = WorkflowOutputOptions.from_mode(output_mode)
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
     print("整合检测：文字检测 + 布局区域图形比较 (VLM Mode)")
@@ -615,507 +652,609 @@ def run_unified_detection(
     results = {
         "success": True,
         "text_detection": {},
-        "graphic_comparison": {}
+        "graphic_comparison": {},
+        "output_mode": output_options.mode,
     }
+    with TemporaryDirectory(prefix="label-detection-") as temp_root:
+        work_root = output_root / "debug" if output_options.mode == "debug" else Path(temp_root)
+        work_root.mkdir(parents=True, exist_ok=True)
 
-    # ========== Step 1: 预处理 ==========
-    print("\n" + "=" * 40)
-    print("Step 1: 预处理")
-    print("=" * 40)
+        preprocess_dir = work_root / "preprocess"
+        preprocess_dir.mkdir(parents=True, exist_ok=True)
+        template_assets_dir = work_root / "template_assets"
+        graphic_output_dir = (
+            work_root / "graphic_comparison" if output_options.save_graphic_debug else None
+        )
+        if graphic_output_dir is not None:
+            graphic_output_dir.mkdir(parents=True, exist_ok=True)
+        graphic_output_dir_str = str(graphic_output_dir) if graphic_output_dir is not None else None
+        target_preprocessed_path = preprocess_dir / "target_preprocessed.jpg"
+        text_excel_path = None
 
-    # 1.1 解析模板输入
-    print("\n[1.1] 解析模板输入...")
-    template_raw_path, template_source_type, err = resolve_template_input(
-        template_input_path,
-        output_dir=os.path.join(output_dir, "template_assets"),
-    )
-    if err:
-        return {"success": False, "error": err}
-    if template_source_type == "pdf":
-        print("  模板来源: PDF，已提取红框区域")
-    else:
-        print("  模板来源: 图片，直接使用原图")
+        # ========== Step 1: 预处理 ==========
+        print("\n" + "=" * 40)
+        print("Step 1: 预处理")
+        print("=" * 40)
 
-    # 1.2 预处理模板（检测黑框，去除白边）
-    print("\n[1.2] 预处理模板图片（去除黑框外白边）...")
-    template_cropped, template_path, err = preprocess_template_image(
-        template_raw_path, output_dir
-    )
-    if err:
-        return {"success": False, "error": err}
+        # 1.1 解析模板输入
+        print("\n[1.1] 解析模板输入...")
+        template_raw_path, template_source_type, err = resolve_template_input(
+            template_input_path,
+            output_dir=str(template_assets_dir),
+        )
+        if err:
+            return {"success": False, "error": err}
+        if template_source_type == "pdf":
+            print("  模板来源: PDF，已提取红框区域")
+        else:
+            print("  模板来源: 图片，直接使用原图")
 
-    # 1.3 预处理实拍图片（带角度矫正）
-    print("\n[1.3] 预处理实拍图片（带角度矫正）...")
-    target_cropped, _, err = preprocess_target(
-        target_image_path,
-        output_dir,
-        template_image=template_cropped
-    )
-    if err:
-        return {"success": False, "error": err}
+        # 1.2 预处理模板（检测黑框，去除白边）
+        print("\n[1.2] 预处理模板图片（去除黑框外白边）...")
+        template_cropped, template_path, err = preprocess_template_image(
+            template_raw_path,
+            str(preprocess_dir),
+        )
+        if err:
+            return {"success": False, "error": err}
 
-    # 保存预处理后的实拍图
-    target_preprocessed_path = os.path.join(output_dir, "target_preprocessed.jpg")
-    cv2.imwrite(target_preprocessed_path, target_cropped)
+        # 1.3 预处理实拍图片（带角度矫正）
+        print("\n[1.3] 预处理实拍图片（带角度矫正）...")
+        target_cropped, _, err = preprocess_target(
+            target_image_path,
+            str(preprocess_dir),
+            template_image=template_cropped,
+        )
+        if err:
+            return {"success": False, "error": err}
 
-    # ========== Step 2: 文字检测 ==========
-    print("\n" + "=" * 40)
-    print("Step 2: 文字检测")
-    print("=" * 40)
+        # 保存预处理后的实拍图到工作目录，供 OCR 和布局检测复用
+        cv2.imwrite(str(target_preprocessed_path), target_cropped)
 
-    # 2.1 OCR 提取模板文字和坐标
-    print("\n[2.1] OCR 提取模板图片文字...")
-    start_time = time.time()
-    template_text, template_boxes = get_ocr_with_boxes(template_path)
-    print(f"  识别到 {len(template_boxes)} 个文字区域，共 {len(template_text)} 字符")
+        # ========== Step 2: 文字检测 ==========
+        print("\n" + "=" * 40)
+        print("Step 2: 文字检测")
+        print("=" * 40)
 
-    # 2.2 OCR 提取实拍文字和坐标
-    print("\n[2.2] OCR 提取实拍图片文字...")
-    target_text, target_boxes = get_ocr_with_boxes(target_preprocessed_path)
-    print(f"  识别到 {len(target_boxes)} 个文字区域，共 {len(target_text)} 字符")
+        # 2.1 OCR 提取模板文字和坐标
+        print("\n[2.1] OCR 提取模板图片文字...")
+        start_time = time.time()
+        template_text, template_boxes = get_ocr_with_boxes(template_path)
+        print(f"  识别到 {len(template_boxes)} 个文字区域，共 {len(template_text)} 字符")
 
-    label_kind = infer_label_kind(template_text or target_text)
-    model_cls = get_label_model(label_kind)
-    comparison_fields = list(model_cls.model_fields.keys())
-    print(f"\n[2.3] 识别文字标签类型: {label_kind} ({len(comparison_fields)} 个字段)")
-    print("[2.3] LLM/规则提取模板结构化信息...")
-    llm_start = time.time()
-    data1 = run_llm_extraction(template_path, template_text, model_cls, label_kind)
-    print(f"  LLM 耗时: {time.time() - llm_start:.2f} 秒")
+        # 2.2 OCR 提取实拍文字和坐标
+        print("\n[2.2] OCR 提取实拍图片文字...")
+        target_text, target_boxes = get_ocr_with_boxes(str(target_preprocessed_path))
+        print(f"  识别到 {len(target_boxes)} 个文字区域，共 {len(target_text)} 字符")
 
-    print("\n[2.4] LLM/规则提取实拍结构化信息...")
-    llm_start = time.time()
-    data2 = run_llm_extraction(
-        target_preprocessed_path,
-        target_text,
-        model_cls,
-        label_kind,
-    )
-    print(f"  LLM 耗时: {time.time() - llm_start:.2f} 秒")
+        label_kind = infer_label_kind(template_text or target_text)
+        model_cls = get_label_model(label_kind)
+        comparison_fields = list(model_cls.model_fields.keys())
+        print(f"\n[2.3] 识别文字标签类型: {label_kind} ({len(comparison_fields)} 个字段)")
+        print("[2.3] LLM/规则提取模板结构化信息...")
+        llm_start = time.time()
+        data1 = run_llm_extraction(template_path, template_text, model_cls, label_kind)
+        print(f"  LLM 耗时: {time.time() - llm_start:.2f} 秒")
 
-    # 2.5 对比文字结果
-    print("\n[2.5] 对比文字结果...")
-    text_excel_path = compare_text_results(
-        data1, data2,
-        os.path.join(output_dir, "text_comparison.xlsx")
-    )
+        print("\n[2.4] LLM/规则提取实拍结构化信息...")
+        llm_start = time.time()
+        data2 = run_llm_extraction(
+            str(target_preprocessed_path),
+            target_text,
+            model_cls,
+            label_kind,
+        )
+        print(f"  LLM 耗时: {time.time() - llm_start:.2f} 秒")
 
-    results["text_detection"] = {
-        "label_kind": label_kind,
-        "fields": comparison_fields,
-        "template_data": data1.model_dump(),
-        "target_data": data2.model_dump(),
-        "excel_path": text_excel_path,
-        "time": time.time() - start_time
-    }
+        # 2.5 对比文字结果
+        print("\n[2.5] 对比文字结果...")
+        if output_options.save_text_excel:
+            text_excel_path = compare_text_results(
+                data1,
+                data2,
+                str(work_root / "text_comparison.xlsx"),
+            )
 
-    # ========== Step 3: 区域检测与对比 ==========
-    print("\n" + "=" * 40)
-    print(f"Step 3: 区域检测与对比")
-    print("=" * 40)
+        results["text_detection"] = {
+            "label_kind": label_kind,
+            "fields": comparison_fields,
+            "template_data": data1.model_dump(),
+            "target_data": data2.model_dump(),
+            "excel_path": text_excel_path,
+            "time": time.time() - start_time,
+        }
 
-    graphic_output_dir = os.path.join(output_dir, "graphic_comparison")
-    os.makedirs(graphic_output_dir, exist_ok=True)
+        # ========== Step 3: 区域检测与对比 ==========
+        print("\n" + "=" * 40)
+        print("Step 3: 区域检测与对比")
+        print("=" * 40)
 
-    # 3.1 检测布局区域 (使用 PP-DocLayoutV3)
-    print("\n[3.1] 检测布局区域 (PP-DocLayoutV3)...")
-    template_all_regions = detect_layout_regions(template_path)
-    template_regions = extract_regions_by_type(template_all_regions, "image")
+        # 3.1 检测布局区域 (使用 PP-DocLayoutV3)
+        print("\n[3.1] 检测布局区域 (PP-DocLayoutV3)...")
+        template_all_regions = detect_layout_regions(template_path)
+        template_regions = extract_regions_by_type(template_all_regions, "image")
 
-    target_all_regions = detect_layout_regions(target_preprocessed_path)
-    target_regions = extract_regions_by_type(target_all_regions, "image")
+        target_all_regions = detect_layout_regions(str(target_preprocessed_path))
+        target_regions = extract_regions_by_type(target_all_regions, "image")
 
-    skipped_template_regions: List[Dict] = []
-    skipped_target_regions: List[Dict] = []
-    split_template_regions: List[Dict] = []
-    split_target_regions: List[Dict] = []
-    template_regions, skipped_template_regions = split_barcode_regions(
-        template_regions,
-        template_cropped,
-        template_boxes,
-    )
-    target_regions, skipped_target_regions = split_barcode_regions(
-        target_regions,
-        target_cropped,
-        target_boxes,
-    )
-    if ENABLE_IMAGE_REGION_SPLIT:
-        template_regions, split_template_regions = split_composite_image_regions(
+        skipped_template_regions: List[Dict] = []
+        skipped_target_regions: List[Dict] = []
+        split_template_regions: List[Dict] = []
+        split_target_regions: List[Dict] = []
+        template_regions, skipped_template_regions = split_barcode_regions(
             template_regions,
             template_cropped,
             template_boxes,
         )
-        target_regions, split_target_regions = split_composite_image_regions(
+        target_regions, skipped_target_regions = split_barcode_regions(
             target_regions,
             target_cropped,
             target_boxes,
         )
-
-    print(
-        "  - 模板图片区域: "
-        f"{len(template_regions)} 个可比对 / {len(skipped_template_regions)} 个条码跳过 "
-        f"(总检测 {len(template_all_regions)})"
-    )
-    print(
-        "  - 实拍图片区域: "
-        f"{len(target_regions)} 个可比对 / {len(skipped_target_regions)} 个条码跳过 "
-        f"(总检测 {len(target_all_regions)})"
-    )
-    if ENABLE_IMAGE_REGION_SPLIT:
-        print(
-            "  - 图片区域二次拆分: "
-            f"模板拆分 {len(split_template_regions)} 个大框, "
-            f"实拍拆分 {len(split_target_regions)} 个大框"
-        )
-
-    # 3.2 区域匹配
-    print("\n[3.2] 匹配对应区域...")
-    matched_pairs, unmatched1, unmatched2 = match_regions(
-        template_regions,
-        target_regions,
-        template_cropped.shape[:2],
-        target_cropped.shape[:2]
-    )
-
-    print(f"  - 匹配对数: {len(matched_pairs)}")
-    print(f"  - 模板未匹配: {len(unmatched1)}")
-    print(f"  - 实拍未匹配: {len(unmatched2)}")
-
-    # 3.3 区域内容对比
-    print("\n[3.3] 对比匹配区域内容...")
-    comparison_results = []
-
-    for idx, (i, j, dist) in enumerate(matched_pairs):
-        region1 = template_regions[i]
-        region2 = target_regions[j]
-
-        print(f"  >>> 对比区域对 #{idx+1} [T{i} <-> S{j}]...")
-
-        try:
-            res = compare_region_pair(
+        if ENABLE_IMAGE_REGION_SPLIT:
+            template_regions, split_template_regions = split_composite_image_regions(
+                template_regions,
                 template_cropped,
-                target_cropped,
-                region1["coordinate"],
-                region2["coordinate"],
-                output_dir=graphic_output_dir,
-                pair_idx=idx,
-                use_vlm=USE_VLM_FOR_GRAPHIC,
+                template_boxes,
             )
-            res["template_idx"] = i
-            res["target_idx"] = j
-            res["match_distance"] = dist
+            target_regions, split_target_regions = split_composite_image_regions(
+                target_regions,
+                target_cropped,
+                target_boxes,
+            )
 
-            # 打印判定结果（使用 decision 字段）
-            decision = res.get("decision", "unknown")
-            conf = res.get("confidence")
-            source = res.get("judgment_source", "")
-            if decision == "match":
-                print(f"      判定: ✅ 匹配 (Conf: {conf}, Source: {source})")
-            elif decision == "mismatch":
-                print(f"      判定: ❌ 不匹配 (Conf: {conf}, Source: {source})")
-            else:
-                print(f"      判定: ⚠️  需复核 (Conf: {conf}, Source: {source})")
+        print(
+            "  - 模板图片区域: "
+            f"{len(template_regions)} 个可比对 / {len(skipped_template_regions)} 个条码跳过 "
+            f"(总检测 {len(template_all_regions)})"
+        )
+        print(
+            "  - 实拍图片区域: "
+            f"{len(target_regions)} 个可比对 / {len(skipped_target_regions)} 个条码跳过 "
+            f"(总检测 {len(target_all_regions)})"
+        )
+        if ENABLE_IMAGE_REGION_SPLIT:
+            print(
+                "  - 图片区域二次拆分: "
+                f"模板拆分 {len(split_template_regions)} 个大框, "
+                f"实拍拆分 {len(split_target_regions)} 个大框"
+            )
 
-            comparison_results.append(res)
-
-        except Exception as e:
-            print(f"      对比出错: {e}")
-
-    # 3.4 未匹配区域恢复
-    recovered_template_regions: List[Dict] = []
-    recovered_target_regions: List[Dict] = []
-    remaining_unmatched1 = list(unmatched1)
-    remaining_unmatched2 = list(unmatched2)
-
-    if unmatched1 or unmatched2:
-        print("\n[3.4] 尝试恢复未匹配区域...")
-        recovery_payload = _recover_unmatched_regions(
+        # 3.2 区域匹配
+        print("\n[3.2] 匹配对应区域...")
+        matched_pairs, unmatched1, unmatched2 = match_regions(
             template_regions,
             target_regions,
-            matched_pairs,
-            unmatched1,
-            unmatched2,
-            template_cropped,
-            target_cropped,
-            graphic_output_dir,
-            USE_VLM_FOR_GRAPHIC,
-        )
-        recovery_results = recovery_payload["recovery_results"]
-        recovered_template_regions = recovery_payload["recovered_template_regions"]
-        recovered_target_regions = recovery_payload["recovered_target_regions"]
-        resolved_unmatched1 = set(recovery_payload["resolved_unmatched1"])
-        resolved_unmatched2 = set(recovery_payload["resolved_unmatched2"])
-        remaining_unmatched1 = [idx for idx in unmatched1 if idx not in resolved_unmatched1]
-        remaining_unmatched2 = [idx for idx in unmatched2 if idx not in resolved_unmatched2]
-        comparison_results.extend(recovery_results)
-        print(
-            "  - 恢复结果: "
-            f"模板补回 {len(recovered_template_regions)} 个, "
-            f"实拍补回 {len(recovered_target_regions)} 个"
+            template_cropped.shape[:2],
+            target_cropped.shape[:2],
         )
 
-    # 保存区域检测可视化（包含恢复框）
-    template_vis = draw_regions(template_cropped, template_regions)
-    target_vis = draw_regions(target_cropped, target_regions)
-    if skipped_template_regions:
-        template_vis = draw_regions(template_vis, skipped_template_regions, color=(0, 165, 255))
-    if skipped_target_regions:
-        target_vis = draw_regions(target_vis, skipped_target_regions, color=(0, 165, 255))
-    if recovered_template_regions:
-        template_vis = draw_regions(template_vis, recovered_template_regions, color=(255, 128, 0))
-    if recovered_target_regions:
-        target_vis = draw_regions(target_vis, recovered_target_regions, color=(255, 128, 0))
-    cv2.imwrite(os.path.join(graphic_output_dir, "template_regions_detected.jpg"), template_vis)
-    cv2.imwrite(os.path.join(graphic_output_dir, "target_regions_detected.jpg"), target_vis)
+        print(f"  - 匹配对数: {len(matched_pairs)}")
+        print(f"  - 模板未匹配: {len(unmatched1)}")
+        print(f"  - 实拍未匹配: {len(unmatched2)}")
 
-    results["graphic_comparison"] = {
-        "template_regions_total_count": len(extract_regions_by_type(template_all_regions, "image")),
-        "target_regions_total_count": len(extract_regions_by_type(target_all_regions, "image")),
-        "template_regions_count": len(template_regions),
-        "target_regions_count": len(target_regions),
-        "skipped_template_regions": skipped_template_regions,
-        "skipped_target_regions": skipped_target_regions,
-        "split_template_regions": split_template_regions,
-        "split_target_regions": split_target_regions,
-        "recovered_template_regions": recovered_template_regions,
-        "recovered_target_regions": recovered_target_regions,
-        "remaining_unmatched_template": remaining_unmatched1,
-        "remaining_unmatched_target": remaining_unmatched2,
-        "matched_count": len(matched_pairs),
-        "recovered_match_count": len(recovered_template_regions) + len(recovered_target_regions),
-        "effective_matched_count": len(matched_pairs) + len(recovered_template_regions) + len(recovered_target_regions),
-        "comparison_results": comparison_results,
-        "region_type": "image"
-    }
-    results["template_input"] = {
-        "source_path": template_input_path,
-        "source_type": template_source_type,
-        "resolved_image_path": template_raw_path,
-    }
+        # 3.3 区域内容对比
+        print("\n[3.3] 对比匹配区域内容...")
+        comparison_results = []
 
-    # ========== Step 4: 结果可视化 (差异标注) ==========
-    print("\n" + "=" * 40)
-    print("Step 4: 结果可视化 (标注差异)")
-    print("=" * 40)
+        for idx, (i, j, dist) in enumerate(matched_pairs):
+            region1 = template_regions[i]
+            region2 = target_regions[j]
 
-    # 在实拍预处理图上绘制
-    vis_image = target_cropped.copy()
-    diff_count = 0
+            print(f"  >>> 对比区域对 #{idx+1} [T{i} <-> S{j}]...")
 
-    # 1. 标注差异的文字区域 (红色)
-    print("  寻找并标注差异文字区域...")
-    for k in comparison_fields:
-        v1 = getattr(data1, k)
-        v2 = getattr(data2, k)
+            try:
+                res = compare_region_pair(
+                    template_cropped,
+                    target_cropped,
+                    region1["coordinate"],
+                    region2["coordinate"],
+                    output_dir=graphic_output_dir_str,
+                    pair_idx=idx,
+                    use_vlm=USE_VLM_FOR_GRAPHIC,
+                )
+                res["template_idx"] = i
+                res["target_idx"] = j
+                res["match_distance"] = dist
 
-        if not field_values_match(v1, v2):
-            target_val = str(v2) if v2 else ""
-            if not target_val or target_val == "None":
-                continue
+                decision = res.get("decision", "unknown")
+                conf = res.get("confidence")
+                source = res.get("judgment_source", "")
+                if decision == "match":
+                    print(f"      判定: ✅ 匹配 (Conf: {conf}, Source: {source})")
+                elif decision == "mismatch":
+                    print(f"      判定: ❌ 不匹配 (Conf: {conf}, Source: {source})")
+                else:
+                    print(f"      判定: ⚠️  需复核 (Conf: {conf}, Source: {source})")
 
-            matched_box_indices = find_matching_ocr_boxes(
-                target_val,
-                target_boxes,
-                field_name=k,
+                comparison_results.append(res)
+
+            except Exception as e:
+                print(f"      对比出错: {e}")
+
+        # 3.4 未匹配区域恢复
+        recovered_template_regions: List[Dict] = []
+        recovered_target_regions: List[Dict] = []
+        remaining_unmatched1 = list(unmatched1)
+        remaining_unmatched2 = list(unmatched2)
+
+        if unmatched1 or unmatched2:
+            print("\n[3.4] 尝试恢复未匹配区域...")
+            recovery_payload = _recover_unmatched_regions(
+                template_regions,
+                target_regions,
+                matched_pairs,
+                unmatched1,
+                unmatched2,
+                template_cropped,
+                target_cropped,
+                graphic_output_dir_str,
+                USE_VLM_FOR_GRAPHIC,
+            )
+            recovery_results = recovery_payload["recovery_results"]
+            recovered_template_regions = recovery_payload["recovered_template_regions"]
+            recovered_target_regions = recovery_payload["recovered_target_regions"]
+            resolved_unmatched1 = set(recovery_payload["resolved_unmatched1"])
+            resolved_unmatched2 = set(recovery_payload["resolved_unmatched2"])
+            remaining_unmatched1 = [
+                idx for idx in unmatched1 if idx not in resolved_unmatched1
+            ]
+            remaining_unmatched2 = [
+                idx for idx in unmatched2 if idx not in resolved_unmatched2
+            ]
+            comparison_results.extend(recovery_results)
+            print(
+                "  - 恢复结果: "
+                f"模板补回 {len(recovered_template_regions)} 个, "
+                f"实拍补回 {len(recovered_target_regions)} 个"
             )
 
-            if matched_box_indices:
-                matched_texts = [target_boxes[b_idx][1] for b_idx in matched_box_indices]
-                print(
-                    f"    - 字段 '{k}' 差异 (值: {target_val}) -> 对应 "
-                    f"{len(matched_box_indices)} 个 OCR 框: {matched_texts}"
+        if output_options.save_graphic_debug and graphic_output_dir is not None:
+            template_vis = draw_regions(template_cropped, template_regions)
+            target_vis = draw_regions(target_cropped, target_regions)
+            if skipped_template_regions:
+                template_vis = draw_regions(
+                    template_vis,
+                    skipped_template_regions,
+                    color=(0, 165, 255),
                 )
-                for b_idx in matched_box_indices:
-                    # 兼容不同格式的 poly 坐标信息，支持四点斜框
-                    pts = np.array(target_boxes[b_idx][0], dtype=np.int32)
-                    if pts.shape == (4,):
-                        # [x1, y1, x2, y2]
-                        x1, y1, x2, y2 = pts
-                        poly = np.array([[x1,y1], [x2,y1], [x2,y2], [x1,y2]], dtype=np.int32)
-                    else:
-                        poly = pts.reshape((-1, 1, 2))
-                    cv2.polylines(vis_image, [poly], isClosed=True, color=(0, 0, 255), thickness=3)
+            if skipped_target_regions:
+                target_vis = draw_regions(
+                    target_vis,
+                    skipped_target_regions,
+                    color=(0, 165, 255),
+                )
+            if recovered_template_regions:
+                template_vis = draw_regions(
+                    template_vis,
+                    recovered_template_regions,
+                    color=(255, 128, 0),
+                )
+            if recovered_target_regions:
+                target_vis = draw_regions(
+                    target_vis,
+                    recovered_target_regions,
+                    color=(255, 128, 0),
+                )
+            cv2.imwrite(
+                str(graphic_output_dir / "template_regions_detected.jpg"),
+                template_vis,
+            )
+            cv2.imwrite(
+                str(graphic_output_dir / "target_regions_detected.jpg"),
+                target_vis,
+            )
+
+        results["graphic_comparison"] = {
+            "template_regions_total_count": len(
+                extract_regions_by_type(template_all_regions, "image")
+            ),
+            "target_regions_total_count": len(
+                extract_regions_by_type(target_all_regions, "image")
+            ),
+            "template_regions_count": len(template_regions),
+            "target_regions_count": len(target_regions),
+            "skipped_template_regions": skipped_template_regions,
+            "skipped_target_regions": skipped_target_regions,
+            "split_template_regions": split_template_regions,
+            "split_target_regions": split_target_regions,
+            "recovered_template_regions": recovered_template_regions,
+            "recovered_target_regions": recovered_target_regions,
+            "remaining_unmatched_template": remaining_unmatched1,
+            "remaining_unmatched_target": remaining_unmatched2,
+            "matched_count": len(matched_pairs),
+            "recovered_match_count": len(recovered_template_regions)
+            + len(recovered_target_regions),
+            "effective_matched_count": len(matched_pairs)
+            + len(recovered_template_regions)
+            + len(recovered_target_regions),
+            "comparison_results": comparison_results,
+            "region_type": "image",
+        }
+        results["template_input"] = {
+            "source_path": template_input_path,
+            "source_type": template_source_type,
+            "resolved_image_path": (
+                template_raw_path
+                if template_source_type == "image"
+                or output_options.save_template_assets
+                else None
+            ),
+        }
+
+        # ========== Step 4: 结果可视化 (差异标注) ==========
+        print("\n" + "=" * 40)
+        print("Step 4: 结果可视化 (标注差异)")
+        print("=" * 40)
+
+        vis_image = target_cropped.copy()
+        diff_count = 0
+
+        print("  寻找并标注差异文字区域...")
+        for k in comparison_fields:
+            v1 = getattr(data1, k)
+            v2 = getattr(data2, k)
+
+            if not field_values_match(v1, v2):
+                target_val = str(v2) if v2 else ""
+                if not target_val or target_val == "None":
+                    continue
+
+                matched_box_indices = find_matching_ocr_boxes(
+                    target_val,
+                    target_boxes,
+                    field_name=k,
+                )
+
+                if matched_box_indices:
+                    matched_texts = [
+                        target_boxes[b_idx][1] for b_idx in matched_box_indices
+                    ]
+                    print(
+                        f"    - 字段 '{k}' 差异 (值: {target_val}) -> 对应 "
+                        f"{len(matched_box_indices)} 个 OCR 框: {matched_texts}"
+                    )
+                    for b_idx in matched_box_indices:
+                        pts = np.array(target_boxes[b_idx][0], dtype=np.int32)
+                        if pts.shape == (4,):
+                            x1, y1, x2, y2 = pts
+                            poly = np.array(
+                                [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+                                dtype=np.int32,
+                            )
+                        else:
+                            poly = pts.reshape((-1, 1, 2))
+                        cv2.polylines(
+                            vis_image,
+                            [poly],
+                            isClosed=True,
+                            color=(0, 0, 255),
+                            thickness=3,
+                        )
+                        diff_count += 1
+                else:
+                    print(
+                        f"    - 字段 '{k}' 差异 (值: {target_val}) -> 未找到对应 OCR 框"
+                    )
+
+        print("  标注差异和需复核的图形区域...")
+        needs_review_regions = []
+        unresolved_regions = []
+        for res in comparison_results:
+            decision = res.get("decision", "unknown")
+            needs_review = bool(res.get("needs_review", False))
+            target_idx = res.get("target_idx")
+            region_box = None
+
+            if target_idx is not None and target_idx < len(target_regions):
+                region_box = target_regions[target_idx]["coordinate"]
+            elif res.get("inferred_target_box") is not None:
+                region_box = res["inferred_target_box"]
+
+            if region_box is not None:
+                x1, y1, x2, y2 = [int(v) for v in region_box]
+
+                if res.get("unresolved_unmatched"):
+                    cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 128, 255), 3)
+                    cv2.putText(
+                        vis_image,
+                        "Unmatched",
+                        (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 128, 255),
+                        2,
+                    )
+                    unresolved_regions.append(res)
+                    print(
+                        "    - 图形未恢复: 区域 "
+                        f"#{target_idx if target_idx is not None else 'recovered'} "
+                        f"({res.get('summary', '')})"
+                    )
+                elif needs_review or decision == "unknown":
+                    cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 200, 255), 3)
+                    cv2.putText(
+                        vis_image,
+                        "Review",
+                        (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 200, 255),
+                        2,
+                    )
+                    needs_review_regions.append(res)
+                    print(
+                        "    - 图形需复核: 区域 "
+                        f"#{target_idx if target_idx is not None else 'recovered'} "
+                        f"({res.get('summary', '')})"
+                    )
+                elif decision == "mismatch":
+                    cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                    cv2.putText(
+                        vis_image,
+                        "Diff",
+                        (x1, y1 - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 0, 255),
+                        2,
+                    )
                     diff_count += 1
-            else:
-                print(f"    - 字段 '{k}' 差异 (值: {target_val}) -> 未找到对应 OCR 框")
+                    print(
+                        "    - 图形差异: 区域 "
+                        f"#{target_idx if target_idx is not None else 'recovered'} "
+                        "(确认不匹配)"
+                    )
 
-    # 2. 标注差异的图形区域
-    print("  标注差异和需复核的图形区域...")
-    needs_review_regions = []
-    unresolved_regions = []
-    for res in comparison_results:
-        decision = res.get("decision", "unknown")
-        needs_review = bool(res.get("needs_review", False))
-        target_idx = res.get("target_idx")
-        region_box = None
-
-        if target_idx is not None and target_idx < len(target_regions):
-            region_box = target_regions[target_idx]["coordinate"]
-        elif res.get("inferred_target_box") is not None:
-            region_box = res["inferred_target_box"]
-
-        if region_box is not None:
-            x1, y1, x2, y2 = [int(v) for v in region_box]
-
-            if res.get("unresolved_unmatched"):
-                # 未恢复区域：橙框
-                cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 128, 255), 3)
-                cv2.putText(vis_image, "Unmatched", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 128, 255), 2)
-                unresolved_regions.append(res)
-                print(
-                    "    - 图形未恢复: 区域 "
-                    f"#{target_idx if target_idx is not None else 'recovered'} "
-                    f"({res.get('summary', '')})"
-                )
-            elif needs_review or decision == "unknown":
-                # 需复核：黄框
-                cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 200, 255), 3)
-                cv2.putText(vis_image, "Review", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
-                needs_review_regions.append(res)
-                print(
-                    "    - 图形需复核: 区域 "
-                    f"#{target_idx if target_idx is not None else 'recovered'} "
-                    f"({res.get('summary', '')})"
-                )
-            elif decision == "mismatch":
-                # 确认差异：红框
-                cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                cv2.putText(vis_image, "Diff", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                diff_count += 1
-                print(f"    - 图形差异: 区域 #{target_idx if target_idx is not None else 'recovered'} (确认不匹配)")
-
-    # 保存可视化结果
-    vis_path = os.path.join(output_dir, "visualization_diff.jpg")
-    cv2.imwrite(vis_path, vis_image)
-    print(
-        f"  差异可视化已保存: {vis_path} "
-        f"(差异 {diff_count} 处, 未恢复 {len(unresolved_regions)} 处, 待复核 {len(needs_review_regions)} 处)"
-    )
-
-
-    # ========== 输出汇总 ==========
-    print("\n" + "=" * 60)
-    print("检测完成！结果汇总")
-    print("=" * 60)
-
-    # 文字对比统计
-    match_count = sum(
-        1 for k in comparison_fields
-        if field_values_match(getattr(data1, k), getattr(data2, k))
-    )
-    total_fields = len(comparison_fields)
-
-    print(f"\n📝 文字检测:")
-    print(f"   - 字段匹配: {match_count}/{total_fields}")
-    print(f"   - 结果文件: {text_excel_path}")
-
-    print(f"\n🖼️ 图形比较 (基于区域):")
-    effective_template_regions = len(template_regions) + len(recovered_template_regions)
-    effective_target_regions = len(target_regions) + len(recovered_target_regions)
-    effective_matched_pairs = len(matched_pairs) + len(recovered_template_regions) + len(recovered_target_regions)
-
-    print(
-        f"   - 检测区域数: 模板 {len(template_regions)} / 实拍 {len(target_regions)}"
-        f" (恢复后 {effective_template_regions} / {effective_target_regions})"
-    )
-    if skipped_template_regions or skipped_target_regions:
-        print(f"   - 条码跳过: 模板 {len(skipped_template_regions)} / 实拍 {len(skipped_target_regions)}")
-    if recovered_template_regions or recovered_target_regions:
-        print(f"   - 漏检恢复: 模板 +{len(recovered_template_regions)} / 实拍 +{len(recovered_target_regions)}")
-    print(f"   - 成功匹配: {effective_matched_pairs} 对")
-
-    # 统计分为三类
-    confirmed_match = [
-        r for r in comparison_results
-        if r.get("decision") == "match" and not r.get("needs_review", False)
-    ]
-    confirmed_mismatch = [
-        r for r in comparison_results
-        if r.get("decision") == "mismatch" and not r.get("needs_review", False)
-    ]
-    review_needed = [
-        r for r in comparison_results
-        if r.get("decision") == "unknown" or r.get("needs_review", False)
-    ]
-
-    graphic_pass = True
-    has_review = len(review_needed) > 0
-
-    if effective_template_regions != effective_target_regions:
-        print(f"   - ⚠️ 区域数量不一致!")
-        graphic_pass = False
-
-    if remaining_unmatched1 or remaining_unmatched2:
-        print(f"   - ⚠️ 存在未匹配区域!")
-        graphic_pass = False
-
-    if confirmed_mismatch:
-        graphic_pass = False
-        for res in confirmed_mismatch:
-            print(f"   - ❌ 确认不匹配: {res.get('summary')}")
-
-    if review_needed:
-        for res in review_needed:
-            print(f"   - ⚠️ 需复核: {res.get('summary')}")
-
-    if confirmed_match and not confirmed_mismatch and not review_needed and effective_matched_pairs > 0:
-        print("   - ✅ 所有匹配区域均判定一致")
-    elif effective_matched_pairs == 0:
-         print("   - ⚠️ 无可见图形区域参与对比")
-
-    print(f"   - 统计: 一致 {len(confirmed_match)}, 不一致 {len(confirmed_mismatch)}, 待复核 {len(review_needed)}")
-    if remaining_unmatched1 or remaining_unmatched2:
+        vis_path = output_root / "visualization_diff.jpg"
+        cv2.imwrite(str(vis_path), vis_image)
         print(
-            f"   - 未恢复区域: 模板 {len(remaining_unmatched1)} / 实拍 {len(remaining_unmatched2)}"
+            f"  差异可视化已保存: {vis_path} "
+            f"(差异 {diff_count} 处, 未恢复 {len(unresolved_regions)} 处, "
+            f"待复核 {len(needs_review_regions)} 处)"
         )
-    print(f"   - 结果目录: {output_dir}")
-    print(f"   - 可视化图: {vis_path}")
 
-    # 综合判定
-    text_match_ratio = match_count / total_fields
-    unresolved_graphics = len(remaining_unmatched1) + len(remaining_unmatched2)
+        # ========== 输出汇总 ==========
+        print("\n" + "=" * 60)
+        print("检测完成！结果汇总")
+        print("=" * 60)
 
-    if text_match_ratio == 1.0 and graphic_pass and not has_review:
-        verdict = "✅ 标签完全一致"
-    elif text_match_ratio == 1.0 and graphic_pass and has_review:
-        verdict = f"⚠️ 标签基本一致，{len(review_needed)} 处图形需人工复核"
-    elif text_match_ratio >= 0.8 and graphic_pass:
-        verdict = f"⚠️ 文字存在差异 ({int((1-text_match_ratio)*total_fields)} 处)，图形一致"
-    elif text_match_ratio == 1.0 and not graphic_pass:
-        if unresolved_graphics > 0 and not confirmed_mismatch:
-            verdict = f"⚠️ 文字一致，但图形有 {unresolved_graphics} 个区域未恢复"
+        match_count = sum(
+            1
+            for k in comparison_fields
+            if field_values_match(getattr(data1, k), getattr(data2, k))
+        )
+        total_fields = len(comparison_fields)
+
+        print(f"\n📝 文字检测:")
+        print(f"   - 字段匹配: {match_count}/{total_fields}")
+        print(f"   - 结果文件: {text_excel_path or '未保存'}")
+
+        print(f"\n🖼️ 图形比较 (基于区域):")
+        effective_template_regions = len(template_regions) + len(recovered_template_regions)
+        effective_target_regions = len(target_regions) + len(recovered_target_regions)
+        effective_matched_pairs = (
+            len(matched_pairs)
+            + len(recovered_template_regions)
+            + len(recovered_target_regions)
+        )
+
+        print(
+            f"   - 检测区域数: 模板 {len(template_regions)} / 实拍 {len(target_regions)}"
+            f" (恢复后 {effective_template_regions} / {effective_target_regions})"
+        )
+        if skipped_template_regions or skipped_target_regions:
+            print(
+                f"   - 条码跳过: 模板 {len(skipped_template_regions)} / "
+                f"实拍 {len(skipped_target_regions)}"
+            )
+        if recovered_template_regions or recovered_target_regions:
+            print(
+                f"   - 漏检恢复: 模板 +{len(recovered_template_regions)} / "
+                f"实拍 +{len(recovered_target_regions)}"
+            )
+        print(f"   - 成功匹配: {effective_matched_pairs} 对")
+
+        confirmed_match = [
+            r
+            for r in comparison_results
+            if r.get("decision") == "match" and not r.get("needs_review", False)
+        ]
+        confirmed_mismatch = [
+            r
+            for r in comparison_results
+            if r.get("decision") == "mismatch" and not r.get("needs_review", False)
+        ]
+        review_needed = [
+            r
+            for r in comparison_results
+            if r.get("decision") == "unknown" or r.get("needs_review", False)
+        ]
+
+        graphic_pass = True
+        has_review = len(review_needed) > 0
+
+        if effective_template_regions != effective_target_regions:
+            print("   - ⚠️ 区域数量不一致!")
+            graphic_pass = False
+
+        if remaining_unmatched1 or remaining_unmatched2:
+            print("   - ⚠️ 存在未匹配区域!")
+            graphic_pass = False
+
+        if confirmed_mismatch:
+            graphic_pass = False
+            for res in confirmed_mismatch:
+                print(f"   - ❌ 确认不匹配: {res.get('summary')}")
+
+        if review_needed:
+            for res in review_needed:
+                print(f"   - ⚠️ 需复核: {res.get('summary')}")
+
+        if (
+            confirmed_match
+            and not confirmed_mismatch
+            and not review_needed
+            and effective_matched_pairs > 0
+        ):
+            print("   - ✅ 所有匹配区域均判定一致")
+        elif effective_matched_pairs == 0:
+            print("   - ⚠️ 无可见图形区域参与对比")
+
+        print(
+            f"   - 统计: 一致 {len(confirmed_match)}, 不一致 {len(confirmed_mismatch)}, "
+            f"待复核 {len(review_needed)}"
+        )
+        if remaining_unmatched1 or remaining_unmatched2:
+            print(
+                f"   - 未恢复区域: 模板 {len(remaining_unmatched1)} / "
+                f"实拍 {len(remaining_unmatched2)}"
+            )
+        print(f"   - 结果目录: {output_root}")
+        print(f"   - 可视化图: {vis_path}")
+
+        text_match_ratio = match_count / total_fields
+        unresolved_graphics = len(remaining_unmatched1) + len(remaining_unmatched2)
+
+        if text_match_ratio == 1.0 and graphic_pass and not has_review:
+            verdict = "✅ 标签完全一致"
+        elif text_match_ratio == 1.0 and graphic_pass and has_review:
+            verdict = f"⚠️ 标签基本一致，{len(review_needed)} 处图形需人工复核"
+        elif text_match_ratio >= 0.8 and graphic_pass:
+            verdict = f"⚠️ 文字存在差异 ({int((1-text_match_ratio)*total_fields)} 处)，图形一致"
+        elif text_match_ratio == 1.0 and not graphic_pass:
+            if unresolved_graphics > 0 and not confirmed_mismatch:
+                verdict = f"⚠️ 文字一致，但图形有 {unresolved_graphics} 个区域未恢复"
+            else:
+                verdict = (
+                    "⚠️ 文字一致，图形存在差异 "
+                    f"({len(confirmed_mismatch)} 处不匹配, {unresolved_graphics} 个未恢复)"
+                )
         else:
             verdict = (
-                "⚠️ 文字一致，图形存在差异 "
-                f"({len(confirmed_mismatch)} 处不匹配, {unresolved_graphics} 个未恢复)"
+                "❌ 标签差异较大 "
+                f"(文字 {match_count}/{total_fields}，图形 {len(confirmed_mismatch)} 处不匹配, "
+                f"{unresolved_graphics} 个未恢复)"
             )
-    else:
-        verdict = (
-            "❌ 标签差异较大 "
-            f"(文字 {match_count}/{total_fields}，图形 {len(confirmed_mismatch)} 处不匹配, "
-            f"{unresolved_graphics} 个未恢复)"
-        )
 
-    print(f"\n🏷️ 综合判定: {verdict}")
+        print(f"\n🏷️ 综合判定: {verdict}")
 
-    # 【修复】先补齐 verdict 和 output_dir，再写入 JSON
-    results["verdict"] = verdict
-    results["output_dir"] = output_dir
+        results["verdict"] = verdict
+        results["output_dir"] = str(output_root)
 
-    # 保存最终结果 JSON
-    class NumpyEncoder(json.JSONEncoder):
-        def default(self, obj):
-            if isinstance(obj, (np.integer, np.int64)):
-                return int(obj)
-            elif isinstance(obj, (np.floating, np.float64)):
-                return float(obj)
-            elif isinstance(obj, np.ndarray):
-                return obj.tolist()
-            return super().default(obj)
+        class NumpyEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, (np.integer, np.int64)):
+                    return int(obj)
+                if isinstance(obj, (np.floating, np.float64)):
+                    return float(obj)
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                return super().default(obj)
 
-    final_json_path = os.path.join(output_dir, "final_result.json")
-    with open(final_json_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2, cls=NumpyEncoder)
+        final_json_path = output_root / "final_result.json"
+        with final_json_path.open("w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2, cls=NumpyEncoder)
 
     return results
 
@@ -1131,6 +1270,12 @@ def build_arg_parser():
     )
     parser.add_argument("--target", default=DEFAULT_TARGET_PATH, help="实拍图片路径")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="结果输出目录")
+    parser.add_argument(
+        "--output-mode",
+        default="debug",
+        choices=["final", "debug"],
+        help="输出模式: final 仅保留最终结果, debug 保留详细中间产物",
+    )
     return parser
 
 
@@ -1142,6 +1287,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.template,
         args.target,
         output_dir=args.output_dir,
+        output_mode=args.output_mode,
     )
     if not result.get("success"):
         print(f"检测失败: {result.get('error', '未知错误')}")
