@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 from functools import lru_cache
 
-from label_detection.core.config import PADDLE_DEVICE_REQUIRED, PADDLE_DISABLE_MODEL_SOURCE_CHECK
+from label_detection.core.config import (
+    PADDLE_DEVICE_REQUIRED,
+    PADDLE_DISABLE_MODEL_SOURCE_CHECK,
+    PADDLE_EMPTY_CACHE_AFTER_RUN,
+)
 
 
 if PADDLE_DISABLE_MODEL_SOURCE_CHECK:
@@ -58,3 +63,49 @@ def resolve_paddle_device(requested_device: str | None, component: str = "Paddle
         return "cpu"
 
     return requested
+
+
+def empty_paddle_cache(reason: str = "workflow") -> None:
+    """Release cached Paddle GPU blocks back to the driver after a run."""
+    if not PADDLE_EMPTY_CACHE_AFTER_RUN:
+        return
+
+    try:
+        import paddle
+    except Exception:
+        return
+
+    try:
+        current_device = str(paddle.get_device() or "").strip().lower()
+    except Exception:
+        current_device = ""
+
+    if not current_device.startswith("gpu"):
+        return
+
+    try:
+        before_reserved = paddle.device.cuda.memory_reserved()
+        before_allocated = paddle.device.cuda.memory_allocated()
+        paddle.device.cuda.empty_cache()
+        after_reserved = paddle.device.cuda.memory_reserved()
+        after_allocated = paddle.device.cuda.memory_allocated()
+    except Exception as exc:  # pragma: no cover - depends on CUDA runtime state
+        print(f"[Paddle] 清理 GPU 缓存失败 ({reason}): {exc}")
+        return
+
+    mib = 1024 * 1024
+    print(
+        "[Paddle] 已清理 GPU 缓存 "
+        f"({reason}): reserved {before_reserved / mib:.1f}MB -> "
+        f"{after_reserved / mib:.1f}MB, allocated {before_allocated / mib:.1f}MB -> "
+        f"{after_allocated / mib:.1f}MB"
+    )
+
+
+@contextmanager
+def paddle_cache_cleanup_scope(reason: str = "workflow"):
+    """Ensure Paddle cached GPU memory is released after the wrapped workflow exits."""
+    try:
+        yield
+    finally:
+        empty_paddle_cache(reason=reason)

@@ -30,6 +30,7 @@ from label_detection.core.config import (
     ENABLE_IMAGE_REGION_SPLIT,
     ensure_local_ollama_no_proxy,
 )
+from label_detection.core.paddle_runtime import paddle_cache_cleanup_scope
 from label_detection.extraction.template_source import resolve_template_input
 from label_detection.extraction.text import (
     count_populated_fields,
@@ -724,7 +725,9 @@ def run_unified_detection(
         "graphic_comparison": {},
         "output_mode": output_options.mode,
     }
-    with TemporaryDirectory(prefix="label-detection-") as temp_root:
+    with TemporaryDirectory(
+        prefix="label-detection-"
+    ) as temp_root, paddle_cache_cleanup_scope(reason="run_unified_detection"):
         work_root = output_root / "debug" if output_options.mode == "debug" else Path(temp_root)
         work_root.mkdir(parents=True, exist_ok=True)
 

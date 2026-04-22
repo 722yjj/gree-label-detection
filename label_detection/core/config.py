@@ -37,6 +37,7 @@ PADDLE_DISABLE_MODEL_SOURCE_CHECK = _env_flag(
     "PADDLE_DISABLE_MODEL_SOURCE_CHECK",
     "1",
 )
+PADDLE_EMPTY_CACHE_AFTER_RUN = _env_flag("PADDLE_EMPTY_CACHE_AFTER_RUN", "1")
 
 # ==================== 布局检测配置 ====================
 LAYOUT_DETECTION_THRESHOLD = float(os.getenv("LAYOUT_DETECTION_THRESHOLD", "0.3"))
