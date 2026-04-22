@@ -40,3 +40,26 @@ class DetectionJobResult:
     visualization_path: Optional[Path] = None
     raw_result: dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
+    text_match_count: int = 0
+    text_total_count: int = 0
+    graphic_match_count: int = 0
+    graphic_mismatch_count: int = 0
+    graphic_review_count: int = 0
+    target_image_path: Optional[Path] = None
+    template_path: Optional[Path] = None
+    code: Optional[str] = None
+    template_display_name: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class HistoryRecord:
+    """A persisted desktop detection history entry."""
+
+    created_at: str
+    code: str
+    template_name: str
+    verdict: str
+    output_dir: Path
+    target_image_path: Path
+    visualization_path: Optional[Path] = None
+    summary_text: str = ""

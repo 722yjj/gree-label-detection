@@ -3,6 +3,7 @@
 ## Working Mode
 
 - This project is developed directly on the server in the current working checkout.
+- If the current checkout contains a project virtual environment such as `.venv`, use that environment first before running `uv` commands, so all installs, checks, and launches stay bound to the current project environment.
 - Use Git to manage the repository state on the server: create or switch branches as needed, keep `main` stable, and make changes through normal commit-based workflows.
 - Unless the user explicitly asks for a separate local workflow, do not assume code will be edited locally first and then pulled to the server.
 - Prefer static checks, unit tests, and dry-run validation in the current server environment; run end-to-end jobs directly on the server when the user asks for them or when the task requires real in-environment verification.
