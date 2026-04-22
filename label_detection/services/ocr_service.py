@@ -2,7 +2,8 @@ import logging
 import os
 from typing import TYPE_CHECKING, List, Tuple
 
-from label_detection.core.config import OCR_LANG, OCR_USE_ANGLE_CLS
+from label_detection.core.config import OCR_DEVICE, OCR_LANG, OCR_USE_ANGLE_CLS
+from label_detection.core.paddle_runtime import resolve_paddle_device
 
 if TYPE_CHECKING:
     from paddleocr import PaddleOCR
@@ -21,8 +22,13 @@ def get_ocr_engine() -> "PaddleOCR":
     if _ocr_engine is None:
         from paddleocr import PaddleOCR
 
-        print("正在初始化 PaddleOCR...")
-        _ocr_engine = PaddleOCR(use_angle_cls=OCR_USE_ANGLE_CLS, lang=OCR_LANG)
+        device = resolve_paddle_device(OCR_DEVICE, component="PaddleOCR")
+        print(f"正在初始化 PaddleOCR (device={device})...")
+        _ocr_engine = PaddleOCR(
+            use_angle_cls=OCR_USE_ANGLE_CLS,
+            lang=OCR_LANG,
+            device=device,
+        )
     return _ocr_engine
 
 

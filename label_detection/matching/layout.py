@@ -24,6 +24,8 @@ from scipy.optimize import linear_sum_assignment
 # 导入公共模块
 from label_detection.core.config import (
     LAYOUT_DETECTION_THRESHOLD,
+    LAYOUT_DEVICE,
+    LAYOUT_MODEL_NAME,
     MATCH_WEIGHT_CENTER,
     MATCH_WEIGHT_AREA,
     MATCH_WEIGHT_ASPECT,
@@ -31,6 +33,7 @@ from label_detection.core.config import (
     MATCH_COST_THRESHOLD,
     ENABLE_IMAGE_REGION_SPLIT,
 )
+from label_detection.core.paddle_runtime import resolve_paddle_device
 
 
 # 创建 PP-DocLayoutV3 预测器（全局复用）
@@ -57,8 +60,13 @@ def get_layout_predictor(threshold: float = None):
     if _layout_predictor is None:
         from paddlex import create_predictor
 
-        print("[模型] 初始化 PP-DocLayoutV3 预测器...")
-        _layout_predictor = create_predictor(model_name="PP-DocLayoutV3", threshold=threshold)
+        device = resolve_paddle_device(LAYOUT_DEVICE, component=LAYOUT_MODEL_NAME)
+        print(f"[模型] 初始化 {LAYOUT_MODEL_NAME} 预测器 (device={device})...")
+        _layout_predictor = create_predictor(
+            model_name=LAYOUT_MODEL_NAME,
+            threshold=threshold,
+            device=device,
+        )
     return _layout_predictor
 
 

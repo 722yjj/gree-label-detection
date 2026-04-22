@@ -8,6 +8,12 @@ import os
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SAMPLES_DIR = PROJECT_ROOT / "samples"
 
+
+def _env_flag(name: str, default: str) -> bool:
+    value = os.getenv(name, default).strip().lower()
+    return value not in {"", "0", "false", "no", "off"}
+
+
 # ==================== Ollama / VLM 配置 ====================
 OLLAMA_API_BASE = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
@@ -23,6 +29,14 @@ VLM_NUM_PREDICT = int(os.getenv("VLM_NUM_PREDICT", "8192"))
 # ==================== OCR 配置 ====================
 OCR_LANG = os.getenv("OCR_LANG", "ch")
 OCR_USE_ANGLE_CLS = True
+PADDLE_DEVICE = os.getenv("PADDLE_DEVICE", "gpu:0").strip() or "gpu:0"
+OCR_DEVICE = os.getenv("OCR_DEVICE", PADDLE_DEVICE).strip() or PADDLE_DEVICE
+LAYOUT_DEVICE = os.getenv("LAYOUT_DEVICE", PADDLE_DEVICE).strip() or PADDLE_DEVICE
+PADDLE_DEVICE_REQUIRED = _env_flag("PADDLE_DEVICE_REQUIRED", "0")
+PADDLE_DISABLE_MODEL_SOURCE_CHECK = _env_flag(
+    "PADDLE_DISABLE_MODEL_SOURCE_CHECK",
+    "1",
+)
 
 # ==================== 布局检测配置 ====================
 LAYOUT_DETECTION_THRESHOLD = float(os.getenv("LAYOUT_DETECTION_THRESHOLD", "0.3"))
