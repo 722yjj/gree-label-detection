@@ -7,12 +7,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QColor, QImage, QPixmap
+from PySide6.QtWidgets import QApplication, QScrollArea
 
 from desktop_app.controllers.app_controller import AppController
 from desktop_app.devices.scanner.mock import MockScannerAdapter
 from desktop_app.models import TemplateRecord
-from desktop_app.ui.main_window import MainWindow
+from desktop_app.ui.main_window import MainWindow, ScaledImageLabel
 
 
 class FakeTemplateRepository:
@@ -159,5 +160,118 @@ def test_run_detection_uses_output_mode_toggle(tmp_path, qapp):
         window.detailed_output_checkbox.setChecked(True)
         controller.run_detection()
         assert captured_requests[-1].output_mode == "debug"
+    finally:
+        window.close()
+
+
+def test_scaled_image_label_rescales_pixmap_on_label_resize(tmp_path, qapp):
+    image_path = tmp_path / "preview.jpg"
+    image = QImage(1600, 900, QImage.Format.Format_RGB32)
+    image.fill(QColor("red"))
+    assert image.save(str(image_path))
+
+    label = ScaledImageLabel("placeholder")
+    label.resize(500, 300)
+    label.show()
+    qapp.processEvents()
+
+    try:
+        label.set_preview_pixmap(QPixmap(str(image_path)))
+        qapp.processEvents()
+        first_pixmap = label.pixmap()
+
+        label.resize(240, 120)
+        qapp.processEvents()
+        second_pixmap = label.pixmap()
+
+        assert first_pixmap is not None
+        assert second_pixmap is not None
+        assert second_pixmap.width() <= label.width()
+        assert second_pixmap.height() <= label.height()
+        assert second_pixmap.width() < first_pixmap.width()
+    finally:
+        label.close()
+
+
+def test_scaled_image_label_keeps_stable_size_hints_after_pixmap_set(tmp_path, qapp):
+    image_path = tmp_path / "preview.jpg"
+    image = QImage(1600, 900, QImage.Format.Format_RGB32)
+    image.fill(QColor("blue"))
+    assert image.save(str(image_path))
+
+    label = ScaledImageLabel("placeholder")
+    label.show()
+    qapp.processEvents()
+
+    try:
+        before_minimum = label.minimumSizeHint()
+        before_preferred = label.sizeHint()
+
+        label.set_preview_pixmap(QPixmap(str(image_path)))
+        qapp.processEvents()
+
+        after_minimum = label.minimumSizeHint()
+        after_preferred = label.sizeHint()
+
+        assert after_minimum == before_minimum
+        assert after_preferred == before_preferred
+    finally:
+        label.close()
+
+
+def test_main_window_enables_standard_window_buttons(qapp):
+    from PySide6.QtCore import Qt
+
+    window = MainWindow()
+    window.show()
+    qapp.processEvents()
+
+    try:
+        flags = window.windowFlags()
+        assert flags & Qt.WindowType.Window
+        assert flags & Qt.WindowType.WindowSystemMenuHint
+        assert flags & Qt.WindowType.WindowMinimizeButtonHint
+        assert flags & Qt.WindowType.WindowMaximizeButtonHint
+        assert flags & Qt.WindowType.WindowCloseButtonHint
+    finally:
+        window.close()
+
+
+def test_main_window_uses_scroll_area_for_overflow(qapp):
+    window = MainWindow()
+    window.resize(1180, 720)
+    window.show()
+    qapp.processEvents()
+
+    try:
+        central = window.centralWidget()
+        assert isinstance(central, QScrollArea) is False
+
+        scroll_area = window.right_lower_scroll_area
+        assert isinstance(scroll_area, QScrollArea)
+        assert scroll_area.widgetResizable() is True
+
+        window.resize(1180, 640)
+        qapp.processEvents()
+
+        assert scroll_area.verticalScrollBar().maximum() > 0
+    finally:
+        window.close()
+
+
+def test_main_window_uses_internal_scroll_areas_for_result_and_history(qapp):
+    window = MainWindow()
+    window.resize(1180, 720)
+    window.show()
+    qapp.processEvents()
+
+    try:
+        assert isinstance(window.result_scroll_area, QScrollArea)
+        assert window.result_scroll_area.widgetResizable() is True
+        assert window.result_scroll_area.verticalScrollBar().maximum() > 0
+
+        assert isinstance(window.history_scroll_area, QScrollArea)
+        assert window.history_scroll_area.widgetResizable() is True
+        assert window.history_scroll_area.verticalScrollBar().maximum() > 0
     finally:
         window.close()

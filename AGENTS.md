@@ -9,9 +9,17 @@
 - Prefer static checks, unit tests, and dry-run validation in the current server environment; run end-to-end jobs directly on the server when the user asks for them or when the task requires real in-environment verification.
 - After code changes, provide the exact command that can be run in the current server checkout to verify the result.
 
+## Canonical Commands
+
+- In this checkout, `.venv/bin/python` is the canonical interpreter once `.venv` exists.
+- Desktop app launch command: `.venv/bin/python -m desktop_app.main`
+- Root CLI launch command: `.venv/bin/python main.py --template <template_path> --target <target_path>`
+- If `.venv` is missing or dependencies need to be refreshed, run `uv sync --extra desktop` in the repo root first, then continue using `.venv/bin/python ...`.
+- Avoid mixing `uv run python ...` and `.venv/bin/python ...` in project instructions unless the user explicitly asks for a temporary `uv run` invocation.
+
 ## Batch Sample Testing
 
-- The batch entrypoint is `python scripts/batch_run_samples.py`.
+- The canonical batch command is `.venv/bin/python scripts/batch_run_samples.py`.
 - Default discovery scans `samples/pdfs` for template files and `samples/images/produce` for target images.
 - Filename matching is code-based: extract the main numeric code from the filename and treat suffixes like `-01` or `_1` as variants of the same label.
 - Default pairing mode is `all`: every template variant for a code is compared with every target variant for the same code.

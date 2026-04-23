@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, Signal
+from PySide6.QtCore import QSize, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QSizePolicy,
     QTreeWidget,
@@ -29,6 +30,78 @@ from PySide6.QtWidgets import (
 
 from desktop_app.models import DetectionJobResult, HistoryRecord, TemplateRecord
 
+
+class ScaledImageLabel(QLabel):
+    """QLabel that keeps the source pixmap and rescales on its own resize."""
+
+    def __init__(
+        self,
+        placeholder: str,
+        *,
+        preferred_width: int = 420,
+        preferred_height: int = 260,
+        minimum_width: int = 120,
+        minimum_height: int = 220,
+    ) -> None:
+        super().__init__(placeholder)
+        self._preferred_width = preferred_width
+        self._preferred_height = preferred_height
+        self._minimum_width = minimum_width
+        self._minimum_height = minimum_height
+        self._placeholder_text = placeholder
+        self._source_pixmap: QPixmap | None = None
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumHeight(self._minimum_height)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.setWordWrap(True)
+        self.setStyleSheet(
+            "border: 1px solid #d7dee7; background: #f8fafc; border-radius: 10px;"
+        )
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSizeHint().expandedTo(
+            super().sizeHint()
+        ).expandedTo(
+            QSize(self._preferred_width, self._preferred_height)
+        )
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(self._minimum_width, self._minimum_height)
+
+    def clear_preview(self, text: str | None = None) -> None:
+        if text is not None:
+            self._placeholder_text = text
+        self._source_pixmap = None
+        self.setText(self._placeholder_text)
+        super().setPixmap(QPixmap())
+
+    def set_preview_pixmap(self, pixmap: QPixmap, text: str | None = None) -> None:
+        if text is not None:
+            self._placeholder_text = text
+        self._source_pixmap = pixmap
+        self._sync_pixmap()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._source_pixmap is not None:
+            self._sync_pixmap()
+
+    def _sync_pixmap(self) -> None:
+        if self._source_pixmap is None or self._source_pixmap.isNull():
+            self.clear_preview()
+            return
+
+        target_size = self.contentsRect().size()
+        if target_size.width() <= 0 or target_size.height() <= 0:
+            return
+
+        scaled = self._source_pixmap.scaled(
+            target_size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.setText("")
+        super().setPixmap(scaled)
 
 class MainWindow(QMainWindow):
     """Desktop UI shell for code lookup and detection runs."""
@@ -43,6 +116,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("标签检测桌面端")
+        self._configure_window_chrome()
+        self.setMinimumSize(1180, 720)
         self.resize(1440, 920)
 
         self.code_input = QLineEdit()
@@ -75,9 +150,22 @@ class MainWindow(QMainWindow):
         self.history_output_dir_value = QLineEdit()
         self.history_output_dir_value.setReadOnly(True)
         self.history_list = QTreeWidget()
-        self.template_preview_label = self._build_image_label("选择模板后显示模板图")
-        self.preview_label = self._build_image_label("请选择或采集目标图片")
-        self.result_preview_label = self._build_image_label("检测完成后显示画框结果图")
+        self.template_preview_label = self._build_image_label(
+            "选择模板后显示模板图",
+            preferred_height=280,
+        )
+        self.preview_label = self._build_image_label(
+            "请选择或采集目标图片",
+            preferred_height=300,
+        )
+        self.result_preview_label = self._build_image_label(
+            "检测完成后显示画框结果图",
+            preferred_width=520,
+            preferred_height=420,
+        )
+        self.right_lower_scroll_area = QScrollArea()
+        self.result_scroll_area = QScrollArea()
+        self.history_scroll_area = QScrollArea()
         self.result_card_frame = QFrame()
         self.result_header_frame = QFrame()
 
@@ -166,8 +254,12 @@ class MainWindow(QMainWindow):
         result_preview_group.setLayout(result_preview_layout)
 
         result_group = QGroupBox("检测结果")
-        result_layout = QVBoxLayout()
-        result_layout.setContentsMargins(12, 12, 12, 12)
+        result_outer_layout = QVBoxLayout()
+        result_outer_layout.setContentsMargins(12, 12, 12, 12)
+        result_outer_layout.setSpacing(0)
+        result_content = QWidget()
+        result_layout = QVBoxLayout(result_content)
+        result_layout.setContentsMargins(0, 0, 0, 0)
         result_layout.setSpacing(12)
         self.result_header_frame.setObjectName("resultHeader")
         header_layout = QHBoxLayout(self.result_header_frame)
@@ -196,11 +288,30 @@ class MainWindow(QMainWindow):
 
         result_layout.addWidget(self.result_header_frame)
         result_layout.addWidget(self.result_card_frame)
-        result_group.setLayout(result_layout)
+        self.result_scroll_area.setWidgetResizable(True)
+        self.result_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.result_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.result_scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.result_scroll_area.setWidget(result_content)
+        result_outer_layout.addWidget(self.result_scroll_area)
+        result_group.setLayout(result_outer_layout)
+        result_group.setMaximumHeight(260)
+        result_group.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Maximum,
+        )
 
         history_group = QGroupBox("历史记录")
-        history_layout = QVBoxLayout()
-        history_layout.setContentsMargins(12, 12, 12, 12)
+        history_outer_layout = QVBoxLayout()
+        history_outer_layout.setContentsMargins(12, 12, 12, 12)
+        history_outer_layout.setSpacing(0)
+        history_content = QWidget()
+        history_layout = QVBoxLayout(history_content)
+        history_layout.setContentsMargins(0, 0, 0, 0)
         history_layout.setSpacing(10)
         self.history_list.setRootIsDecorated(False)
         self.history_list.setItemsExpandable(False)
@@ -219,7 +330,22 @@ class MainWindow(QMainWindow):
         history_button_row.addWidget(self.open_history_dir_button)
         history_button_row.addWidget(self.copy_history_path_button)
         history_layout.addLayout(history_button_row)
-        history_group.setLayout(history_layout)
+        self.history_scroll_area.setWidgetResizable(True)
+        self.history_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.history_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.history_scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.history_scroll_area.setWidget(history_content)
+        history_outer_layout.addWidget(self.history_scroll_area)
+        history_group.setLayout(history_outer_layout)
+        history_group.setMaximumHeight(190)
+        history_group.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Maximum,
+        )
 
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
@@ -234,15 +360,31 @@ class MainWindow(QMainWindow):
         preview_splitter.addWidget(preview_group)
         preview_splitter.addWidget(result_preview_group)
         preview_splitter.setStretchFactor(0, 1)
-        preview_splitter.setStretchFactor(1, 1)
+        preview_splitter.setStretchFactor(1, 2)
+
+        right_lower_content = QWidget()
+        right_lower_layout = QVBoxLayout(right_lower_content)
+        right_lower_layout.setContentsMargins(0, 0, 0, 0)
+        right_lower_layout.setSpacing(12)
+        right_lower_layout.addWidget(result_group)
+        right_lower_layout.addWidget(history_group)
+        right_lower_layout.addStretch(1)
+
+        self.right_lower_scroll_area.setWidgetResizable(True)
+        self.right_lower_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.right_lower_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.right_lower_scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.right_lower_scroll_area.setWidget(right_lower_content)
 
         right_splitter = QSplitter(Qt.Orientation.Vertical)
         right_splitter.addWidget(preview_splitter)
-        right_splitter.addWidget(result_group)
-        right_splitter.addWidget(history_group)
-        right_splitter.setStretchFactor(0, 8)
-        right_splitter.setStretchFactor(1, 4)
-        right_splitter.setStretchFactor(2, 4)
+        right_splitter.addWidget(self.right_lower_scroll_area)
+        right_splitter.setStretchFactor(0, 14)
+        right_splitter.setStretchFactor(1, 5)
         left_panel.setMaximumWidth(420)
 
         right_panel = QWidget()
@@ -266,8 +408,8 @@ class MainWindow(QMainWindow):
         root_layout.setStretch(1, 1)
         self.setCentralWidget(central)
 
-        preview_splitter.setSizes([500, 500])
-        right_splitter.setSizes([420, 230, 230])
+        preview_splitter.setSizes([420, 660])
+        right_splitter.setSizes([620, 260])
         splitter.setSizes([360, 1080])
 
     def _apply_styles(self) -> None:
@@ -336,6 +478,19 @@ class MainWindow(QMainWindow):
             }
             """
         )
+
+    def _configure_window_chrome(self) -> None:
+        flags = self.windowFlags()
+        flags |= (
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowSystemMenuHint
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+        flags &= ~Qt.WindowType.WindowContextHelpButtonHint
+        self.setWindowFlags(flags)
 
     def _connect_signals(self) -> None:
         self.query_button.clicked.connect(self.manual_query_requested)
@@ -592,24 +747,6 @@ class MainWindow(QMainWindow):
         self.history_output_dir_value.setText(str(record.output_dir) if record else "")
         self._sync_history_buttons()
 
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._render_image(
-            self.template_preview_label,
-            self._template_preview_path,
-            "选择模板后显示模板图",
-        )
-        self._render_image(
-            self.preview_label,
-            self._target_preview_path,
-            "请选择或采集目标图片",
-        )
-        self._render_image(
-            self.result_preview_label,
-            self._result_preview_path,
-            "检测完成后显示画框结果图",
-        )
-
     def showEvent(self, event) -> None:
         super().showEvent(event)
         if self._did_auto_focus_code_input:
@@ -619,42 +756,39 @@ class MainWindow(QMainWindow):
         self.focus_code_input(select_all=True)
 
     @staticmethod
-    def _build_image_label(placeholder: str) -> QLabel:
-        label = QLabel(placeholder)
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setMinimumHeight(300)
-        label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-        label.setWordWrap(True)
-        label.setStyleSheet(
-            "border: 1px solid #d7dee7; background: #f8fafc; border-radius: 10px;"
+    def _build_image_label(
+        placeholder: str,
+        *,
+        preferred_width: int = 420,
+        preferred_height: int = 260,
+        minimum_width: int = 120,
+        minimum_height: int = 220,
+    ) -> ScaledImageLabel:
+        return ScaledImageLabel(
+            placeholder,
+            preferred_width=preferred_width,
+            preferred_height=preferred_height,
+            minimum_width=minimum_width,
+            minimum_height=minimum_height,
         )
-        return label
 
-    @staticmethod
-    def _clear_image(label: QLabel, text: str) -> None:
-        label.setText(text)
-        label.setPixmap(QPixmap())
-
-    def _render_image(self, label: QLabel, path: Path | None, empty_text: str) -> None:
+    def _render_image(
+        self, label: ScaledImageLabel, path: Path | None, empty_text: str
+    ) -> None:
         if path is None:
-            self._clear_image(label, empty_text)
+            label.clear_preview(empty_text)
+            return
+
+        if not path.exists():
+            label.clear_preview("图片不存在")
             return
 
         pixmap = QPixmap(str(path))
-        if not path.exists():
-            self._clear_image(label, "图片不存在")
-            return
         if pixmap.isNull():
-            self._clear_image(label, "无法加载图片预览")
+            label.clear_preview("无法加载图片预览")
             return
 
-        scaled = pixmap.scaled(
-            label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        label.setText("")
-        label.setPixmap(scaled)
+        label.set_preview_pixmap(pixmap, empty_text)
 
     @staticmethod
     def _build_section_title(text: str) -> QLabel:

@@ -7,16 +7,21 @@
 当前根入口文件为 `main.py`：
 
 ```bash
-python main.py --template samples/pdfs/600004075219-01.pdf --target samples/images/produce/type1/600004075219_1.jpg
+.venv/bin/python main.py --template samples/pdfs/600004075219-01.pdf --target samples/images/produce/type1/600004075219_1.jpg
 ```
 
 实际主流程位于 `label_detection/workflows/unified.py`，`main.py` 只是根目录 CLI 包装器。
 
-桌面端入口为：
+桌面端统一启动命令为：
 
 ```bash
-uv run python -m desktop_app.main
+.venv/bin/python -m desktop_app.main
 ```
+
+当前仓库约定：
+
+- 如果仓库根目录已经存在 `.venv`，后续命令统一使用 `.venv/bin/python ...`
+- 不再把 `uv run python ...` 作为默认启动写法，避免新会话里出现两套命令混用
 
 ## 核心流程
 
@@ -74,15 +79,19 @@ project/
 
 ```bash
 uv venv
-uv sync
+uv sync --extra desktop
 ```
 
-这套 `uv` 配置当前固定在 Python 3.12。
-
-如果要启动桌面端，再安装桌面依赖组：
+这套 `uv` 配置当前固定在 Python 3.12。完成同步后，推荐统一使用项目虚拟环境里的 Python：
 
 ```bash
-uv sync --extra desktop
+.venv/bin/python -m desktop_app.main
+```
+
+如果只运行 CLI，也统一使用：
+
+```bash
+.venv/bin/python main.py --template samples/pdfs/600004075219-01.pdf --target samples/images/produce/type1/600004075219_1.jpg
 ```
 
 兼容旧方式时，仍可使用：
@@ -108,11 +117,7 @@ ollama serve
 ollama pull qwen3.5:9b
 ```
 
-如果使用 `uv`，推荐通过 `uv run` 启动命令：
-
-```bash
-uv run python main.py --template samples/pdfs/600004075219-01.pdf --target samples/images/produce/type1/600004075219_1.jpg
-```
+如果 `.venv` 缺失或依赖不完整，先执行 `uv sync --extra desktop`，再回到上面的 `.venv/bin/python ...` 启动方式。
 
 ## 运行参数
 
@@ -139,7 +144,7 @@ uv run python main.py --template samples/pdfs/600004075219-01.pdf --target sampl
 批量测试入口：
 
 ```bash
-python scripts/batch_run_samples.py --dry-run --pair-mode all
+.venv/bin/python scripts/batch_run_samples.py --dry-run --pair-mode all
 ```
 
 默认行为：
@@ -156,16 +161,16 @@ python scripts/batch_run_samples.py --dry-run --pair-mode all
 
 ```bash
 # 只预览将要运行的配对，不真正执行
-python scripts/batch_run_samples.py --dry-run --pair-mode all
+.venv/bin/python scripts/batch_run_samples.py --dry-run --pair-mode all
 
 # 同一编码下，所有模板变体 × 所有实拍变体，全部运行
-python scripts/batch_run_samples.py --pair-mode all
+.venv/bin/python scripts/batch_run_samples.py --pair-mode all
 
 # 同一编码下，只选一个最优模板变体，再配对全部实拍变体
-python scripts/batch_run_samples.py --pair-mode best-template
+.venv/bin/python scripts/batch_run_samples.py --pair-mode best-template
 
 # 只运行指定编码的所有组合
-python scripts/batch_run_samples.py --code 600004075219 --pair-mode all
+.venv/bin/python scripts/batch_run_samples.py --code 600004075219 --pair-mode all
 ```
 
 参数说明：
