@@ -43,38 +43,40 @@ class VLMComparator:
 # class VLMComparator:
     """使用 Qwen3-VL (Ollama) 进行图形对比的类"""
 
-    # 优化后的提示词模板
-    PROMPT_TEMPLATE = """你是图形一致性判定器。
-你将看到左右两张局部图形区域图：左图是 Template，右图是 Target。
+    PROMPT_TEMPLATE = """You are a graphic consistency judge.
+You will see two local graphic-region crops side by side:
+- left: Template
+- right: Target
 
-判定目标：
-只比较前景图标/符号本身是否一致。
-不要把以下因素视为差异：
-- 裁剪位置偏移
-- 留白差异
-- 轻微模糊
-- 亮度或颜色变化
-- 小于15%的缩放差异
-- 条形码、二维码、条码下方数字或纯编码区域
+Task:
+Compare only the foreground icon, symbol, logo, mark, QR code, barcode, or other non-text graphic content.
 
-重点检查：
-1. 图标数量是否一致
-2. 是否有缺失或多余图标
-3. 图标主体形状是否明显不同
+Do NOT treat these as differences:
+- crop offset or different whitespace
+- slight blur, compression artifacts, lighting, contrast, or color changes
+- scaling differences smaller than 15%
+- line thickness changes caused by printing or camera quality
+- tiny partial strokes at the crop boundary
 
-输出规则（必须严格遵守）：
-1. 只输出一个 JSON 对象，不要输出任何其他文本。
-2. 禁止输出思考过程、解释、分析、推理、注释、Markdown、代码块、标签（例如 <think>）。
-3. JSON 必须且仅包含以下 4 个键：
+Important judgment rules:
+1. Return "match" when the main foreground graphic is the same, even if scale, crop, brightness, or image quality differs.
+2. Return "mismatch" only when the main foreground graphic shapes are clearly different, or one side clearly has an extra/missing complete icon.
+3. Return "unknown" when either crop is too small, truncated, mostly blank, mostly whitespace, or otherwise insufficient for a reliable judgment.
+4. Do not invent object names. If you are not sure what an icon is, judge only by visible shape.
+5. If the region is mainly a barcode, QR code, barcode digits, or a pure code area, output "decision":"match" and set "summary":"barcode_ignored".
+
+Output rules:
+1. Output exactly one JSON object and nothing else.
+2. Do not output thinking, explanations, analysis, reasoning, comments, Markdown, code fences, or tags such as <think>.
+3. The JSON must contain exactly these 4 keys:
    - "decision": "match" | "mismatch" | "unknown"
-   - "confidence": 0.0 到 1.0 的数字
-   - "differences": 字符串数组
-   - "summary": 字符串
-4. 如果区域主体是条形码、二维码、条码数字或纯编码，直接输出 "decision":"match"，并将 "summary" 固定为 "barcode_ignored"。
-5. 如果无法可靠判断，必须输出 "decision": "unknown"，不要猜测。
-6. 当 decision 为 "match" 时，differences 必须是空数组 []。
+   - "confidence": a number from 0.0 to 1.0
+   - "differences": an array of strings
+   - "summary": a string
+4. If decision is "match", differences must be [].
+5. If decision is "unknown", keep confidence at 0.0.
 
-仅输出如下格式的 JSON：
+Output only JSON in this format:
 {"decision":"match|mismatch|unknown","confidence":0.0,"differences":[],"summary":"..."}"""
 
     def __init__(

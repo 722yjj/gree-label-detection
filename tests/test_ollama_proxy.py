@@ -58,5 +58,6 @@ def test_get_llm_sets_no_proxy_before_chatollama_init(monkeypatch):
 
     assert isinstance(llm, FakeChatOllama)
     assert calls["kwargs"]["base_url"] == unified.OLLAMA_API_BASE
+    assert calls["kwargs"]["client_kwargs"] == {"trust_env": False}
     assert "localhost" in calls["no_proxy"]
     assert "127.0.0.1" in calls["no_proxy"]

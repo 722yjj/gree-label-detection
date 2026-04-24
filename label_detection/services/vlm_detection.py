@@ -33,23 +33,23 @@ def _require_cv2():
 class VLMObjectDetector:
     """Use a VLM through Ollama to test prompt-based object detection."""
 
-    PROMPT_TEMPLATE = """你是视觉目标检测器。
-请检测图中与以下描述匹配的目标：
+    PROMPT_TEMPLATE = """You are a visual object detector.
+Detect all objects in the image that match this description:
 {query}
 
-图像尺寸信息：
+Image size:
 - width: {width}
 - height: {height}
 
-输出要求：
-1. 只输出一个 JSON 对象，不要输出任何解释、分析、Markdown、代码块或思考过程。
-2. JSON 结构固定为：
-{{"objects":[{{"label":"目标名","confidence":0.0,"bbox_1000":[x1,y1,x2,y2]}}],"summary":"..."}}
-3. `bbox_1000` 使用相对于整张图像的 0-1000 归一化坐标，格式必须是 [x1, y1, x2, y2]。
-4. x1 < x2，y1 < y2。
-5. 最多返回 {max_objects} 个最确定的目标。
-6. 如果没有检测到目标，返回 {{"objects":[],"summary":"no target found"}}。
-7. 不确定时不要猜测。
+Output rules:
+1. Output exactly one JSON object and nothing else. Do not output explanations, analysis, Markdown, code fences, or thinking text.
+2. The JSON schema is fixed:
+{{"objects":[{{"label":"object name","confidence":0.0,"bbox_1000":[x1,y1,x2,y2]}}],"summary":"..."}}
+3. `bbox_1000` uses normalized 0-1000 coordinates relative to the full image: [x1, y1, x2, y2].
+4. x1 < x2 and y1 < y2.
+5. Return at most {max_objects} highest-confidence objects.
+6. If no target is detected, return {{"objects":[],"summary":"no target found"}}.
+7. If uncertain, do not guess.
 """
 
     def __init__(

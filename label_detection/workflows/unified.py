@@ -29,6 +29,7 @@ from label_detection.core.config import (
     USE_VLM_FOR_GRAPHIC,
     ENABLE_IMAGE_REGION_SPLIT,
     ensure_local_ollama_no_proxy,
+    is_local_ollama,
 )
 from label_detection.core.paddle_runtime import paddle_cache_cleanup_scope
 from label_detection.extraction.template_source import resolve_template_input
@@ -114,11 +115,13 @@ def get_llm():
         ensure_local_ollama_no_proxy(OLLAMA_API_BASE)
         from langchain_ollama import ChatOllama
 
+        client_kwargs = {"trust_env": False} if is_local_ollama(OLLAMA_API_BASE) else {}
         _llm = ChatOllama(
             model=OLLAMA_MODEL,
             base_url=OLLAMA_API_BASE,
             temperature=0,
             num_predict=VLM_NUM_PREDICT,
+            client_kwargs=client_kwargs,
         )
     return _llm
 
@@ -178,43 +181,59 @@ def preprocess_template_image(template_path, output_dir=DEFAULT_OUTPUT_DIR):
 
 def _build_extraction_prompt(label_kind: str, ocr_text: str) -> str:
     if label_kind == LABEL_KIND_COMPACT:
-        return f"""【任务】：提取图中紧凑型标签的文字信息
+        return f"""Task: extract structured text from a compact product label image.
 
-【参考 OCR 文本】：
+Reference OCR text:
 {ocr_text}
 
-【字段定义】：
-- model_number: 型号
-- net_weight: N.W.
-- gross_weight: G.W.
-- color: Color
-- connection_pipes: Connection Pipes
-- refrigerant: Refrigerant
-- barcode: 条形码下方的数字
+Fields:
+- model_number: the Model value.
+- net_weight: the N.W. / Net Weight value.
+- gross_weight: the G.W. / Gross Weight value.
+- color: the Color value.
+- connection_pipes: the Connection Pipes value.
+- refrigerant: the Refrigerant value.
+- barcode: the digits printed below the barcode.
 
-【提取规则】：
-1. 优先根据图片视觉内容提取，OCR 只用于纠错。
-2. 只输出上面 7 个字段；没有就填 null。
-3. 保留原始文本，不要补充不存在的字段。
-4. 必须输出纯标准 JSON，不要包含 Markdown 代码块或解释。
+Extraction rules:
+1. Read the image first. Use the OCR text only as a spelling/digit reference when the image is hard to read.
+2. Preserve the exact printed value as much as possible. Do not translate, normalize units, calculate values, or correct apparent printing/OCR defects.
+3. Output exactly these 7 keys. If a field is not visible or not present, set it to null.
+4. Output one valid JSON object only. Do not output Markdown, code fences, explanations, analysis, or thinking text.
 
-【输出示例】：
+Example output:
 {{"model_number":"GWH24AGD-K6DNA1C/I(WIFI)","net_weight":"14kg","gross_weight":"16.5kg","color":"White","connection_pipes":"1/4\\"/1/2\\"","refrigerant":"R32","barcode":"600001076226"}}"""
 
-    return f"""【任务】：提取图中标签的文字信息
+    return f"""Task: extract structured text from the air-conditioner product label image.
 
-【参考信息】：
-为了防止你看不清小字，我已经使用 OCR 技术识别了图中的文字，内容如下（可能存在乱序，仅供参考拼写和数字）：
+Reference OCR text:
+The OCR text below may be unordered or noisy. Use it only as a reference for small characters, spelling, and digits:
 {ocr_text}
 
-【提取规则】：
-1. 优先根据图片视觉内容提取,保留文字原始信息,不做任何修改。
-2. 如果图片看不清，参考 OCR 文本。
-3. 如果找不到某项，保持为 null。
-4. 必须输出纯标准的 JSON 格式，不要包含 Markdown 代码块。
-5. 只输出最后的JSON字符串，不要包含任何其他解释性文本和思考过程。
+Fields to output:
+- brand
+- product_type
+- model_number
+- voltage
+- frequency
+- heating_capacity
+- cooling_capacity
+- air_volume
+- weight
+- noise
+- mfg_date
+- manufacturer
+- address
+- barcode
 
-【输出示例】：
+Extraction rules:
+1. Read the image first. Use OCR only when the image text is hard to read.
+2. Preserve the exact printed text and value as much as possible, including unusual punctuation, duplicated letters, malformed dates, or apparent defects.
+3. Do not translate, normalize units, calculate values, infer expected values, or correct spelling/printing defects.
+4. If a field cannot be found in the image or OCR reference, set it to null.
+5. Output exactly one valid JSON object and nothing else. Do not output Markdown, code fences, explanations, analysis, or thinking text.
+
+Example output:
 {{"brand":"GREE","product_type":"SPLIT AIR CONDITIONER INDOOR UNIT","model_number":"GWH18AAD-K6DNA2E/I","voltage":"220-240V~","frequency":"50Hz","heating_capacity":"5.20kW","cooling_capacity":"4.60kW","air_volume":"850m³/h","weight":"13.5kg","noise":"46dB(A)","mfg_date":"2026.01","manufacturer":"GREE ELECTRIC APPLIANCES,INC.OF ZHUHAI","address":"Add: West Jinji Rd, Qianshan, Zhuhai, Guangdong, China, 519070","barcode":"600004075219"}}"""
 
 

@@ -39,21 +39,21 @@ VLM_MODEL = OLLAMA_MODEL
 VLM_API_BASE = OLLAMA_API_BASE
 VLM_TIMEOUT_SECONDS = VLM_TIMEOUT
 
-VLM_REGION_PROMPT = f"""你是版面图形区域检测器。
-目标：请在整张标签图中找出所有与版面检测模型 image 区域尽量对应的“图形区域”。
+VLM_REGION_PROMPT = f"""You are a layout graphic-region detector.
+Goal: find all graphic regions in the full label image that should correspond to layout-model `image` regions.
 
-这里的“图形区域 / image region”定义为：
-- 图标、认证标志、LOGO、二维码、条形码、示意图、图片块等非纯文本区域
-- 可以包含少量附带文字，但主体必须是图形/图片/编码块
-- 不要把纯文字段落、纯数字行、表格线、边框、空白区域当成图形区域
+Definition of a graphic region / image region:
+- icons, certification marks, logos, QR codes, barcodes, diagrams, picture blocks, or other non-text visual regions
+- a region may include a small amount of attached text, but the main content must be a graphic, image, or code block
+- do not mark pure text paragraphs, pure number lines, table lines, borders, or blank areas as graphic regions
 
-输出要求：
-1. 只输出一个 JSON 对象，不要输出任何解释、分析、Markdown、代码块或思考过程。
-2. JSON 结构固定为：
+Output rules:
+1. Output exactly one JSON object and nothing else. Do not output explanations, analysis, Markdown, code fences, or thinking text.
+2. The JSON schema is fixed:
 {{"regions":[{{"label":"image","confidence":0.0,"bbox_1000":[x1,y1,x2,y2]}}],"summary":"..."}}
-3. bbox_1000 使用相对于整张图像的 0-1000 归一化坐标，格式必须是 [x1, y1, x2, y2]。
-4. 最多返回 {MAX_VLM_REGIONS} 个最确定的区域。
-5. 不确定时不要猜测；如果没有检测到，返回 {{"regions":[],"summary":"no image region found"}}。
+3. `bbox_1000` uses normalized 0-1000 coordinates relative to the full image: [x1, y1, x2, y2].
+4. Return at most {MAX_VLM_REGIONS} highest-confidence regions.
+5. If uncertain, do not guess. If no image region is detected, return {{"regions":[],"summary":"no image region found"}}.
 """
 
 
