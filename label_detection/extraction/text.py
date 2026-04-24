@@ -28,6 +28,31 @@ def _strip_inner_spaces(value: str | None) -> str | None:
     return re.sub(r"\s+", "", value)
 
 
+def _compact_value(value: object) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    return re.sub(r"\s+", "", text)
+
+
+def _llm_value_completes_ocr_value(rule_val: object, llm_val: object) -> bool:
+    """
+    Return whether the LLM value appears to be the OCR value plus a short suffix.
+
+    This preserves OCR anchors for real printed defects, but avoids dropping
+    trailing symbols such as the `~` in `220-240V~` when OCR clipped them.
+    """
+    rule_text = _compact_value(rule_val)
+    llm_text = _compact_value(llm_val)
+    if not rule_text or not llm_text:
+        return False
+    if len(llm_text) <= len(rule_text):
+        return False
+    if not llm_text.casefold().startswith(rule_text.casefold()):
+        return False
+
+    suffix = llm_text[len(rule_text) :]
+    return 0 < len(suffix) <= 4
+
+
 def _search_label_value(label_pattern: str, value_pattern: str, text: str) -> str | None:
     return _search_group(
         rf"{label_pattern}\s*[:：]?\s*[\r\n ]*({value_pattern})",
@@ -321,7 +346,12 @@ def merge_standard_sources(
     for field_name in field_names:
         rule_val = rule_data.get(field_name)
         llm_val = llm_data.get(field_name)
-        if field_name in STANDARD_OCR_ANCHOR_FIELDS and rule_val not in (None, "", "None"):
+        if (
+            field_name in STANDARD_OCR_ANCHOR_FIELDS
+            and _llm_value_completes_ocr_value(rule_val, llm_val)
+        ):
+            merged[field_name] = llm_val
+        elif field_name in STANDARD_OCR_ANCHOR_FIELDS and rule_val not in (None, "", "None"):
             merged[field_name] = rule_val
         elif llm_val in (None, "", "None") and rule_val not in (None, "", "None"):
             merged[field_name] = rule_val

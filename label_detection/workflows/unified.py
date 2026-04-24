@@ -52,6 +52,7 @@ from label_detection.matching.layout import (
     split_composite_image_regions,
     merge_fragmented_split_regions,
     filter_split_image_regions,
+    recover_uncovered_graphic_regions,
     infer_corresponding_region,
     estimate_region_foreground_ratio,
 )
@@ -510,6 +511,7 @@ def _make_unresolved_recovery_result(
     source_idx: int,
     reason: str,
     inferred_region: Dict | None,
+    source_region: Dict | None = None,
     foreground_ratio: float | None = None,
     exc: Exception | None = None,
 ) -> Dict:
@@ -520,7 +522,21 @@ def _make_unresolved_recovery_result(
         subject = f"模板未匹配区域 #{source_idx}"
         side_hint = "疑似实拍缺失图形，或实拍侧漏检"
 
-    if reason == "inference_failed":
+    is_recovered_target_extra = (
+        source_side == "实拍"
+        and source_region is not None
+        and source_region.get("recovered_uncovered_graphic") is True
+    )
+
+    if reason == "inference_failed" and is_recovered_target_extra:
+        summary = f"{subject} 是补检出的实拍图形，无法推理对应模板区域，判定实拍多出图形"
+        error_type = "recovery_extra_target_graphic"
+        decision = "mismatch"
+        confidence = 0.90
+        needs_review = False
+        judgment_source = "recovery_uncovered_target_graphic"
+        unresolved_unmatched = False
+    elif reason == "inference_failed":
         summary = f"{subject} 无法推理对应区域，{side_hint}"
         error_type = "recovery_inference_failed"
         decision = "unknown"
@@ -653,6 +669,7 @@ def _recover_unmatched_regions(
                     source_idx=source_idx,
                     reason="inference_failed",
                     inferred_region=None,
+                    source_region=source_region,
                 )
             )
             return
@@ -668,6 +685,7 @@ def _recover_unmatched_regions(
                     source_idx=source_idx,
                     reason="low_foreground",
                     inferred_region=inferred_region,
+                    source_region=source_region,
                     foreground_ratio=foreground_ratio,
                 )
             )
@@ -696,6 +714,7 @@ def _recover_unmatched_regions(
                     source_idx=source_idx,
                     reason="compare_error",
                     inferred_region=inferred_region,
+                    source_region=source_region,
                     foreground_ratio=foreground_ratio,
                     exc=exc,
                 )
@@ -982,6 +1001,8 @@ def run_unified_detection(
         split_target_regions: List[Dict] = []
         skipped_split_template_regions: List[Dict] = []
         skipped_split_target_regions: List[Dict] = []
+        recovered_uncovered_template_regions: List[Dict] = []
+        recovered_uncovered_target_regions: List[Dict] = []
         template_regions, skipped_template_regions = split_barcode_regions(
             template_regions,
             template_cropped,
@@ -1015,6 +1036,22 @@ def run_unified_detection(
                 target_cropped,
                 target_boxes,
             )
+            template_regions, recovered_uncovered_template_regions = (
+                recover_uncovered_graphic_regions(
+                    template_regions,
+                    template_cropped,
+                    template_boxes,
+                    ignored_regions=skipped_template_regions + skipped_split_template_regions,
+                )
+            )
+            target_regions, recovered_uncovered_target_regions = (
+                recover_uncovered_graphic_regions(
+                    target_regions,
+                    target_cropped,
+                    target_boxes,
+                    ignored_regions=skipped_target_regions + skipped_split_target_regions,
+                )
+            )
 
         print(
             "  - 模板图片区域: "
@@ -1037,6 +1074,12 @@ def run_unified_detection(
                 f"模板跳过 {len(skipped_split_template_regions)} 个子框, "
                 f"实拍跳过 {len(skipped_split_target_regions)} 个子框"
             )
+            if recovered_uncovered_template_regions or recovered_uncovered_target_regions:
+                print(
+                    "  - 未覆盖图形补检: "
+                    f"模板补检 {len(recovered_uncovered_template_regions)} 个, "
+                    f"实拍补检 {len(recovered_uncovered_target_regions)} 个"
+                )
 
         # 3.2 区域匹配
         print("\n[3.2] 匹配对应区域...")
@@ -1195,6 +1238,8 @@ def run_unified_detection(
             "split_target_regions": split_target_regions,
             "skipped_split_template_regions": skipped_split_template_regions,
             "skipped_split_target_regions": skipped_split_target_regions,
+            "recovered_uncovered_template_regions": recovered_uncovered_template_regions,
+            "recovered_uncovered_target_regions": recovered_uncovered_target_regions,
             "recovered_template_regions": recovered_template_regions,
             "recovered_target_regions": recovered_target_regions,
             "remaining_unmatched_template": remaining_unmatched1,

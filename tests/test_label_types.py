@@ -205,6 +205,18 @@ class TestExtractStandardSpecFromText:
         assert merged["heating_capacity"] == "520kW"
         assert merged["weight"] == "13.5kg"
 
+    def test_merge_prefers_llm_when_it_completes_truncated_ocr_anchor(self):
+        rule_data = {"voltage": "220-240V"}
+        llm_data = {"voltage": "220-240V~"}
+
+        merged = merge_standard_sources(
+            rule_data,
+            llm_data,
+            AirConditionerLabel.model_fields.keys(),
+        )
+
+        assert merged["voltage"] == "220-240V~"
+
     def test_merge_uses_ocr_when_llm_returns_nulls(self):
         rule_data = {
             "brand": "GREE",

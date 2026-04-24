@@ -21,6 +21,7 @@ from label_detection.matching.layout import (
     split_composite_image_regions,
     merge_fragmented_split_regions,
     filter_split_image_regions,
+    recover_uncovered_graphic_regions,
     infer_corresponding_region,
 )
 
@@ -474,3 +475,35 @@ class TestSplitRegionPostFilter:
         assert kept[0]["coordinate"] == [40, 60, 110, 150]
         assert len(skipped) == 1
         assert skipped[0]["skip_reason"] == "thin_sliver"
+
+    def test_recover_uncovered_graphic_regions_keeps_low_confidence_symbol_ocr(self):
+        img = np.full((320, 460, 3), 255, dtype=np.uint8)
+
+        # High-confidence OCR text should be masked out.
+        img[30:70, 30:150] = 0
+        text_box = ([[30, 30], [150, 30], [150, 70], [30, 70]], "Model", 0.99)
+
+        # Low-confidence one-character OCR can be a real graphic symbol.
+        img[115:235, 282:298] = 0
+        img[115:235, 306:322] = 0
+        img[115:235, 330:346] = 0
+        symbol_box = ([[270, 100], [360, 100], [360, 250], [270, 250]], "H", 0.25)
+
+        existing = [self._make_region(40, 230, 100, 300)]
+        ignored = [self._make_region(250, 260, 420, 310)]
+
+        regions, recovered = recover_uncovered_graphic_regions(
+            existing,
+            img,
+            [text_box, symbol_box],
+            ignored_regions=ignored,
+        )
+
+        assert len(regions) == 2
+        assert len(recovered) == 1
+        recovered_box = recovered[0]["coordinate"]
+        assert recovered_box[0] <= 282
+        assert recovered_box[1] <= 115
+        assert recovered_box[2] >= 346
+        assert recovered_box[3] >= 235
+        assert recovered[0]["recovered_uncovered_graphic"] is True

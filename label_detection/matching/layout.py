@@ -1356,6 +1356,191 @@ def estimate_region_foreground_ratio(image: np.ndarray, box: Sequence[float]) ->
     return float(foreground.mean())
 
 
+def _ocr_box_should_mask(box_info: Tuple[object, str, float]) -> bool:
+    text = str(box_info[1] or "").strip() if len(box_info) >= 2 else ""
+    try:
+        score = float(box_info[2]) if len(box_info) >= 3 else 1.0
+    except (TypeError, ValueError):
+        score = 1.0
+
+    # Very low-confidence one-character OCR is often a symbol misread as text.
+    return score >= 0.55 or len(text) >= 2
+
+
+def _paint_box(mask: np.ndarray, box: Sequence[float], pad_x: int, pad_y: int) -> None:
+    cv2 = _require_cv2()
+    h, w = mask.shape[:2]
+    x1, y1, x2, y2 = [int(round(float(v))) for v in box]
+    cv2.rectangle(
+        mask,
+        (max(0, x1 - pad_x), max(0, y1 - pad_y)),
+        (min(w, x2 + pad_x), min(h, y2 + pad_y)),
+        0,
+        -1,
+    )
+
+
+def recover_uncovered_graphic_regions(
+    regions: Sequence[Dict],
+    image: np.ndarray,
+    ocr_boxes: Sequence[Tuple[object, str, float]] | None = None,
+    ignored_regions: Sequence[Dict] | None = None,
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Recover isolated graphic regions missed by PP-DocLayoutV3.
+
+    The pass is intentionally conservative: it masks reliable OCR text, already
+    detected graphics, and skipped barcode regions, then searches only the
+    remaining dark connected components.
+    """
+    cv2 = _require_cv2()
+    existing_regions = [dict(region) for region in regions]
+    recovered: List[Dict] = []
+
+    if image is None or image.size == 0:
+        return existing_regions, recovered
+
+    img_h, img_w = image.shape[:2]
+    if image.ndim == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image.copy()
+
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, binary = cv2.threshold(
+        blurred,
+        0,
+        255,
+        cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+    )
+
+    for box_info in ocr_boxes or []:
+        if len(box_info) < 2 or not _ocr_box_should_mask(box_info):
+            continue
+        ocr_box = _poly_to_bbox(box_info[0])
+        width = max(1, int(round(ocr_box[2] - ocr_box[0])))
+        height = max(1, int(round(ocr_box[3] - ocr_box[1])))
+        _paint_box(
+            binary,
+            ocr_box,
+            pad_x=max(6, int(round(width * 0.12))),
+            pad_y=max(6, int(round(height * 0.18))),
+        )
+
+    masked_regions = list(existing_regions) + list(ignored_regions or [])
+    for region in masked_regions:
+        box = region.get("coordinate")
+        if box is None:
+            continue
+        metrics = _box_metrics(box)
+        _paint_box(
+            binary,
+            box,
+            pad_x=max(8, int(round(metrics["width"] * 0.08))),
+            pad_y=max(8, int(round(metrics["height"] * 0.08))),
+        )
+
+    # Remove long table/border rules; vertical bars are kept because they can be
+    # real extra symbols in this label family.
+    horizontal_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (max(40, img_w // 20), 2),
+    )
+    horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel)
+    binary = cv2.subtract(binary, horizontal_lines)
+
+    grouped = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11)),
+    )
+    grouped = cv2.morphologyEx(
+        grouped,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (max(15, min(45, int(round(img_w * 0.016)))), 3),
+        ),
+    )
+
+    contours, _ = cv2.findContours(grouped, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    min_area = max(3000.0, float(img_h * img_w) * 0.00050)
+
+    for contour in contours:
+        x, y, width, height = cv2.boundingRect(contour)
+        area = float(width * height)
+        if area < min_area or width < 18 or height < 24:
+            continue
+
+        if x <= 2 or y <= 2 or x + width >= img_w - 2 or y + height >= img_h - 2:
+            continue
+
+        center_y_ratio = (y + height / 2.0) / max(1.0, img_h)
+        if center_y_ratio < 0.12:
+            continue
+
+        aspect_ratio = width / max(1.0, height)
+        if aspect_ratio > 6.0:
+            continue
+        if aspect_ratio < 0.08 and width < 30:
+            continue
+
+        candidate_box = [int(x), int(y), int(x + width), int(y + height)]
+        local_binary = binary[y : y + height, x : x + width]
+        foreground_ratio = float((local_binary > 0).mean()) if local_binary.size else 0.0
+        if foreground_ratio < 0.025:
+            continue
+
+        overlaps_reliable_text = False
+        for box_info in ocr_boxes or []:
+            if len(box_info) < 2 or not _ocr_box_should_mask(box_info):
+                continue
+            ocr_box = _poly_to_bbox(box_info[0])
+            ocr_area = _box_area(ocr_box)
+            if ocr_area <= 1:
+                continue
+            if _intersection_area(candidate_box, ocr_box) / ocr_area > 0.25:
+                overlaps_reliable_text = True
+                break
+        if overlaps_reliable_text:
+            continue
+
+        overlaps_existing = False
+        for region in masked_regions:
+            region_box = region.get("coordinate")
+            if region_box is None:
+                continue
+            candidate_area = _box_area(candidate_box)
+            if candidate_area <= 1:
+                continue
+            if _intersection_area(candidate_box, region_box) / candidate_area > 0.20:
+                overlaps_existing = True
+                break
+        if overlaps_existing:
+            continue
+
+        is_barcode, barcode_meta = detect_barcode_region(
+            {"coordinate": candidate_box},
+            image,
+            ocr_boxes,
+        )
+        if is_barcode and barcode_meta.get("barcode_digits"):
+            continue
+
+        recovered_region = {
+            "coordinate": candidate_box,
+            "label": "image",
+            "score": 0.0,
+            "recovered_uncovered_graphic": True,
+            "foreground_ratio": foreground_ratio,
+            "barcode_hint": barcode_meta if is_barcode else None,
+        }
+        recovered.append(recovered_region)
+
+    recovered.sort(key=lambda item: (item["coordinate"][1], item["coordinate"][0]))
+    return existing_regions + recovered, recovered
+
+
 def infer_corresponding_region(
     source_region: Dict,
     source_shape: Tuple[int, int],
