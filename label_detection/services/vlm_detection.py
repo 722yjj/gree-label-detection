@@ -16,8 +16,9 @@ except ImportError:  # pragma: no cover - exercised only in minimal test environ
 
 from label_detection.core.config import (
     OLLAMA_API_BASE,
-    OLLAMA_MODEL,
-    VLM_NUM_PREDICT,
+    GRAPHIC_VLM_MODEL,
+    GRAPHIC_NUM_PREDICT,
+    OLLAMA_KEEP_ALIVE,
     VLM_TIMEOUT,
     ensure_local_ollama_no_proxy,
     is_local_ollama,
@@ -59,7 +60,7 @@ Output rules:
         timeout: int | None = None,
         check_model: bool = True,
     ):
-        self.model_name = model_name or OLLAMA_MODEL
+        self.model_name = model_name or GRAPHIC_VLM_MODEL
         self.api_base = (api_base or OLLAMA_API_BASE).rstrip("/")
         self.timeout = timeout or VLM_TIMEOUT
         ensure_local_ollama_no_proxy(self.api_base)
@@ -142,10 +143,12 @@ Output rules:
                     "model": self.model_name,
                     "messages": messages,
                     "stream": False,
+                    "format": "json",
                     "think": False,
+                    "keep_alive": OLLAMA_KEEP_ALIVE,
                     "options": {
                         "temperature": 0,
-                        "num_predict": VLM_NUM_PREDICT,
+                        "num_predict": GRAPHIC_NUM_PREDICT,
                     },
                 },
                 timeout=self.timeout,

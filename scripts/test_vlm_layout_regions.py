@@ -14,7 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import cv2
 
-from label_detection.core.config import OLLAMA_API_BASE, OLLAMA_MODEL, PROJECT_ROOT as REPO_ROOT, VLM_TIMEOUT
+from label_detection.core.config import GRAPHIC_VLM_MODEL, OLLAMA_API_BASE, PROJECT_ROOT as REPO_ROOT, VLM_TIMEOUT
 from label_detection.extraction.pdf import extract_red_box_info
 from label_detection.matching.layout import calculate_iou, detect_layout_regions, draw_regions, extract_regions_by_type
 from label_detection.preprocessing.pipeline import preprocess_target, preprocess_template
@@ -35,7 +35,7 @@ IOU_MATCH_THRESHOLD = 0.30
 MAX_VLM_REGIONS = 12
 
 OUTPUT_DIR = REPO_ROOT / "results" / "vlm_layout_region_test"
-VLM_MODEL = OLLAMA_MODEL
+VLM_MODEL = GRAPHIC_VLM_MODEL
 VLM_API_BASE = OLLAMA_API_BASE
 VLM_TIMEOUT_SECONDS = VLM_TIMEOUT
 

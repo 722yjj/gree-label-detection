@@ -23,9 +23,10 @@ except ImportError:  # pragma: no cover - exercised only in minimal test environ
 
 from label_detection.core.config import (
     OLLAMA_API_BASE,
-    OLLAMA_MODEL,
+    GRAPHIC_VLM_MODEL,
+    GRAPHIC_NUM_PREDICT,
+    OLLAMA_KEEP_ALIVE,
     VLM_TIMEOUT,
-    VLM_NUM_PREDICT,
     VLM_CANVAS_SIZE,
     VLM_MAX_RETRIES,
     ensure_local_ollama_no_proxy,
@@ -93,7 +94,7 @@ Output only JSON in this format:
             api_base: Ollama API 地址（默认从 config 读取）
             timeout: 请求超时时间（秒）
         """
-        self.model_name = model_name or OLLAMA_MODEL
+        self.model_name = model_name or GRAPHIC_VLM_MODEL
         self.api_base = (api_base or OLLAMA_API_BASE).rstrip("/")
         self.timeout = timeout or VLM_TIMEOUT
         ensure_local_ollama_no_proxy(self.api_base)
@@ -260,10 +261,12 @@ Output only JSON in this format:
                         "model": self.model_name,
                         "messages": messages,
                         "stream": False,
+                        "format": "json",
                         "think": False,
+                        "keep_alive": OLLAMA_KEEP_ALIVE,
                         "options": {
                             "temperature": 0,
-                            "num_predict": VLM_NUM_PREDICT,
+                            "num_predict": GRAPHIC_NUM_PREDICT,
                         },
                     },
                     timeout=self.timeout,

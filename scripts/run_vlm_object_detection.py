@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from label_detection.core.config import OLLAMA_API_BASE, OLLAMA_MODEL, PROJECT_ROOT as REPO_ROOT, VLM_TIMEOUT
+from label_detection.core.config import GRAPHIC_VLM_MODEL, OLLAMA_API_BASE, PROJECT_ROOT as REPO_ROOT, VLM_TIMEOUT
 from label_detection.services.vlm_detection import VLMObjectDetector, draw_detections
 
 
@@ -33,7 +33,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=str(DEFAULT_OUTPUT_DIR),
         help="输出目录，默认 results/vlm_object_detection",
     )
-    parser.add_argument("--model", default=OLLAMA_MODEL, help="Ollama 模型名称")
+    parser.add_argument("--model", default=GRAPHIC_VLM_MODEL, help="Ollama 模型名称")
     parser.add_argument("--api-base", default=OLLAMA_API_BASE, help="Ollama API 地址")
     parser.add_argument("--timeout", type=int, default=VLM_TIMEOUT, help="请求超时时间（秒）")
     parser.add_argument("--max-objects", type=int, default=10, help="最多返回多少个目标")

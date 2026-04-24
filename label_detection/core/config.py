@@ -17,14 +17,27 @@ def _env_flag(name: str, default: str) -> bool:
 # ==================== Ollama / VLM 配置 ====================
 OLLAMA_API_BASE = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
-# OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-vl:8b")
+TEXT_LLM_MODEL = os.getenv("TEXT_LLM_MODEL", OLLAMA_MODEL)
+GRAPHIC_VLM_MODEL = os.getenv("GRAPHIC_VLM_MODEL", OLLAMA_MODEL)
 LOCAL_OLLAMA_HOSTS = {"localhost", "127.0.0.1", "::1"}
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
+
+# 文本结构化抽取请求超时（秒）
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "60"))
+
+# 文本结构化抽取最大生成 token 数
+TEXT_NUM_PREDICT = int(os.getenv("TEXT_NUM_PREDICT", "1024"))
 
 # VLM 请求超时（秒）
 VLM_TIMEOUT = int(os.getenv("VLM_TIMEOUT", "120"))
 
-# VLM / LLM 最大生成 token 数
-VLM_NUM_PREDICT = int(os.getenv("VLM_NUM_PREDICT", "8192"))
+# 图形 VLM 最大生成 token 数
+GRAPHIC_NUM_PREDICT = int(
+    os.getenv("GRAPHIC_NUM_PREDICT", os.getenv("VLM_NUM_PREDICT", "256"))
+)
+
+# 兼容旧配置名：现仅表示图形 VLM 的生成 token 上限
+VLM_NUM_PREDICT = GRAPHIC_NUM_PREDICT
 
 # ==================== OCR 配置 ====================
 OCR_LANG = os.getenv("OCR_LANG", "ch")

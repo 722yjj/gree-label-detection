@@ -20,16 +20,15 @@ from pydantic import BaseModel
 from label_detection.core import langchain_compat as _langchain_compat  # noqa: F401
 from label_detection.core.config import (
     OLLAMA_API_BASE,
-    OLLAMA_MODEL,
-    VLM_NUM_PREDICT,
+    TEXT_LLM_MODEL,
+    TEXT_NUM_PREDICT,
+    LLM_TIMEOUT,
     LLM_MAX_RETRIES,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_PDF_PATH,
     DEFAULT_TARGET_PATH,
     USE_VLM_FOR_GRAPHIC,
     ENABLE_IMAGE_REGION_SPLIT,
-    ensure_local_ollama_no_proxy,
-    is_local_ollama,
 )
 from label_detection.core.paddle_runtime import paddle_cache_cleanup_scope
 from label_detection.extraction.template_source import resolve_template_input
@@ -73,6 +72,7 @@ from label_detection.schema import (
 )
 from label_detection.preprocessing.border import crop_to_border, find_template_crop_rect
 from label_detection.preprocessing.pipeline import preprocess_target
+from label_detection.services.ollama_client import OllamaHTTPClient
 from label_detection.services.ocr_service import get_ocr_with_boxes
 
 _llm = None
@@ -109,19 +109,14 @@ class WorkflowOutputOptions:
 
 
 def get_llm():
-    """Lazily initialize the Ollama client when the workflow actually runs."""
+    """Lazily initialize the native Ollama client when the workflow runs."""
     global _llm
     if _llm is None:
-        ensure_local_ollama_no_proxy(OLLAMA_API_BASE)
-        from langchain_ollama import ChatOllama
-
-        client_kwargs = {"trust_env": False} if is_local_ollama(OLLAMA_API_BASE) else {}
-        _llm = ChatOllama(
-            model=OLLAMA_MODEL,
-            base_url=OLLAMA_API_BASE,
-            temperature=0,
-            num_predict=VLM_NUM_PREDICT,
-            client_kwargs=client_kwargs,
+        _llm = OllamaHTTPClient(
+            model_name=TEXT_LLM_MODEL,
+            api_base=OLLAMA_API_BASE,
+            timeout=LLM_TIMEOUT,
+            num_predict=TEXT_NUM_PREDICT,
         )
     return _llm
 
@@ -237,6 +232,37 @@ Example output:
 {{"brand":"GREE","product_type":"SPLIT AIR CONDITIONER INDOOR UNIT","model_number":"GWH18AAD-K6DNA2E/I","voltage":"220-240V~","frequency":"50Hz","heating_capacity":"5.20kW","cooling_capacity":"4.60kW","air_volume":"850m³/h","weight":"13.5kg","noise":"46dB(A)","mfg_date":"2026.01","manufacturer":"GREE ELECTRIC APPLIANCES,INC.OF ZHUHAI","address":"Add: West Jinji Rd, Qianshan, Zhuhai, Guangdong, China, 519070","barcode":"600004075219"}}"""
 
 
+def _extract_json_object(content: str) -> Optional[Dict[str, object]]:
+    text = str(content or "").strip()
+    if not text:
+        return None
+
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    fenced = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text)
+    if fenced:
+        try:
+            parsed = json.loads(fenced.group(1))
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            pass
+
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            parsed, _ = decoder.raw_decode(text[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+
+    return None
+
+
 def _extract_structured_from_text(
     label_kind: str,
     model_cls: Type[BaseModel],
@@ -307,12 +333,8 @@ def run_llm_extraction(
     Returns:
         BaseModel: 结构化数据
     """
-    import json as json_module
-
     if max_retries is None:
         max_retries = LLM_MAX_RETRIES
-
-    from langchain_core.messages import HumanMessage
 
     llm = get_llm()
     b64_img = encode_image(image_path)
@@ -334,26 +356,22 @@ def run_llm_extraction(
         )
 
     final_prompt = _build_extraction_prompt(label_kind, ocr_text)
-
-    msg = HumanMessage(
-        content=[
-            {"type": "text", "text": final_prompt},
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"},
-            },
-        ]
-    )
+    message = {"role": "user", "content": final_prompt}
+    if b64_img:
+        message["images"] = [b64_img]
 
     last_error = None
     for attempt in range(max_retries):
         try:
-            response = llm.invoke([msg])
+            response = llm.chat([message], json_mode=True, think=False)
             content = response.content
 
             # 检查空响应
             if not content or not content.strip():
-                print(f"    ⚠ 第 {attempt+1} 次尝试: LLM 返回空响应，重试...")
+                print(
+                    f"    ⚠ 第 {attempt+1} 次尝试: LLM 返回空响应 "
+                    f"({response.debug_summary()})，重试..."
+                )
                 continue
 
             # [DEBUG] 打印 LLM 返回的原始内容
@@ -361,9 +379,8 @@ def run_llm_extraction(
             print(f"    {content[:500]}")
 
             # 尝试提取 JSON
-            json_match = re.search(r'\{[\s\S]*\}', content)
-            if json_match:
-                res_dict = json_module.loads(json_match.group())
+            res_dict = _extract_json_object(content)
+            if res_dict is not None:
                 data = model_cls(**res_dict)
                 if label_kind == LABEL_KIND_COMPACT and rule_based is not None:
                     merged = merge_compact_sources(
@@ -393,7 +410,10 @@ def run_llm_extraction(
                     return model_cls(**merged)
                 return data
             else:
-                print(f"    ⚠ 第 {attempt+1} 次尝试: 未找到 JSON，重试...")
+                print(
+                    f"    ⚠ 第 {attempt+1} 次尝试: 未找到 JSON "
+                    f"({response.debug_summary()})，重试..."
+                )
                 continue
 
         except Exception as e:

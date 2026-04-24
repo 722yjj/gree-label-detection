@@ -15,11 +15,25 @@ def _clean_match(value: str | None) -> str | None:
     return value or None
 
 
-def _search_group(pattern: str, text: str) -> str | None:
-    match = re.search(pattern, text, re.IGNORECASE)
+def _search_group(pattern: str, text: str, flags: int = re.IGNORECASE) -> str | None:
+    match = re.search(pattern, text, flags)
     if not match:
         return None
     return _clean_match(match.group(1))
+
+
+def _strip_inner_spaces(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return re.sub(r"\s+", "", value)
+
+
+def _search_label_value(label_pattern: str, value_pattern: str, text: str) -> str | None:
+    return _search_group(
+        rf"{label_pattern}\s*[:：]?\s*[\r\n ]*({value_pattern})",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
 
 
 def extract_compact_spec_from_text(ocr_text: object) -> Dict[str, str | None]:
@@ -57,22 +71,86 @@ def extract_compact_spec_from_text(ocr_text: object) -> Dict[str, str | None]:
 
 
 def extract_standard_spec_from_text(ocr_text: object) -> Dict[str, str | None]:
-    """Extract high-confidence standard label anchors directly from OCR text."""
+    """Extract high-confidence standard label fields directly from OCR text."""
 
     text = unicodedata.normalize("NFKC", str(ocr_text or ""))
     compacted = re.sub(r"[ \t]+", " ", text)
+    one_line = re.sub(r"\s+", " ", compacted)
 
     model_candidates = re.findall(r"GWH[0-9A-Z][A-Z0-9\-/]{6,}", compacted, re.IGNORECASE)
-    frequency = _search_group(r"\b([0-9]{2}\s*H+\s*z\.?)\b", compacted)
-    heating_capacity = _search_group(
-        r"Heating\s+Capacity(?:\s+[A-Za-z]){0,2}\s+([0-9]+(?:\.[0-9]+)?\s*kW)",
+    voltage = _search_label_value(
+        r"(?:Rated\s+)?Voltage",
+        r"[0-9OIl]{2,3}\s*[-–]\s*[0-9OIl]{2,3}\s*V\s*~?",
+        compacted,
+    ) or _search_group(
+        r"\b([0-9OIl]{2,3}\s*[-–]\s*[0-9OIl]{2,3}\s*V\s*~?)\b",
         compacted,
     )
+    frequency = _search_label_value(
+        r"(?:Rated\s+)?Frequency",
+        r"[0-9OIl]{2,3}\s*H+\s*z\.?",
+        compacted,
+    ) or _search_group(r"\b([0-9OIl]{2,3}\s*H+\s*z\.?)\b", compacted)
+    capacity_pattern = r"[0-9OIl]+(?:[.,][0-9OIl]+)?\s*k?\s*W"
+    heating_capacity = _search_label_value(
+        r"Heating\s+Capacity(?:\s+[A-Za-z]){0,2}",
+        capacity_pattern,
+        compacted,
+    )
+    cooling_capacity = _search_label_value(
+        r"Cooling\s+Capacity(?:\s+[A-Za-z]){0,2}",
+        capacity_pattern,
+        compacted,
+    )
+    air_volume = _search_label_value(
+        r"Air\s*(?:Flow\s*)?Volume(?:\s+m\s*(?:3|\^3)?\s*/\s*h)?",
+        r"[0-9OIl]+(?:[.,][0-9OIl]+)?\s*m\s*(?:3|\^3)?\s*/\s*h",
+        compacted,
+    )
+    weight = _search_label_value(
+        r"(?<!Net\s)(?<!Gross\s)Weight(?:\s+kg)?",
+        r"[0-9OIl]+(?:[.,-][0-9OIl]+)?\s*kg",
+        compacted,
+    )
+    noise = _search_label_value(
+        r"(?:Sound\s+Pressure\s+Level\s*\(?H\)?|Noise(?:\s+Level)?)(?:\s+dB\s*\(?A\)?)?",
+        r"[0-9OIl]+(?:[.,][0-9OIl]+)?\s*dB\s*\(?A\)?",
+        compacted,
+    )
+    mfg_date = _search_label_value(
+        r"(?:Manufactured|Mfg\.?)\s+Date",
+        r"[A-Z0-9]{4}(?:[.\-/]?[A-Z0-9]{1,4})?",
+        compacted,
+    )
+    product_type = _search_group(
+        r"\b(SPLIT\s+AIR\s+CONDITIONER\s+INDOOR\s+UNIT)\b",
+        one_line,
+    )
+    manufacturer = _search_group(
+        r"\b(GREE\s+ELECTRIC\s+APPLIANCES\s*,?\s*INC\.?\s*OF\s+ZHUHAI)\b",
+        one_line,
+    )
+    address = _search_group(
+        r"\b(Add\s*:?\s*West\s+Jinji\s+Rd\s*,?\s*Qianshan\s*,?\s*Zhuhai\s*,?\s*Guangdong\s*,?\s*China\s*,?\s*519070)\b",
+        one_line,
+    )
+    barcode_candidates = re.findall(r"\b\d{10,13}\b", compacted)
 
     return {
+        "brand": "GREE" if re.search(r"\bGREE\b", one_line, re.IGNORECASE) else None,
+        "product_type": product_type,
         "model_number": max(model_candidates, key=len).upper() if model_candidates else None,
-        "frequency": re.sub(r"\s+", "", frequency) if frequency else None,
-        "heating_capacity": re.sub(r"\s+", "", heating_capacity) if heating_capacity else None,
+        "voltage": _strip_inner_spaces(voltage),
+        "frequency": _strip_inner_spaces(frequency),
+        "heating_capacity": _strip_inner_spaces(heating_capacity),
+        "cooling_capacity": _strip_inner_spaces(cooling_capacity),
+        "air_volume": _strip_inner_spaces(air_volume),
+        "weight": _strip_inner_spaces(weight),
+        "noise": _strip_inner_spaces(noise),
+        "mfg_date": _strip_inner_spaces(mfg_date),
+        "manufacturer": manufacturer,
+        "address": address,
+        "barcode": max(barcode_candidates, key=len) if barcode_candidates else None,
     }
 
 
@@ -212,7 +290,18 @@ def merge_compact_sources(
     return merged
 
 
-STANDARD_OCR_ANCHOR_FIELDS = {"model_number", "frequency", "heating_capacity"}
+STANDARD_OCR_ANCHOR_FIELDS = {
+    "model_number",
+    "voltage",
+    "frequency",
+    "heating_capacity",
+    "cooling_capacity",
+    "air_volume",
+    "weight",
+    "noise",
+    "mfg_date",
+    "barcode",
+}
 
 
 def merge_standard_sources(
@@ -232,11 +321,9 @@ def merge_standard_sources(
     for field_name in field_names:
         rule_val = rule_data.get(field_name)
         llm_val = llm_data.get(field_name)
-        if field_name in STANDARD_OCR_ANCHOR_FIELDS and rule_val not in (
-            None,
-            "",
-            "None",
-        ):
+        if field_name in STANDARD_OCR_ANCHOR_FIELDS and rule_val not in (None, "", "None"):
+            merged[field_name] = rule_val
+        elif llm_val in (None, "", "None") and rule_val not in (None, "", "None"):
             merged[field_name] = rule_val
         else:
             merged[field_name] = llm_val
