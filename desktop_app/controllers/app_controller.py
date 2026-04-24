@@ -36,6 +36,13 @@ def _camera_brightness_label(
     brightness: CameraFrameBrightness,
 ) -> tuple[str, str]:
     mean = brightness.mean
+    if brightness.is_enhanced:
+        suffix = f"已增亮 {brightness.enhancement_factor:.1f}x"
+        if brightness.level == "too_dark":
+            return f"偏暗 {suffix}", "warning"
+        if brightness.level == "dim":
+            return f"略暗 {suffix}", "neutral"
+
     if brightness.level == "too_dark":
         return f"偏暗 {mean:.0f}", "warning"
     if brightness.level == "dim":
@@ -243,7 +250,9 @@ class AppController(QObject):
         captured_path = Path(captured)
         self.view.set_target_image_path(captured_path)
         self.view.show_pending_result()
-        if self._latest_camera_brightness and self._latest_camera_brightness.is_too_dark:
+        if self._latest_camera_brightness and self._latest_camera_brightness.is_enhanced:
+            self.view.set_status("已拍照保存，原始画面偏暗，已使用增亮图检测")
+        elif self._latest_camera_brightness and self._latest_camera_brightness.is_too_dark:
             self.view.set_status(
                 "已拍照保存，但画面偏暗，建议补光或提高曝光后重拍"
             )
@@ -355,11 +364,17 @@ class AppController(QObject):
         if self._camera_workflow_state != CAMERA_PREVIEWING:
             return
 
+        if brightness.is_enhanced:
+            if self._last_camera_brightness_level != "enhanced":
+                self.view.set_status("原始画面偏暗，预览和保存已自动增亮")
+                self._last_camera_brightness_level = "enhanced"
+            return
+
         if brightness.is_too_dark and self._last_camera_brightness_level != "too_dark":
             self.view.set_status("画面偏暗，建议补光或提高曝光后再拍照")
         elif (
             not brightness.is_too_dark
-            and self._last_camera_brightness_level == "too_dark"
+            and self._last_camera_brightness_level in {"too_dark", "enhanced"}
         ):
             self.view.set_status("相机预览中")
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,10 +22,15 @@ class CameraFrameBrightness:
     p95: float
     dark_ratio: float
     level: Literal["too_dark", "dim", "ok"]
+    enhancement_factor: float = 1.0
 
     @property
     def is_too_dark(self) -> bool:
         return self.level == "too_dark"
+
+    @property
+    def is_enhanced(self) -> bool:
+        return self.enhancement_factor > 1.01
 
 
 class CameraPreviewWorker(QObject):
@@ -43,11 +49,17 @@ class CameraPreviewWorker(QObject):
         *,
         interval_ms: int = 100,
         brightness_interval_s: float = 1.0,
+        auto_enhance: bool | None = None,
     ) -> None:
         super().__init__()
         self.camera_adapter = camera_adapter
         self.interval_ms = interval_ms
         self.brightness_interval_s = brightness_interval_s
+        self.auto_enhance = (
+            _get_env_bool("DESKTOP_CAMERA_AUTO_ENHANCE", True)
+            if auto_enhance is None
+            else auto_enhance
+        )
         self._session = None
         self._timer: QTimer | None = None
         self._latest_frame = None
@@ -129,12 +141,15 @@ class CameraPreviewWorker(QObject):
             self.stop_preview()
             return
 
+        brightness = measure_frame_brightness(frame)
+        if self.auto_enhance:
+            frame, brightness = enhance_frame_for_detection(frame, brightness)
+
         self._latest_frame = frame
-        self._emit_brightness_if_needed(frame)
+        self._emit_brightness_if_needed(brightness)
         self.frame_ready.emit(_bgr_frame_to_qimage(frame))
 
-    def _emit_brightness_if_needed(self, frame) -> None:
-        brightness = measure_frame_brightness(frame)
+    def _emit_brightness_if_needed(self, brightness: CameraFrameBrightness) -> None:
         now = time.monotonic()
         should_emit = (
             brightness.level != self._last_brightness_level
@@ -146,6 +161,25 @@ class CameraPreviewWorker(QObject):
         self._last_brightness_level = brightness.level
         self._last_brightness_emit_at = now
         self.frame_brightness_changed.emit(brightness)
+
+
+def enhance_frame_for_detection(
+    frame,
+    brightness: CameraFrameBrightness | None = None,
+):
+    active_brightness = brightness or measure_frame_brightness(frame)
+    factor = _camera_frame_enhancement_factor(active_brightness)
+    if factor <= 1.01:
+        return frame, active_brightness
+
+    enhanced = cv2.convertScaleAbs(frame, alpha=factor, beta=0)
+    return enhanced, CameraFrameBrightness(
+        mean=active_brightness.mean,
+        p95=active_brightness.p95,
+        dark_ratio=active_brightness.dark_ratio,
+        level=active_brightness.level,
+        enhancement_factor=factor,
+    )
 
 
 def measure_frame_brightness(frame) -> CameraFrameBrightness:
@@ -171,6 +205,15 @@ def measure_frame_brightness(frame) -> CameraFrameBrightness:
     )
 
 
+def _camera_frame_enhancement_factor(brightness: CameraFrameBrightness) -> float:
+    if brightness.level == "ok" or brightness.p95 <= 0:
+        return 1.0
+
+    target_p95 = 180.0 if brightness.level == "too_dark" else 165.0
+    factor = target_p95 / max(brightness.p95, 1.0)
+    return min(max(factor, 1.0), 3.0)
+
+
 def _bgr_frame_to_qimage(frame) -> QImage:
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     height, width, channels = rgb.shape
@@ -184,8 +227,16 @@ def _bgr_frame_to_qimage(frame) -> QImage:
     ).copy()
 
 
+def _get_env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "off", "no", "disabled"}
+
+
 __all__ = [
     "CameraFrameBrightness",
     "CameraPreviewWorker",
+    "enhance_frame_for_detection",
     "measure_frame_brightness",
 ]

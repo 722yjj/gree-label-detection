@@ -17,7 +17,10 @@ from desktop_app.controllers.app_controller import AppController
 from desktop_app.devices.scanner.mock import MockScannerAdapter
 from desktop_app.models import DetectionJobResult, TemplateRecord
 from desktop_app.ui.main_window import MainWindow, ScaledImageLabel
-from desktop_app.workers.camera_preview_worker import measure_frame_brightness
+from desktop_app.workers.camera_preview_worker import (
+    enhance_frame_for_detection,
+    measure_frame_brightness,
+)
 
 
 class FakeTemplateRepository:
@@ -309,7 +312,7 @@ def test_camera_preview_photo_save_locks_target_then_next_resumes_preview(tmp_pa
         window.close()
 
 
-def test_camera_preview_warns_when_frame_is_too_dark(tmp_path, qapp):
+def test_camera_preview_enhances_dark_frame_before_preview_and_save(tmp_path, qapp):
     dark_frame = np.full((48, 64, 3), 45, dtype=np.uint8)
     camera_adapter = FakePreviewCameraAdapter(tmp_path, frame=dark_frame)
     window, controller, _repository = build_controller(
@@ -320,15 +323,18 @@ def test_camera_preview_warns_when_frame_is_too_dark(tmp_path, qapp):
 
     try:
         controller.start_camera_preview()
-        wait_until(qapp, lambda: "偏暗" in window.camera_quality_value.text())
+        wait_until(qapp, lambda: "已增亮" in window.camera_quality_value.text())
 
-        assert "偏暗" in window.camera_quality_value.text()
-        assert window.status_value.text() == "画面偏暗，建议补光或提高曝光后再拍照"
+        assert "偏暗 已增亮" in window.camera_quality_value.text()
+        assert window.status_value.text() == "原始画面偏暗，预览和保存已自动增亮"
 
         controller.capture_camera_image()
         wait_until(qapp, lambda: bool(window.target_image_path()))
 
-        assert window.status_value.text() == "已拍照保存，但画面偏暗，建议补光或提高曝光后重拍"
+        saved = cv2.imread(window.target_image_path())
+        assert saved is not None
+        assert float(saved.mean()) > 100.0
+        assert window.status_value.text() == "已拍照保存，原始画面偏暗，已使用增亮图检测"
     finally:
         controller._stop_camera_preview()
         wait_until(qapp, lambda: controller._camera_preview_thread is None)
@@ -343,6 +349,15 @@ def test_measure_frame_brightness_classifies_dark_and_normal_frames():
     assert dark.is_too_dark is True
     assert normal.level == "ok"
     assert normal.is_too_dark is False
+
+
+def test_enhance_frame_for_detection_scales_dark_frame_to_readable_range():
+    frame = np.full((12, 16, 3), 55, dtype=np.uint8)
+    enhanced, brightness = enhance_frame_for_detection(frame)
+
+    assert brightness.is_enhanced is True
+    assert brightness.enhancement_factor > 1.0
+    assert float(enhanced.mean()) > 120.0
 
 
 def test_detection_result_keeps_locked_image_until_next_target(tmp_path, qapp):
