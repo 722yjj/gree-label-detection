@@ -35,8 +35,10 @@ from label_detection.extraction.template_source import resolve_template_input
 from label_detection.extraction.text import (
     count_populated_fields,
     extract_compact_spec_from_text,
+    extract_standard_spec_from_text,
     find_missing_fields,
     merge_compact_sources,
+    merge_standard_sources,
     needs_compact_llm,
     find_suspicious_fields,
 )
@@ -62,7 +64,12 @@ from label_detection.matching.ocr import (
     make_label_field_name,
     text_field_values_match,
 )
-from label_detection.schema import LABEL_KIND_COMPACT, get_label_model, infer_label_kind
+from label_detection.schema import (
+    LABEL_KIND_COMPACT,
+    LABEL_KIND_STANDARD,
+    get_label_model,
+    infer_label_kind,
+)
 from label_detection.preprocessing.border import crop_to_border, find_template_crop_rect
 from label_detection.preprocessing.pipeline import preprocess_target
 from label_detection.services.ocr_service import get_ocr_with_boxes
@@ -291,6 +298,11 @@ def run_llm_extraction(
     llm = get_llm()
     b64_img = encode_image(image_path)
     rule_based = _extract_structured_from_text(label_kind, model_cls, ocr_text)
+    standard_rule_based = (
+        extract_standard_spec_from_text(ocr_text)
+        if label_kind == LABEL_KIND_STANDARD
+        else None
+    )
     if label_kind == LABEL_KIND_COMPACT and rule_based is not None:
         field_names = list(model_cls.model_fields.keys())
         if not needs_compact_llm(rule_based, field_names):
@@ -345,6 +357,21 @@ def run_llm_extraction(
                         f"{count_populated_fields(merged)}"
                     )
                     return model_cls(**merged)
+                if (
+                    label_kind == LABEL_KIND_STANDARD
+                    and standard_rule_based is not None
+                    and count_populated_fields(standard_rule_based) > 0
+                ):
+                    merged = merge_standard_sources(
+                        standard_rule_based,
+                        data.model_dump(),
+                        model_cls.model_fields.keys(),
+                    )
+                    print(
+                        "    [OCR锚点+LLM] 标准标签保留 OCR 锚点: "
+                        f"{count_populated_fields(standard_rule_based)}"
+                    )
+                    return model_cls(**merged)
                 return data
             else:
                 print(f"    ⚠ 第 {attempt+1} 次尝试: 未找到 JSON，重试...")
@@ -359,6 +386,13 @@ def run_llm_extraction(
     if label_kind == LABEL_KIND_COMPACT and rule_based is not None:
         print("    [规则提取] LLM 补洞失败，回退规则结果")
         return model_cls(**rule_based)
+    if (
+        label_kind == LABEL_KIND_STANDARD
+        and standard_rule_based is not None
+        and count_populated_fields(standard_rule_based) > 0
+    ):
+        print("    [OCR锚点] LLM 提取失败，回退标准标签 OCR 锚点")
+        return model_cls(**standard_rule_based)
     print(f"    ✗ LLM 提取失败，使用空数据")
     return model_cls()
 

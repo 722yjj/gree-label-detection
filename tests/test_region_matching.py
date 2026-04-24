@@ -421,6 +421,27 @@ class TestSplitRegionPostFilter:
         assert len(skipped) == 3
         assert all(item["skip_reason"] == "barcode_cluster" for item in skipped)
 
+    def test_filter_split_image_regions_keeps_graphic_next_to_barcode_cluster(self):
+        img = np.full((240, 500, 3), 255, dtype=np.uint8)
+        img[104:146, 274:326] = 0
+        img[116:134, 260:340] = 0
+        for x in range(350, 486, 7):
+            img[96:152, x : x + 3] = 0
+
+        parent = [250, 88, 492, 160]
+        regions = [
+            self._make_region(260, 96, 340, 152, parent_box=parent, child_idx=0),
+            self._make_region(350, 96, 430, 152, parent_box=parent, child_idx=1),
+            self._make_region(440, 96, 488, 152, parent_box=parent, child_idx=2),
+        ]
+
+        kept, skipped = filter_split_image_regions(regions, img, None)
+
+        assert len(kept) == 1
+        assert kept[0]["coordinate"] == [260, 96, 340, 152]
+        assert len(skipped) == 2
+        assert all(item["skip_reason"] == "barcode_cluster" for item in skipped)
+
     def test_filter_split_image_regions_skips_thin_sliver_child(self):
         img = np.full((220, 360, 3), 255, dtype=np.uint8)
         parent = [20, 40, 270, 190]

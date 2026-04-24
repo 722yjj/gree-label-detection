@@ -1009,6 +1009,47 @@ def _looks_like_barcode_cluster(
     )
 
 
+def _split_child_looks_like_barcode_fragment(
+    region: Dict,
+    parent_box: Sequence[float],
+    image: np.ndarray,
+) -> bool:
+    """Check whether one child from a barcode-like parent is itself barcode texture."""
+    img_h, img_w = image.shape[:2]
+    px1, py1, px2, py2 = [int(round(float(v))) for v in parent_box]
+    px1 = max(0, min(px1, img_w))
+    px2 = max(0, min(px2, img_w))
+    py1 = max(0, min(py1, img_h))
+    py2 = max(0, min(py2, img_h))
+    parent_crop = image[py1:py2, px1:px2]
+    if parent_crop.size == 0:
+        return False
+
+    cx1, cy1, cx2, cy2 = [int(round(float(v))) for v in region["coordinate"]]
+    local_box = [
+        max(0, min(cx1 - px1, parent_crop.shape[1])),
+        max(0, min(cy1 - py1, parent_crop.shape[0])),
+        max(0, min(cx2 - px1, parent_crop.shape[1])),
+        max(0, min(cy2 - py1, parent_crop.shape[0])),
+    ]
+    if local_box[2] <= local_box[0] or local_box[3] <= local_box[1]:
+        return False
+
+    meta = _describe_local_box_barcode_features(local_box, parent_crop)
+    metrics = _box_metrics(local_box)
+    stripe_texture = (
+        meta["transition_density"] >= 0.05
+        and meta["vertical_bias"] >= 3.0
+        and 0.08 <= meta["dark_column_ratio"] <= 0.90
+    )
+    barcode_geometry = (
+        metrics["aspect_ratio"] >= 1.35
+        or metrics["aspect_ratio"] <= 1.10
+        or meta["width_ratio"] >= 0.12
+    )
+    return bool(stripe_texture and barcode_geometry)
+
+
 def _classify_split_fragment(
     region: Dict,
     min_child_area_ratio: float,
@@ -1070,9 +1111,10 @@ def filter_split_image_regions(
         region_copy = dict(region)
         parent_box = region_copy.get("split_parent_coordinate")
         if parent_box is not None and _box_key(parent_box) in barcode_like_parents:
-            region_copy["skip_reason"] = "barcode_cluster"
-            skipped.append(region_copy)
-            continue
+            if _split_child_looks_like_barcode_fragment(region_copy, parent_box, image):
+                region_copy["skip_reason"] = "barcode_cluster"
+                skipped.append(region_copy)
+                continue
 
         skip_reason = _classify_split_fragment(
             region_copy,

@@ -56,6 +56,26 @@ def extract_compact_spec_from_text(ocr_text: object) -> Dict[str, str | None]:
     }
 
 
+def extract_standard_spec_from_text(ocr_text: object) -> Dict[str, str | None]:
+    """Extract high-confidence standard label anchors directly from OCR text."""
+
+    text = unicodedata.normalize("NFKC", str(ocr_text or ""))
+    compacted = re.sub(r"[ \t]+", " ", text)
+
+    model_candidates = re.findall(r"GWH[0-9A-Z][A-Z0-9\-/]{6,}", compacted, re.IGNORECASE)
+    frequency = _search_group(r"\b([0-9]{2}\s*H+\s*z\.?)\b", compacted)
+    heating_capacity = _search_group(
+        r"Heating\s+Capacity(?:\s+[A-Za-z]){0,2}\s+([0-9]+(?:\.[0-9]+)?\s*kW)",
+        compacted,
+    )
+
+    return {
+        "model_number": max(model_candidates, key=len).upper() if model_candidates else None,
+        "frequency": re.sub(r"\s+", "", frequency) if frequency else None,
+        "heating_capacity": re.sub(r"\s+", "", heating_capacity) if heating_capacity else None,
+    }
+
+
 def count_populated_fields(data: Dict[str, object]) -> int:
     return sum(1 for value in data.values() if value not in (None, "", "None"))
 
@@ -189,4 +209,35 @@ def merge_compact_sources(
         else:
             merged[field_name] = llm_val or rule_val
 
+    return merged
+
+
+STANDARD_OCR_ANCHOR_FIELDS = {"model_number", "frequency", "heating_capacity"}
+
+
+def merge_standard_sources(
+    rule_data: Dict[str, object],
+    llm_data: Dict[str, object],
+    field_names: Iterable[str],
+) -> Dict[str, object]:
+    """
+    Merge standard-label OCR anchors with LLM extraction.
+
+    The LLM is useful for layout understanding, but it can autocorrect actual
+    printed defects such as "50HHz" into the expected value "50Hz". For a small
+    set of high-confidence OCR anchors, preserve the OCR text when present.
+    """
+
+    merged: Dict[str, object] = {}
+    for field_name in field_names:
+        rule_val = rule_data.get(field_name)
+        llm_val = llm_data.get(field_name)
+        if field_name in STANDARD_OCR_ANCHOR_FIELDS and rule_val not in (
+            None,
+            "",
+            "None",
+        ):
+            merged[field_name] = rule_val
+        else:
+            merged[field_name] = llm_val
     return merged

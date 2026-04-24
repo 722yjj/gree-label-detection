@@ -6,12 +6,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from label_detection.extraction.text import (
     count_populated_fields,
     extract_compact_spec_from_text,
+    extract_standard_spec_from_text,
     find_missing_fields,
     find_suspicious_fields,
     merge_compact_sources,
+    merge_standard_sources,
     needs_compact_llm,
 )
 from label_detection.schema import (
+    AirConditionerLabel,
     LABEL_KIND_COMPACT,
     LABEL_KIND_STANDARD,
     CompactSpecLabel,
@@ -114,3 +117,47 @@ class TestExtractCompactSpecFromText:
         assert merged["gross_weight"] == "16.5kg"
         assert merged["connection_pipes"] == '1/4"/1/2"'
         assert merged["refrigerant"] == "R32"
+
+
+class TestExtractStandardSpecFromText:
+    def test_extracts_standard_anchors_without_correcting_defects(self):
+        text = """
+        SPLIT AIR CONDITIONER INDOOR UNIT
+        Model GWH18AAD-K6DNA2E/I
+        Rated Frequency
+        50HHz
+        Heating Capacity
+        520kW
+        """
+
+        extracted = extract_standard_spec_from_text(text)
+
+        assert extracted["model_number"] == "GWH18AAD-K6DNA2E/I"
+        assert extracted["frequency"] == "50HHz"
+        assert extracted["heating_capacity"] == "520kW"
+
+    def test_merge_preserves_ocr_anchor_when_llm_autocorrects(self):
+        rule_data = {
+            "model_number": "GWH118AAD-K6DNA2E/I",
+            "frequency": "50HHz",
+            "heating_capacity": "520kW",
+        }
+        llm_data = {
+            "brand": "GREE",
+            "model_number": "GWH18AAD-K6DNA2E/I",
+            "frequency": "50Hz",
+            "heating_capacity": "5.20kW",
+            "weight": "13.5kg",
+        }
+
+        merged = merge_standard_sources(
+            rule_data,
+            llm_data,
+            AirConditionerLabel.model_fields.keys(),
+        )
+
+        assert merged["brand"] == "GREE"
+        assert merged["model_number"] == "GWH118AAD-K6DNA2E/I"
+        assert merged["frequency"] == "50HHz"
+        assert merged["heating_capacity"] == "520kW"
+        assert merged["weight"] == "13.5kg"
