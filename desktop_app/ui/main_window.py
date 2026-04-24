@@ -127,6 +127,8 @@ class MainWindow(QMainWindow):
         self.target_path_input.setReadOnly(True)
         self.camera_backend_value = QLabel("相机：-")
         self.camera_backend_value.setObjectName("cameraBackend")
+        self.camera_quality_value = QLabel("画面：-")
+        self.camera_quality_value.setObjectName("cameraQuality")
         self.browse_button = QPushButton("选择图片")
         self.capture_button = QPushButton("拍照保存")
         self.next_button = QPushButton("下一张")
@@ -200,6 +202,7 @@ class MainWindow(QMainWindow):
         toolbar_layout.setSpacing(10)
         toolbar_layout.addWidget(self._build_section_title("目标图"))
         toolbar_layout.addWidget(self.camera_backend_value)
+        toolbar_layout.addWidget(self.camera_quality_value)
         self.target_path_input.setPlaceholderText("尚未选择目标图片")
         toolbar_layout.addWidget(self.target_path_input, 1)
         toolbar_layout.addWidget(self.browse_button)
@@ -486,6 +489,14 @@ class MainWindow(QMainWindow):
                 font-weight: 700;
                 padding: 6px 10px;
             }
+            QLabel#cameraQuality {
+                background: #eef2f6;
+                border: 1px solid #d7dee7;
+                border-radius: 8px;
+                color: #334e68;
+                font-weight: 700;
+                padding: 6px 10px;
+            }
             #resultHeader {
                 background: #e7f4ee;
                 border: 1px solid #b8dfca;
@@ -624,6 +635,33 @@ class MainWindow(QMainWindow):
 
     def set_camera_backend_name(self, name: str) -> None:
         self.camera_backend_value.setText(f"相机：{name or '-'}")
+
+    def set_camera_quality(self, value: str, severity: str = "neutral") -> None:
+        self.camera_quality_value.setText(f"画面：{value or '-'}")
+        if severity == "warning":
+            self.camera_quality_value.setStyleSheet(
+                "background: #fff4df; border: 1px solid #f5d28a; "
+                "border-radius: 8px; color: #9a5b00; font-weight: 700; "
+                "padding: 6px 10px;"
+            )
+        elif severity == "error":
+            self.camera_quality_value.setStyleSheet(
+                "background: #fdecec; border: 1px solid #f3b4b4; "
+                "border-radius: 8px; color: #b42318; font-weight: 700; "
+                "padding: 6px 10px;"
+            )
+        elif severity == "ok":
+            self.camera_quality_value.setStyleSheet(
+                "background: #e7f4ee; border: 1px solid #b8dfca; "
+                "border-radius: 8px; color: #1f7a4f; font-weight: 700; "
+                "padding: 6px 10px;"
+            )
+        else:
+            self.camera_quality_value.setStyleSheet(
+                "background: #eef2f6; border: 1px solid #d7dee7; "
+                "border-radius: 8px; color: #334e68; font-weight: 700; "
+                "padding: 6px 10px;"
+            )
 
     def set_capture_action(self, text: str, enabled: bool) -> None:
         self.capture_button.setText(text)

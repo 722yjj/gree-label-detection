@@ -17,6 +17,7 @@ from desktop_app.controllers.app_controller import AppController
 from desktop_app.devices.scanner.mock import MockScannerAdapter
 from desktop_app.models import DetectionJobResult, TemplateRecord
 from desktop_app.ui.main_window import MainWindow, ScaledImageLabel
+from desktop_app.workers.camera_preview_worker import measure_frame_brightness
 
 
 class FakeTemplateRepository:
@@ -46,10 +47,11 @@ class FakeDetectionService:
 class FakePreviewSession:
     display_name = "fake-preview-camera"
 
-    def __init__(self, output_dir: Path) -> None:
+    def __init__(self, output_dir: Path, frame=None) -> None:
         self.output_dir = output_dir
-        self.frame = np.zeros((48, 64, 3), dtype=np.uint8)
-        self.frame[:, :, 1] = 180
+        if frame is None:
+            frame = np.full((48, 64, 3), 180, dtype=np.uint8)
+        self.frame = frame
         self.closed = False
         self.saved_code = None
 
@@ -69,8 +71,8 @@ class FakePreviewSession:
 class FakePreviewCameraAdapter:
     name = "fake-preview-camera"
 
-    def __init__(self, output_dir: Path) -> None:
-        self.session = FakePreviewSession(output_dir)
+    def __init__(self, output_dir: Path, frame=None) -> None:
+        self.session = FakePreviewSession(output_dir, frame=frame)
 
     def start_preview(self):
         return self.session
@@ -208,6 +210,19 @@ def test_main_window_displays_camera_backend_name(qapp):
         window.close()
 
 
+def test_main_window_displays_camera_quality(qapp):
+    window = MainWindow()
+    window.show()
+    qapp.processEvents()
+
+    try:
+        window.set_camera_quality("偏暗 53", "warning")
+
+        assert window.camera_quality_value.text() == "画面：偏暗 53"
+    finally:
+        window.close()
+
+
 def test_run_detection_uses_output_mode_toggle(tmp_path, qapp):
     window, controller, _repository = build_controller(tmp_path, qapp)
     captured_requests = []
@@ -292,6 +307,42 @@ def test_camera_preview_photo_save_locks_target_then_next_resumes_preview(tmp_pa
         controller._stop_camera_preview()
         wait_until(qapp, lambda: controller._camera_preview_thread is None)
         window.close()
+
+
+def test_camera_preview_warns_when_frame_is_too_dark(tmp_path, qapp):
+    dark_frame = np.full((48, 64, 3), 45, dtype=np.uint8)
+    camera_adapter = FakePreviewCameraAdapter(tmp_path, frame=dark_frame)
+    window, controller, _repository = build_controller(
+        tmp_path,
+        qapp,
+        camera_adapter=camera_adapter,
+    )
+
+    try:
+        controller.start_camera_preview()
+        wait_until(qapp, lambda: "偏暗" in window.camera_quality_value.text())
+
+        assert "偏暗" in window.camera_quality_value.text()
+        assert window.status_value.text() == "画面偏暗，建议补光或提高曝光后再拍照"
+
+        controller.capture_camera_image()
+        wait_until(qapp, lambda: bool(window.target_image_path()))
+
+        assert window.status_value.text() == "已拍照保存，但画面偏暗，建议补光或提高曝光后重拍"
+    finally:
+        controller._stop_camera_preview()
+        wait_until(qapp, lambda: controller._camera_preview_thread is None)
+        window.close()
+
+
+def test_measure_frame_brightness_classifies_dark_and_normal_frames():
+    dark = measure_frame_brightness(np.full((12, 16, 3), 45, dtype=np.uint8))
+    normal = measure_frame_brightness(np.full((12, 16, 3), 180, dtype=np.uint8))
+
+    assert dark.level == "too_dark"
+    assert dark.is_too_dark is True
+    assert normal.level == "ok"
+    assert normal.is_too_dark is False
 
 
 def test_detection_result_keeps_locked_image_until_next_target(tmp_path, qapp):

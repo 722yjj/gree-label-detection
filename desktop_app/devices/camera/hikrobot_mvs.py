@@ -65,6 +65,8 @@ class HikrobotMVSConfig:
     trigger_mode: Literal["continuous", "software"] = "continuous"
     exposure_time_us: float | None = None
     gain: float | None = None
+    exposure_auto: Literal["off", "once", "continuous"] | None = "continuous"
+    gain_auto: Literal["off", "once", "continuous"] | None = None
     user_set: str | None = None
 
     @classmethod
@@ -80,6 +82,11 @@ class HikrobotMVSConfig:
             ),
             exposure_time_us=_get_env_float("HIKROBOT_CAMERA_EXPOSURE_US"),
             gain=_get_env_float("HIKROBOT_CAMERA_GAIN"),
+            exposure_auto=_get_env_auto_mode(
+                "HIKROBOT_CAMERA_EXPOSURE_AUTO",
+                default="continuous",
+            ),
+            gain_auto=_get_env_auto_mode("HIKROBOT_CAMERA_GAIN_AUTO", default=None),
             user_set=_get_env_string("HIKROBOT_CAMERA_USER_SET"),
         )
 
@@ -177,7 +184,7 @@ class HikrobotMVSPreviewSession:
 
             if self.config.user_set:
                 _load_user_set(self._camera, self.config.user_set)
-            _apply_manual_capture_settings(self._camera, self.config)
+            _apply_capture_settings(self._camera, self.config)
             _configure_trigger(self._camera, self.config.trigger_mode)
 
             width = _get_int_node(self._camera, self._sdk, "Width")
@@ -366,7 +373,7 @@ def capture_hikrobot_image(
 
             if active_config.user_set:
                 _load_user_set(camera, active_config.user_set)
-            _apply_manual_capture_settings(camera, active_config)
+            _apply_capture_settings(camera, active_config)
             _configure_trigger(camera, active_config.trigger_mode)
 
             width = _get_int_node(camera, sdk, "Width")
@@ -513,12 +520,18 @@ def _load_user_set(camera, user_set: str) -> None:
     )
 
 
-def _apply_manual_capture_settings(camera, config: HikrobotMVSConfig) -> None:
+def _apply_capture_settings(camera, config: HikrobotMVSConfig) -> None:
     if config.exposure_time_us is not None:
         camera.MV_CC_SetEnumValueByString("ExposureAuto", "Off")
         _check_ret(
             camera.MV_CC_SetFloatValue("ExposureTime", config.exposure_time_us),
             f"设置曝光失败: {config.exposure_time_us}",
+        )
+    elif config.exposure_auto is not None:
+        _set_enum_value_if_supported(
+            camera,
+            "ExposureAuto",
+            _mvs_auto_value(config.exposure_auto),
         )
 
     if config.gain is not None:
@@ -527,6 +540,27 @@ def _apply_manual_capture_settings(camera, config: HikrobotMVSConfig) -> None:
             camera.MV_CC_SetFloatValue("Gain", config.gain),
             f"设置增益失败: {config.gain}",
         )
+    elif config.gain_auto is not None:
+        _set_enum_value_if_supported(
+            camera,
+            "GainAuto",
+            _mvs_auto_value(config.gain_auto),
+        )
+
+
+def _set_enum_value_if_supported(camera, node_name: str, value: str) -> bool:
+    try:
+        return int(camera.MV_CC_SetEnumValueByString(node_name, value)) == 0
+    except AttributeError:
+        return False
+
+
+def _mvs_auto_value(value: Literal["off", "once", "continuous"]) -> str:
+    if value == "off":
+        return "Off"
+    if value == "once":
+        return "Once"
+    return "Continuous"
 
 
 def _configure_trigger(
@@ -628,6 +662,17 @@ def _normalize_trigger_mode(value: str) -> Literal["continuous", "software"]:
     raise ValueError(f"不支持的 HIKROBOT_CAMERA_TRIGGER_MODE: {value}")
 
 
+def _normalize_auto_mode(value: str) -> Literal["off", "once", "continuous"]:
+    normalized = (value or "").strip().lower()
+    if normalized in {"off", "false", "0", "manual", "none", "disable", "disabled"}:
+        return "off"
+    if normalized in {"once", "single"}:
+        return "once"
+    if normalized in {"continuous", "continue", "on", "true", "1", "auto", "enabled"}:
+        return "continuous"
+    raise ValueError(f"不支持的自动曝光/增益模式: {value}")
+
+
 def _sanitize_filename_fragment(value: str) -> str:
     cleaned = _SAFE_FILENAME_RE.sub("-", value.strip())
     cleaned = cleaned.strip("-.")
@@ -650,6 +695,17 @@ def _get_env_int(name: str, default: int) -> int:
 def _get_env_float(name: str) -> float | None:
     value = _get_env_string(name)
     return float(value) if value is not None else None
+
+
+def _get_env_auto_mode(
+    name: str,
+    *,
+    default: Literal["off", "once", "continuous"] | None,
+) -> Literal["off", "once", "continuous"] | None:
+    value = _get_env_string(name)
+    if value is None:
+        return default
+    return _normalize_auto_mode(value)
 
 
 __all__ = [

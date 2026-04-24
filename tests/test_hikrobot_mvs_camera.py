@@ -124,6 +124,8 @@ def test_config_from_env_reads_capture_settings(monkeypatch):
     monkeypatch.setenv("HIKROBOT_CAMERA_TRIGGER_MODE", "software")
     monkeypatch.setenv("HIKROBOT_CAMERA_EXPOSURE_US", "1800.5")
     monkeypatch.setenv("HIKROBOT_CAMERA_GAIN", "6.5")
+    monkeypatch.setenv("HIKROBOT_CAMERA_EXPOSURE_AUTO", "once")
+    monkeypatch.setenv("HIKROBOT_CAMERA_GAIN_AUTO", "continuous")
     monkeypatch.setenv("HIKROBOT_CAMERA_USER_SET", "UserSet1")
 
     config = HikrobotMVSConfig.from_env()
@@ -134,7 +136,21 @@ def test_config_from_env_reads_capture_settings(monkeypatch):
     assert config.trigger_mode == "software"
     assert config.exposure_time_us == 1800.5
     assert config.gain == 6.5
+    assert config.exposure_auto == "once"
+    assert config.gain_auto == "continuous"
     assert config.user_set == "UserSet1"
+
+
+def test_config_from_env_defaults_to_continuous_auto_exposure(monkeypatch):
+    monkeypatch.delenv("HIKROBOT_CAMERA_EXPOSURE_US", raising=False)
+    monkeypatch.delenv("HIKROBOT_CAMERA_EXPOSURE_AUTO", raising=False)
+    monkeypatch.delenv("HIKROBOT_CAMERA_GAIN", raising=False)
+    monkeypatch.delenv("HIKROBOT_CAMERA_GAIN_AUTO", raising=False)
+
+    config = HikrobotMVSConfig.from_env()
+
+    assert config.exposure_auto == "continuous"
+    assert config.gain_auto is None
 
 
 def test_adapter_capture_uses_helper_and_returns_saved_path(tmp_path: Path, monkeypatch):

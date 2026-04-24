@@ -49,6 +49,7 @@ ip -4 addr show dev enp4s0
 ## 启动桌面端
 
 桌面端默认使用真实相机后端 `hikrobot-mvs`，不会从样本图片模拟取图。工具栏会显示当前相机后端，启动后会自动检查相机并进入实时预览。
+工具栏同时显示 `画面` 亮度状态：`正常` 可以直接拍照；`略暗` 建议确认补光；`偏暗` 时软件会提示先补光或调曝光，否则检测结果容易不稳定。
 
 现场操作流程：
 
@@ -65,6 +66,27 @@ DESKTOP_CAMERA_BACKEND=hikrobot-mvs \
 HIKROBOT_CAMERA_MODEL=MV-CU060-10GC \
 .venv/bin/python -m desktop_app.main
 ```
+
+桌面端默认会尝试启用连续自动曝光。如果现场光源稳定，推荐先用默认自动曝光观察 `画面` 状态；如果仍然偏暗，再使用手动曝光/增益固定参数：
+
+```bash
+DESKTOP_CAMERA_BACKEND=hikrobot-mvs \
+HIKROBOT_CAMERA_MODEL=MV-CU060-10GC \
+HIKROBOT_CAMERA_EXPOSURE_US=15000 \
+HIKROBOT_CAMERA_GAIN=8 \
+.venv/bin/python -m desktop_app.main
+```
+
+如果画面仍偏暗，可以把 `HIKROBOT_CAMERA_EXPOSURE_US` 调到 `25000` 左右再试；如果画面拖影，优先增加补光，避免继续拉高曝光。手动曝光或手动增益存在时，会覆盖自动曝光/自动增益。
+
+自动曝光/增益也可以显式配置：
+
+```bash
+HIKROBOT_CAMERA_EXPOSURE_AUTO=continuous
+HIKROBOT_CAMERA_GAIN_AUTO=continuous
+```
+
+可用值为 `off`、`once`、`continuous`。
 
 生产现场建议指定序列号，避免插入多台相机时选错设备：
 

@@ -16,7 +16,10 @@ from desktop_app.repositories.template_repository import TemplateRepository
 from desktop_app.services.detection_service import DetectionService
 from desktop_app.services.preview_service import PreviewService
 from desktop_app.ui.main_window import MainWindow
-from desktop_app.workers.camera_preview_worker import CameraPreviewWorker
+from desktop_app.workers.camera_preview_worker import (
+    CameraFrameBrightness,
+    CameraPreviewWorker,
+)
 from desktop_app.workers.detection_worker import DetectionWorker
 
 
@@ -27,6 +30,17 @@ CAMERA_CAPTURING = "CAPTURING"
 CAMERA_CAPTURED = "CAPTURED"
 CAMERA_DETECTING = "DETECTING"
 CAMERA_RESULT_READY = "RESULT_READY"
+
+
+def _camera_brightness_label(
+    brightness: CameraFrameBrightness,
+) -> tuple[str, str]:
+    mean = brightness.mean
+    if brightness.level == "too_dark":
+        return f"偏暗 {mean:.0f}", "warning"
+    if brightness.level == "dim":
+        return f"略暗 {mean:.0f}", "neutral"
+    return f"正常 {mean:.0f}", "ok"
 
 
 class AppController(QObject):
@@ -59,6 +73,8 @@ class AppController(QObject):
         self._camera_preview_thread: QThread | None = None
         self._camera_preview_worker: CameraPreviewWorker | None = None
         self._camera_workflow_state = CAMERA_NO_CAMERA
+        self._latest_camera_brightness: CameraFrameBrightness | None = None
+        self._last_camera_brightness_level: str | None = None
         self._auto_start_camera_preview = auto_start_camera_preview
         self._connect_signals()
         self._connect_scanner_signals()
@@ -189,6 +205,7 @@ class AppController(QObject):
         if not file_path:
             return
         self.view.set_target_image_path(file_path)
+        self.view.set_camera_quality("手动图片", "neutral")
         self.view.show_pending_result()
         self.view.set_status("已选择目标图片")
         self._camera_workflow_state = CAMERA_CAPTURED
@@ -226,7 +243,12 @@ class AppController(QObject):
         captured_path = Path(captured)
         self.view.set_target_image_path(captured_path)
         self.view.show_pending_result()
-        self.view.set_status("已拍照保存，目标图已锁定")
+        if self._latest_camera_brightness and self._latest_camera_brightness.is_too_dark:
+            self.view.set_status(
+                "已拍照保存，但画面偏暗，建议补光或提高曝光后重拍"
+            )
+        else:
+            self.view.set_status("已拍照保存，目标图已锁定")
         self._camera_workflow_state = CAMERA_CAPTURED
         self._sync_camera_actions()
         self._refresh_detection_ready_state()
@@ -235,6 +257,7 @@ class AppController(QObject):
         if message.startswith("未检测到相机"):
             self.view.set_status("未检测到相机")
             self.view.clear_target_image("未检测到相机")
+            self.view.set_camera_quality("未检测到相机", "error")
             self._camera_workflow_state = CAMERA_NO_CAMERA
         elif self._camera_workflow_state == CAMERA_CAPTURING:
             self.view.set_status("拍照保存失败")
@@ -250,6 +273,7 @@ class AppController(QObject):
         else:
             self.view.set_status("相机预览失败")
             self.view.clear_target_image("相机预览失败")
+            self.view.set_camera_quality("预览失败", "error")
             self._camera_workflow_state = CAMERA_NO_CAMERA
         self._sync_camera_actions()
         self._refresh_detection_ready_state()
@@ -266,6 +290,9 @@ class AppController(QObject):
             return
 
         self.view.clear_target_image("正在检查相机...")
+        self.view.set_camera_quality("检查中", "neutral")
+        self._latest_camera_brightness = None
+        self._last_camera_brightness_level = None
         self._camera_workflow_state = CAMERA_STARTING
         self._sync_camera_actions()
         self.view.set_status("正在检查相机")
@@ -277,6 +304,7 @@ class AppController(QObject):
         thread.started.connect(worker.start)
         worker.started_status.connect(self.view.set_status)
         worker.frame_ready.connect(self._handle_camera_preview_frame)
+        worker.frame_brightness_changed.connect(self._handle_camera_frame_brightness)
         worker.photo_saved.connect(self._handle_camera_photo_saved)
         worker.failed.connect(self._handle_camera_preview_failed)
         worker.stopped.connect(thread.quit)
@@ -291,12 +319,51 @@ class AppController(QObject):
         thread.start()
 
     def _handle_camera_preview_frame(self, image: object) -> None:
+        started_previewing = self._camera_workflow_state in {
+            CAMERA_STARTING,
+            CAMERA_NO_CAMERA,
+        }
         if self._camera_workflow_state in {CAMERA_STARTING, CAMERA_NO_CAMERA}:
             self._camera_workflow_state = CAMERA_PREVIEWING
             self._sync_camera_actions()
             self._refresh_detection_ready_state()
         if self._camera_workflow_state == CAMERA_PREVIEWING:
             self.view.set_target_preview_image(image)
+            if started_previewing and self._latest_camera_brightness is not None:
+                self._sync_camera_brightness_status(self._latest_camera_brightness)
+
+    def _handle_camera_frame_brightness(self, brightness: object) -> None:
+        if not isinstance(brightness, CameraFrameBrightness):
+            return
+
+        self._latest_camera_brightness = brightness
+        if self._camera_workflow_state in {
+            CAMERA_CAPTURED,
+            CAMERA_DETECTING,
+            CAMERA_RESULT_READY,
+        }:
+            return
+
+        label, severity = _camera_brightness_label(brightness)
+        self.view.set_camera_quality(label, severity)
+        self._sync_camera_brightness_status(brightness)
+
+    def _sync_camera_brightness_status(
+        self,
+        brightness: CameraFrameBrightness,
+    ) -> None:
+        if self._camera_workflow_state != CAMERA_PREVIEWING:
+            return
+
+        if brightness.is_too_dark and self._last_camera_brightness_level != "too_dark":
+            self.view.set_status("画面偏暗，建议补光或提高曝光后再拍照")
+        elif (
+            not brightness.is_too_dark
+            and self._last_camera_brightness_level == "too_dark"
+        ):
+            self.view.set_status("相机预览中")
+
+        self._last_camera_brightness_level = brightness.level
 
     def retake_target_image(self) -> None:
         self.view.clear_target_image("等待相机预览")
