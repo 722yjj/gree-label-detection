@@ -37,6 +37,8 @@ llm-results*.xlsx
 *.swp
 *.swo
 tests/.tmp/
+.codex
+MvSdkLog/
 
 # OS
 .DS_Store

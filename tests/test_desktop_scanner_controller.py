@@ -1,6 +1,9 @@
 import os
+import time
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -12,7 +15,7 @@ from PySide6.QtWidgets import QApplication, QScrollArea
 
 from desktop_app.controllers.app_controller import AppController
 from desktop_app.devices.scanner.mock import MockScannerAdapter
-from desktop_app.models import TemplateRecord
+from desktop_app.models import DetectionJobResult, TemplateRecord
 from desktop_app.ui.main_window import MainWindow, ScaledImageLabel
 
 
@@ -40,6 +43,42 @@ class FakeDetectionService:
         raise AssertionError("detection should not run in scanner controller tests")
 
 
+class FakePreviewSession:
+    display_name = "fake-preview-camera"
+
+    def __init__(self, output_dir: Path) -> None:
+        self.output_dir = output_dir
+        self.frame = np.zeros((48, 64, 3), dtype=np.uint8)
+        self.frame[:, :, 1] = 180
+        self.closed = False
+        self.saved_code = None
+
+    def read_frame_bgr(self):
+        return self.frame.copy()
+
+    def save_frame_bgr(self, frame, preferred_code: str | None = None) -> Path:
+        self.saved_code = preferred_code
+        output_path = self.output_dir / f"{preferred_code or 'uncoded'}.jpg"
+        assert cv2.imwrite(str(output_path), frame)
+        return output_path
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakePreviewCameraAdapter:
+    name = "fake-preview-camera"
+
+    def __init__(self, output_dir: Path) -> None:
+        self.session = FakePreviewSession(output_dir)
+
+    def start_preview(self):
+        return self.session
+
+    def capture(self, preferred_code: str | None = None) -> Path | None:
+        raise AssertionError("single capture should not run during preview workflow")
+
+
 @pytest.fixture(scope="module")
 def qapp():
     app = QApplication.instance() or QApplication([])
@@ -59,10 +98,22 @@ def make_template(tmp_path: Path, code: str, variant: str | None = None) -> Temp
     )
 
 
+def wait_until(qapp: QApplication, predicate, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        if predicate():
+            return
+        time.sleep(0.01)
+    qapp.processEvents()
+    assert predicate()
+
+
 def build_controller(
     tmp_path: Path,
     qapp: QApplication,
     *,
+    camera_adapter=None,
     scanner_adapter=None,
 ) -> tuple[MainWindow, AppController, FakeTemplateRepository]:
     code = "600004075219"
@@ -75,8 +126,9 @@ def build_controller(
         view=window,
         template_repository=repository,
         detection_service=FakeDetectionService(),
-        camera_adapter=FakeCameraAdapter(),
+        camera_adapter=camera_adapter or FakeCameraAdapter(),
         scanner_adapter=scanner_adapter,
+        auto_start_camera_preview=False,
     )
     controller._resolve_template_preview_path = lambda template: None
     return window, controller, repository
@@ -143,6 +195,19 @@ def test_set_busy_disables_code_input(qapp):
         window.close()
 
 
+def test_main_window_displays_camera_backend_name(qapp):
+    window = MainWindow()
+    window.show()
+    qapp.processEvents()
+
+    try:
+        window.set_camera_backend_name("hikrobot-mvs")
+
+        assert window.camera_backend_value.text() == "相机：hikrobot-mvs"
+    finally:
+        window.close()
+
+
 def test_run_detection_uses_output_mode_toggle(tmp_path, qapp):
     window, controller, _repository = build_controller(tmp_path, qapp)
     captured_requests = []
@@ -161,6 +226,115 @@ def test_run_detection_uses_output_mode_toggle(tmp_path, qapp):
         controller.run_detection()
         assert captured_requests[-1].output_mode == "debug"
     finally:
+        window.close()
+
+
+def test_camera_preview_reports_no_connected_camera(tmp_path, qapp):
+    class DisconnectedCameraAdapter:
+        name = "hikrobot-mvs"
+
+        def start_preview(self):
+            raise RuntimeError("当前无可见设备")
+
+        def capture(self, preferred_code: str | None = None) -> Path | None:
+            raise AssertionError("capture should not run when camera is disconnected")
+
+    window, controller, _repository = build_controller(
+        tmp_path,
+        qapp,
+        camera_adapter=DisconnectedCameraAdapter(),
+    )
+
+    try:
+        controller.capture_camera_image()
+        wait_until(qapp, lambda: controller._camera_preview_thread is None)
+
+        assert window.status_value.text() == "未检测到相机"
+        assert window.capture_button.text() == "重连相机"
+        assert window.target_image_path() == ""
+    finally:
+        window.close()
+
+
+def test_camera_preview_photo_save_locks_target_then_next_resumes_preview(tmp_path, qapp):
+    camera_adapter = FakePreviewCameraAdapter(tmp_path)
+    window, controller, _repository = build_controller(
+        tmp_path,
+        qapp,
+        camera_adapter=camera_adapter,
+    )
+
+    try:
+        controller.handle_scanned_code("600004075219")
+        controller.start_camera_preview()
+        wait_until(qapp, lambda: controller._camera_workflow_state == "PREVIEWING")
+
+        assert window.capture_button.text() == "拍照保存"
+        assert window.run_button.isEnabled() is False
+
+        controller.capture_camera_image()
+        wait_until(qapp, lambda: bool(window.target_image_path()))
+
+        saved_path = Path(window.target_image_path())
+        assert saved_path.exists()
+        assert saved_path.name == "600004075219.jpg"
+        assert camera_adapter.session.saved_code == "600004075219"
+        assert window.capture_button.text() == "重拍"
+        assert window.run_button.isEnabled() is True
+
+        controller.prepare_next_target()
+        wait_until(qapp, lambda: window.target_image_path() == "")
+
+        assert window.capture_button.text() == "拍照保存"
+        assert window.next_button.isEnabled() is False
+        assert window.run_button.isEnabled() is False
+    finally:
+        controller._stop_camera_preview()
+        wait_until(qapp, lambda: controller._camera_preview_thread is None)
+        window.close()
+
+
+def test_detection_result_keeps_locked_image_until_next_target(tmp_path, qapp):
+    camera_adapter = FakePreviewCameraAdapter(tmp_path)
+    window, controller, _repository = build_controller(
+        tmp_path,
+        qapp,
+        camera_adapter=camera_adapter,
+    )
+
+    try:
+        controller.handle_scanned_code("600004075219")
+        controller.start_camera_preview()
+        wait_until(qapp, lambda: controller._camera_workflow_state == "PREVIEWING")
+        controller.capture_camera_image()
+        wait_until(qapp, lambda: bool(window.target_image_path()))
+        locked_path = Path(window.target_image_path())
+
+        controller._handle_detection_finished(
+            DetectionJobResult(
+                success=True,
+                verdict="通过",
+                output_dir=tmp_path,
+                summary_text="ok",
+                target_image_path=locked_path,
+                template_path=window.selected_template().source_path,
+                code="600004075219",
+                template_display_name="600004075219",
+            )
+        )
+
+        assert window.target_image_path() == str(locked_path)
+        assert window.capture_button.text() == "重拍"
+        assert window.next_button.isEnabled() is True
+
+        controller.prepare_next_target()
+
+        assert window.target_image_path() == ""
+        assert window.capture_button.text() == "拍照保存"
+        assert window.next_button.isEnabled() is False
+    finally:
+        controller._stop_camera_preview()
+        wait_until(qapp, lambda: controller._camera_preview_thread is None)
         window.close()
 
 

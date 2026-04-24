@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread
+from PySide6.QtCore import QObject, QThread, Signal
 
 from desktop_app.devices.camera.base import CameraAdapter
 from desktop_app.devices.scanner.base import ScannerAdapter
@@ -16,11 +16,24 @@ from desktop_app.repositories.template_repository import TemplateRepository
 from desktop_app.services.detection_service import DetectionService
 from desktop_app.services.preview_service import PreviewService
 from desktop_app.ui.main_window import MainWindow
+from desktop_app.workers.camera_preview_worker import CameraPreviewWorker
 from desktop_app.workers.detection_worker import DetectionWorker
+
+
+CAMERA_NO_CAMERA = "NO_CAMERA"
+CAMERA_STARTING = "STARTING"
+CAMERA_PREVIEWING = "PREVIEWING"
+CAMERA_CAPTURING = "CAPTURING"
+CAMERA_CAPTURED = "CAPTURED"
+CAMERA_DETECTING = "DETECTING"
+CAMERA_RESULT_READY = "RESULT_READY"
 
 
 class AppController(QObject):
     """Own the high-level interaction flow for the first desktop version."""
+
+    _save_preview_frame_requested = Signal(object)
+    _stop_preview_requested = Signal()
 
     def __init__(
         self,
@@ -31,6 +44,7 @@ class AppController(QObject):
         scanner_adapter: ScannerAdapter | None = None,
         preview_service: PreviewService | None = None,
         history_repository: HistoryRepository | None = None,
+        auto_start_camera_preview: bool = True,
     ) -> None:
         super().__init__(view)
         self.view = view
@@ -42,20 +56,30 @@ class AppController(QObject):
         self.history_repository = history_repository
         self._thread: QThread | None = None
         self._worker: DetectionWorker | None = None
+        self._camera_preview_thread: QThread | None = None
+        self._camera_preview_worker: CameraPreviewWorker | None = None
+        self._camera_workflow_state = CAMERA_NO_CAMERA
+        self._auto_start_camera_preview = auto_start_camera_preview
         self._connect_signals()
         self._connect_scanner_signals()
         self._load_history_records()
+        self.view.set_camera_backend_name(self.camera_adapter.name)
         self.view.show_pending_result()
+        self._sync_camera_actions()
         self._refresh_detection_ready_state()
         self._start_scanner_adapter()
+        if self._auto_start_camera_preview:
+            self.start_camera_preview()
 
     def _connect_signals(self) -> None:
         self.view.manual_query_requested.connect(self.handle_manual_query)
         self.view.simulate_scan_requested.connect(self.handle_scan_from_input)
         self.view.browse_target_requested.connect(self.browse_target_image)
-        self.view.capture_mock_requested.connect(self.capture_mock_image)
+        self.view.capture_camera_requested.connect(self.capture_camera_image)
+        self.view.next_target_requested.connect(self.prepare_next_target)
         self.view.run_detection_requested.connect(self.run_detection)
         self.view.template_selection_changed.connect(self.refresh_template_preview)
+        self.view.destroyed.connect(self._stop_camera_preview)
 
     def _connect_scanner_signals(self) -> None:
         if self.scanner_adapter is None:
@@ -167,18 +191,138 @@ class AppController(QObject):
         self.view.set_target_image_path(file_path)
         self.view.show_pending_result()
         self.view.set_status("已选择目标图片")
+        self._camera_workflow_state = CAMERA_CAPTURED
+        self._sync_camera_actions()
         self._refresh_detection_ready_state()
 
-    def capture_mock_image(self) -> None:
-        code = KeyboardWedgeScannerInput.normalize(self.view.code_text())
-        captured = self.camera_adapter.capture(preferred_code=code or None)
-        if not captured:
-            self.view.show_error("未找到可用的 mock 相机样本图片")
+    def capture_camera_image(self) -> None:
+        if self._is_detection_running():
+            self.view.set_status("检测正在运行，请等待")
             return
 
-        self.view.set_target_image_path(captured)
+        if self._camera_workflow_state == CAMERA_NO_CAMERA:
+            self.start_camera_preview(restart=True)
+            return
+
+        if self._camera_workflow_state in {CAMERA_STARTING, CAMERA_CAPTURING}:
+            self.view.set_status("相机正在准备，请等待")
+            return
+
+        if self._camera_workflow_state in {CAMERA_CAPTURED, CAMERA_RESULT_READY}:
+            self.retake_target_image()
+            return
+
+        if self._camera_workflow_state != CAMERA_PREVIEWING:
+            self.view.set_status("相机预览尚未就绪")
+            return
+
+        code = KeyboardWedgeScannerInput.normalize(self.view.code_text())
+        self._camera_workflow_state = CAMERA_CAPTURING
+        self.view.set_status("拍照保存中")
+        self._sync_camera_actions()
+        self._save_preview_frame_requested.emit(code or None)
+
+    def _handle_camera_photo_saved(self, captured: object) -> None:
+        captured_path = Path(captured)
+        self.view.set_target_image_path(captured_path)
         self.view.show_pending_result()
-        self.view.set_status(f"已从 {self.camera_adapter.name} 获取样本图")
+        self.view.set_status("已拍照保存，目标图已锁定")
+        self._camera_workflow_state = CAMERA_CAPTURED
+        self._sync_camera_actions()
+        self._refresh_detection_ready_state()
+
+    def _handle_camera_preview_failed(self, message: str) -> None:
+        if message.startswith("未检测到相机"):
+            self.view.set_status("未检测到相机")
+            self.view.clear_target_image("未检测到相机")
+            self._camera_workflow_state = CAMERA_NO_CAMERA
+        elif self._camera_workflow_state == CAMERA_CAPTURING:
+            self.view.set_status("拍照保存失败")
+            self._camera_workflow_state = (
+                CAMERA_PREVIEWING if self._is_camera_preview_running() else CAMERA_NO_CAMERA
+            )
+        elif self._camera_workflow_state in {
+            CAMERA_CAPTURED,
+            CAMERA_DETECTING,
+            CAMERA_RESULT_READY,
+        }:
+            self.view.set_status("相机预览已断开，当前目标图已保留")
+        else:
+            self.view.set_status("相机预览失败")
+            self.view.clear_target_image("相机预览失败")
+            self._camera_workflow_state = CAMERA_NO_CAMERA
+        self._sync_camera_actions()
+        self._refresh_detection_ready_state()
+
+    def start_camera_preview(self, *, restart: bool = False) -> None:
+        if self._is_detection_running():
+            return
+        if restart and self._is_camera_preview_running():
+            self._stop_camera_preview()
+            return
+        if self._is_camera_preview_running():
+            self._camera_workflow_state = CAMERA_PREVIEWING
+            self._sync_camera_actions()
+            return
+
+        self.view.clear_target_image("正在检查相机...")
+        self._camera_workflow_state = CAMERA_STARTING
+        self._sync_camera_actions()
+        self.view.set_status("正在检查相机")
+
+        thread = QThread(self.view)
+        worker = CameraPreviewWorker(self.camera_adapter)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.start)
+        worker.started_status.connect(self.view.set_status)
+        worker.frame_ready.connect(self._handle_camera_preview_frame)
+        worker.photo_saved.connect(self._handle_camera_photo_saved)
+        worker.failed.connect(self._handle_camera_preview_failed)
+        worker.stopped.connect(thread.quit)
+        worker.stopped.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_active_camera_preview_worker)
+        self._save_preview_frame_requested.connect(worker.save_current_frame)
+        self._stop_preview_requested.connect(worker.stop_preview)
+
+        self._camera_preview_thread = thread
+        self._camera_preview_worker = worker
+        thread.start()
+
+    def _handle_camera_preview_frame(self, image: object) -> None:
+        if self._camera_workflow_state in {CAMERA_STARTING, CAMERA_NO_CAMERA}:
+            self._camera_workflow_state = CAMERA_PREVIEWING
+            self._sync_camera_actions()
+            self._refresh_detection_ready_state()
+        if self._camera_workflow_state == CAMERA_PREVIEWING:
+            self.view.set_target_preview_image(image)
+
+    def retake_target_image(self) -> None:
+        self.view.clear_target_image("等待相机预览")
+        self.view.show_pending_result()
+        if self._is_camera_preview_running():
+            self._camera_workflow_state = CAMERA_PREVIEWING
+            self.view.set_status("相机预览中，请重新拍照")
+        else:
+            self.start_camera_preview(restart=True)
+            return
+        self._sync_camera_actions()
+        self._refresh_detection_ready_state()
+
+    def prepare_next_target(self) -> None:
+        if self._is_detection_running():
+            self.view.set_status("检测正在运行，请等待")
+            return
+        self.view.clear_target_image("等待相机预览")
+        self.view.show_pending_result()
+        if self._is_camera_preview_running():
+            self._camera_workflow_state = CAMERA_PREVIEWING
+            self.view.set_status("请放入下一张标签，确认画面后拍照保存")
+        else:
+            self.start_camera_preview(restart=True)
+            return
+        self._sync_camera_actions()
         self._refresh_detection_ready_state()
 
     def refresh_template_preview(self) -> None:
@@ -202,6 +346,9 @@ class AppController(QObject):
         if self._is_detection_running():
             self.view.set_status("检测正在运行，请等待")
             return
+        if self._camera_workflow_state == CAMERA_CAPTURING:
+            self.view.set_status("拍照保存中，请等待")
+            return
 
         template = self.view.selected_template()
         if template is None:
@@ -214,7 +361,7 @@ class AppController(QObject):
 
         target_image_path = self.view.target_image_path()
         if not target_image_path:
-            self.view.show_error("请先选择目标图片或使用 Mock 相机取图")
+            self.view.show_error("请先拍照保存目标图片，或选择一张目标图片")
             return
         target_path = Path(target_image_path)
         if not target_path.exists():
@@ -247,6 +394,8 @@ class AppController(QObject):
 
         self._thread = thread
         self._worker = worker
+        self._camera_workflow_state = CAMERA_DETECTING
+        self._sync_camera_actions()
         self.view.set_busy(True)
         self.view.set_status("检测中")
         self.view.show_running_result()
@@ -274,6 +423,8 @@ class AppController(QObject):
             except OSError as exc:
                 print(f"[AppController] failed to persist history: {exc}")
         self.view.prepend_history_record(record)
+        self._camera_workflow_state = CAMERA_RESULT_READY
+        self._sync_camera_actions()
         self._restore_code_focus(select_all=True)
         self._refresh_detection_ready_state()
 
@@ -282,6 +433,8 @@ class AppController(QObject):
         self.view.set_status("检测失败")
         self.view.show_failure_result(message)
         self.view.show_error(message)
+        self._camera_workflow_state = CAMERA_RESULT_READY
+        self._sync_camera_actions()
         self._restore_code_focus(select_all=True)
         self._refresh_detection_ready_state()
 
@@ -292,6 +445,46 @@ class AppController(QObject):
 
     def _is_detection_running(self) -> bool:
         return self._thread is not None
+
+    def _clear_active_camera_preview_worker(self) -> None:
+        self._camera_preview_thread = None
+        self._camera_preview_worker = None
+        if self._camera_workflow_state in {CAMERA_STARTING, CAMERA_PREVIEWING}:
+            self._camera_workflow_state = CAMERA_NO_CAMERA
+            self._sync_camera_actions()
+        self._refresh_detection_ready_state()
+
+    def _is_camera_preview_running(self) -> bool:
+        return self._camera_preview_thread is not None
+
+    def _stop_camera_preview(self, *_args) -> None:
+        if self._camera_preview_worker is None:
+            return
+        self._stop_preview_requested.emit()
+
+    def _sync_camera_actions(self) -> None:
+        state = self._camera_workflow_state
+        if state == CAMERA_NO_CAMERA:
+            self.view.set_capture_action("重连相机", True)
+            self.view.set_next_enabled(False)
+        elif state == CAMERA_STARTING:
+            self.view.set_capture_action("检查中", False)
+            self.view.set_next_enabled(False)
+        elif state == CAMERA_PREVIEWING:
+            self.view.set_capture_action("拍照保存", True)
+            self.view.set_next_enabled(False)
+        elif state == CAMERA_CAPTURING:
+            self.view.set_capture_action("保存中", False)
+            self.view.set_next_enabled(False)
+        elif state == CAMERA_DETECTING:
+            self.view.set_capture_action("检测中", False)
+            self.view.set_next_enabled(False)
+        elif state == CAMERA_RESULT_READY:
+            self.view.set_capture_action("重拍", True)
+            self.view.set_next_enabled(True)
+        else:
+            self.view.set_capture_action("重拍", True)
+            self.view.set_next_enabled(False)
 
     def _restore_code_focus(self, *, select_all: bool) -> None:
         self.view.focus_code_input(select_all=select_all)
@@ -309,6 +502,7 @@ class AppController(QObject):
             and bool(target_path)
             and Path(target_path).exists()
             and not self._is_detection_running()
+            and self._camera_workflow_state != CAMERA_CAPTURING
         )
         self.view.set_detection_enabled(bool(ready))
 

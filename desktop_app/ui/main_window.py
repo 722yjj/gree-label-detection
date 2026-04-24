@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QGuiApplication, QPixmap
+from PySide6.QtGui import QDesktopServices, QGuiApplication, QImage, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
@@ -109,7 +109,8 @@ class MainWindow(QMainWindow):
     manual_query_requested = Signal()
     simulate_scan_requested = Signal()
     browse_target_requested = Signal()
-    capture_mock_requested = Signal()
+    capture_camera_requested = Signal()
+    next_target_requested = Signal()
     run_detection_requested = Signal()
     template_selection_changed = Signal()
 
@@ -124,8 +125,11 @@ class MainWindow(QMainWindow):
         self.query_button = QPushButton("查询模板")
         self.target_path_input = QLineEdit()
         self.target_path_input.setReadOnly(True)
+        self.camera_backend_value = QLabel("相机：-")
+        self.camera_backend_value.setObjectName("cameraBackend")
         self.browse_button = QPushButton("选择图片")
-        self.capture_button = QPushButton("Mock 相机取图")
+        self.capture_button = QPushButton("拍照保存")
+        self.next_button = QPushButton("下一张")
         self.run_button = QPushButton("开始检测")
         self.detailed_output_checkbox = QCheckBox("保存详细调试结果")
         self.open_template_button = QPushButton("打开模板")
@@ -175,6 +179,9 @@ class MainWindow(QMainWindow):
         self._did_auto_focus_code_input = False
         self._detection_enabled = False
         self._busy = False
+        self._camera_busy = False
+        self._capture_action_enabled = True
+        self._next_enabled = False
 
         self._build_layout()
         self._apply_styles()
@@ -183,6 +190,7 @@ class MainWindow(QMainWindow):
         self._sync_history_buttons()
         self._sync_template_buttons()
         self._sync_output_buttons()
+        self._sync_capture_controls()
         self._sync_run_button()
 
     def _build_layout(self) -> None:
@@ -191,10 +199,12 @@ class MainWindow(QMainWindow):
         toolbar_layout.setContentsMargins(16, 14, 16, 14)
         toolbar_layout.setSpacing(10)
         toolbar_layout.addWidget(self._build_section_title("目标图"))
+        toolbar_layout.addWidget(self.camera_backend_value)
         self.target_path_input.setPlaceholderText("尚未选择目标图片")
         toolbar_layout.addWidget(self.target_path_input, 1)
         toolbar_layout.addWidget(self.browse_button)
         toolbar_layout.addWidget(self.capture_button)
+        toolbar_layout.addWidget(self.next_button)
         toolbar_layout.addWidget(self.detailed_output_checkbox)
         toolbar_layout.addWidget(self.run_button)
 
@@ -468,6 +478,14 @@ class MainWindow(QMainWindow):
             QTreeWidget::item {
                 height: 28px;
             }
+            QLabel#cameraBackend {
+                background: #eef2f6;
+                border: 1px solid #d7dee7;
+                border-radius: 8px;
+                color: #334e68;
+                font-weight: 700;
+                padding: 6px 10px;
+            }
             #resultHeader {
                 background: #e7f4ee;
                 border: 1px solid #b8dfca;
@@ -496,7 +514,8 @@ class MainWindow(QMainWindow):
         self.query_button.clicked.connect(self.manual_query_requested)
         self.code_input.returnPressed.connect(self.simulate_scan_requested)
         self.browse_button.clicked.connect(self.browse_target_requested)
-        self.capture_button.clicked.connect(self.capture_mock_requested)
+        self.capture_button.clicked.connect(self.capture_camera_requested)
+        self.next_button.clicked.connect(self.next_target_requested)
         self.run_button.clicked.connect(self.run_detection_requested)
         self.template_list.currentItemChanged.connect(
             self._handle_template_selection_changed
@@ -560,6 +579,16 @@ class MainWindow(QMainWindow):
         self._render_image(self.preview_label, self._target_preview_path, "请选择或采集目标图片")
         self._sync_run_button()
 
+    def clear_target_image(self, placeholder: str = "等待相机预览") -> None:
+        self.target_path_input.setText("")
+        self._target_preview_path = None
+        self.preview_label.clear_preview(placeholder)
+        self._sync_run_button()
+
+    def set_target_preview_image(self, image: QImage) -> None:
+        pixmap = QPixmap.fromImage(image)
+        self.preview_label.set_preview_pixmap(pixmap, "相机实时预览")
+
     def set_template_image_path(self, path: str | Path | None) -> None:
         self._template_preview_path = Path(path) if path else None
         self._render_image(
@@ -592,6 +621,18 @@ class MainWindow(QMainWindow):
             self.status_value.setStyleSheet("color: #1f7a4f; font-weight: 700;")
         else:
             self.status_value.setStyleSheet("color: #334e68; font-weight: 700;")
+
+    def set_camera_backend_name(self, name: str) -> None:
+        self.camera_backend_value.setText(f"相机：{name or '-'}")
+
+    def set_capture_action(self, text: str, enabled: bool) -> None:
+        self.capture_button.setText(text)
+        self._capture_action_enabled = enabled
+        self._sync_capture_controls()
+
+    def set_next_enabled(self, enabled: bool) -> None:
+        self._next_enabled = enabled
+        self._sync_capture_controls()
 
     def set_verdict(self, value: str) -> None:
         verdict = value or "待检测"
@@ -644,10 +685,14 @@ class MainWindow(QMainWindow):
         self._busy = busy
         self.set_code_input_enabled(not busy)
         self.query_button.setDisabled(busy)
-        self.browse_button.setDisabled(busy)
-        self.capture_button.setDisabled(busy)
+        self._sync_capture_controls()
         self.detailed_output_checkbox.setDisabled(busy)
         self.template_list.setDisabled(busy)
+        self._sync_run_button()
+
+    def set_camera_busy(self, busy: bool) -> None:
+        self._camera_busy = busy
+        self._sync_capture_controls()
         self._sync_run_button()
 
     def choose_image_file(self) -> str:
@@ -797,7 +842,15 @@ class MainWindow(QMainWindow):
         return label
 
     def _sync_run_button(self) -> None:
-        self.run_button.setDisabled(self._busy or not self._detection_enabled)
+        self.run_button.setDisabled(
+            self._busy or self._camera_busy or not self._detection_enabled
+        )
+
+    def _sync_capture_controls(self) -> None:
+        disabled = self._busy or self._camera_busy
+        self.browse_button.setDisabled(disabled)
+        self.capture_button.setDisabled(disabled or not self._capture_action_enabled)
+        self.next_button.setDisabled(disabled or not self._next_enabled)
 
     def _sync_template_buttons(self) -> None:
         has_template = self.selected_template() is not None
