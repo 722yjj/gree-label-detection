@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from label_detection.core.config import PROJECT_ROOT, SAMPLES_DIR
 from label_detection.extraction.template_source import SUPPORTED_TEMPLATE_IMAGE_SUFFIXES
+from label_detection.matching.ocr import text_field_values_match
 
 
 DEFAULT_TEMPLATE_ROOTS = (SAMPLES_DIR / "pdfs",)
@@ -224,7 +225,11 @@ def compute_text_summary(result: Dict[str, object]) -> Dict[str, object]:
     different_fields = [
         field_name
         for field_name in field_names
-        if template_data.get(field_name) != target_data.get(field_name)
+        if not text_field_values_match(
+            field_name,
+            template_data.get(field_name),
+            target_data.get(field_name),
+        )
     ]
 
     summary = {

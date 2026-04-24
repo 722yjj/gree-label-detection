@@ -1,13 +1,18 @@
 import os
 import sys
 
+import numpy as np
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from label_detection.matching.ocr import (
+    extract_field_labels_from_ocr_boxes,
     field_values_match,
     find_matching_ocr_boxes,
+    normalize_label_text_for_compare,
     normalize_text_for_compare,
     normalize_text_for_match,
+    text_field_values_match,
 )
 
 
@@ -27,6 +32,12 @@ class TestNormalizeTextForCompare:
         assert normalize_text_for_compare("13.5 kg") == "13.5kg"
 
 
+class TestNormalizeLabelTextForCompare:
+    def test_ignores_spacing_and_punctuation_but_keeps_case(self):
+        assert normalize_label_text_for_compare("Serial No.") == "SerialNo"
+        assert normalize_label_text_for_compare("Air Flow Volume") == "AirFlowVolume"
+
+
 class TestFieldValuesMatch:
     def test_treats_punctuation_spacing_difference_as_match(self):
         assert field_values_match(
@@ -36,6 +47,11 @@ class TestFieldValuesMatch:
 
     def test_keeps_decimal_difference_significant(self):
         assert not field_values_match("13.5kg", "135kg")
+
+
+class TestTextFieldValuesMatch:
+    def test_treats_label_case_change_as_difference(self):
+        assert not text_field_values_match("label:weight", "Weight", "weiGht")
 
 
 class TestFindMatchingOcrBoxes:
@@ -100,3 +116,57 @@ class TestFindMatchingOcrBoxes:
         ]
 
         assert find_matching_ocr_boxes("50Hz", boxes, field_name="frequency") == []
+
+
+class TestExtractFieldLabelsFromOcrBoxes:
+    def _make_box(self, text, score=0.99, x1=0, y1=0, x2=10, y2=10):
+        return ([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], text, score)
+
+    def test_prefers_label_only_box_and_extracts_combined_label_prefix(self):
+        boxes = [
+            self._make_box("Weight"),
+            self._make_box("Weight 13.5kg", score=0.95),
+            self._make_box("Rated Frequency 50Hz"),
+        ]
+
+        labels = extract_field_labels_from_ocr_boxes(boxes, ["weight", "frequency"])
+
+        assert labels == {
+            "weight": {"text": "Weight", "box_indices": [0]},
+            "frequency": {"text": "Rated Frequency", "box_indices": [2]},
+        }
+
+    def test_accepts_fuzzy_weight_label_with_repeated_leading_character(self):
+        boxes = [
+            self._make_box("WWeight"),
+        ]
+
+        labels = extract_field_labels_from_ocr_boxes(boxes, ["weight"])
+
+        assert labels == {
+            "weight": {"text": "WWeight", "box_indices": [0]},
+        }
+
+    def test_merges_adjacent_boxes_for_manufactured_date_label(self):
+        boxes = [
+            self._make_box("Manufactured", x1=0, y1=100, x2=120, y2=130),
+            self._make_box("Date", x1=124, y1=100, x2=170, y2=130),
+            self._make_box("2026.01", x1=250, y1=100, x2=320, y2=130),
+        ]
+
+        labels = extract_field_labels_from_ocr_boxes(boxes, ["mfg_date"])
+
+        assert labels == {
+            "mfg_date": {"text": "Manufactured Date", "box_indices": [0, 1]},
+        }
+
+    def test_supports_numpy_coordinate_arrays_from_real_ocr(self):
+        boxes = [
+            (np.array([[0, 0], [50, 0], [50, 20], [0, 20]], dtype=np.int16), "WWeight", 0.99),
+        ]
+
+        labels = extract_field_labels_from_ocr_boxes(boxes, ["weight"])
+
+        assert labels == {
+            "weight": {"text": "WWeight", "box_indices": [0]},
+        }

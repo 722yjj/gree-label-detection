@@ -42,7 +42,7 @@ def _install_workflow_stubs(monkeypatch, tmp_path: Path):
         image = cv2.imread(str(target_path))
         return image, None, None
 
-    def fake_compare_text_results(data1, data2, output_path=None):
+    def fake_compare_text_results(data1, data2, output_path=None, extra_fields=None):
         compare_text_calls.append(output_path)
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)

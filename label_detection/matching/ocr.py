@@ -30,7 +30,53 @@ FIELD_LABEL_ALIASES: Dict[str, Sequence[str]] = {
     "air_volume": ("airflowvolume", "airvolume"),
     "cooling_capacity": ("coolingcapacity",),
     "heating_capacity": ("heatingcapacity",),
+    "noise": ("soundpressurelevelh", "soundpressurelevel", "noiselevel", "noise"),
+    "mfg_date": ("manufactureddate", "mfgdate", "date"),
+    "address": ("address", "add"),
 }
+
+LABEL_FIELD_PREFIX = "label:"
+
+FIELD_LABEL_PATTERNS: Dict[str, str] = {
+    "model_number": r"(?<![A-Za-z])(Model)(?![A-Za-z])",
+    "net_weight": r"(?<![A-Za-z])(N\s*\.?\s*W\s*\.?|Net\s*Weight)(?![A-Za-z])",
+    "gross_weight": r"(?<![A-Za-z])(G\s*\.?\s*W\s*\.?|Gross\s*Weight)(?![A-Za-z])",
+    "color": r"(?<![A-Za-z])(Color)(?![A-Za-z])",
+    "connection_pipes": r"(?<![A-Za-z])(Connection\s*Pipes?)(?![A-Za-z])",
+    "refrigerant": r"(?<![A-Za-z])(Refrigerant)(?![A-Za-z])",
+    "barcode": r"(?<![A-Za-z])(Serial\s*No\.?|Serial\s*Number|Barcode)(?![A-Za-z])",
+    "weight": r"(?<![A-Za-z])(Weight)(?![A-Za-z])",
+    "frequency": r"(?<![A-Za-z])(Rated\s*Frequency|Frequency)(?![A-Za-z])",
+    "voltage": r"(?<![A-Za-z])(Rated\s*Voltage|Voltage)(?![A-Za-z])",
+    "air_volume": r"(?<![A-Za-z])(Air\s*Flow\s*Volume|Air\s*Volume)(?![A-Za-z])",
+    "cooling_capacity": r"(?<![A-Za-z])(Cooling\s*Capacity)(?![A-Za-z])",
+    "heating_capacity": r"(?<![A-Za-z])(Heating\s*Capacity)(?![A-Za-z])",
+    "noise": r"(?<![A-Za-z])(Sound\s*Pressure\s*Level(?:\s*\(H\))?|Noise(?:\s*Level)?)(?![A-Za-z])",
+    "mfg_date": r"(?<![A-Za-z])(Manufactured\s*Date|MFG\s*Date|Date)(?![A-Za-z])",
+    "address": r"(?<![A-Za-z])(Add(?:ress)?\.?)(?![A-Za-z])",
+}
+
+FIELD_LABEL_REGEXES: Dict[str, re.Pattern[str]] = {
+    field_name: re.compile(pattern, re.IGNORECASE)
+    for field_name, pattern in FIELD_LABEL_PATTERNS.items()
+}
+
+FIELD_LABEL_FUZZY_MIN_SCORE = 0.88
+
+
+def make_label_field_name(field_name: str) -> str:
+    return f"{LABEL_FIELD_PREFIX}{field_name}"
+
+
+def is_label_field_name(field_name: object) -> bool:
+    return str(field_name or "").startswith(LABEL_FIELD_PREFIX)
+
+
+def get_base_field_name(field_name: object) -> str:
+    normalized = str(field_name or "")
+    if is_label_field_name(normalized):
+        return normalized[len(LABEL_FIELD_PREFIX) :]
+    return normalized
 
 
 def normalize_text_for_match(text: object) -> str:
@@ -71,6 +117,237 @@ def normalize_text_for_compare(text: object) -> str:
 def field_values_match(expected: object, actual: object) -> bool:
     """Return whether two extracted field values are equivalent."""
     return normalize_text_for_compare(expected) == normalize_text_for_compare(actual)
+
+
+def normalize_label_text_for_compare(text: object) -> str:
+    """Normalize label captions while keeping case changes significant."""
+    if text is None:
+        return ""
+
+    normalized = unicodedata.normalize("NFKC", str(text)).strip()
+    if not normalized or normalized.lower() == "none":
+        return ""
+
+    normalized = normalized.replace("³", "3")
+    return re.sub(r"[^0-9A-Za-z]+", "", normalized)
+
+
+def label_values_match(expected: object, actual: object) -> bool:
+    return normalize_label_text_for_compare(expected) == normalize_label_text_for_compare(actual)
+
+
+def text_field_values_match(field_name: object, expected: object, actual: object) -> bool:
+    if is_label_field_name(field_name):
+        return label_values_match(expected, actual)
+    return field_values_match(expected, actual)
+
+
+def _coerce_float(value: object) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_box_rect(points: object) -> tuple[float, float, float, float] | None:
+    if points is None:
+        return None
+
+    try:
+        point_list = list(points)
+    except TypeError:
+        return None
+
+    if len(point_list) == 4:
+        scalars = [_coerce_float(value) for value in point_list]
+        if all(value is not None for value in scalars):
+            x1, y1, x2, y2 = scalars
+            return x1, y1, x2, y2
+
+    xy_points = []
+    for point in point_list:
+        try:
+            coords = list(point)
+        except TypeError:
+            continue
+        if len(coords) < 2:
+            continue
+        x = _coerce_float(coords[0])
+        y = _coerce_float(coords[1])
+        if x is None or y is None:
+            continue
+        xy_points.append((x, y))
+
+    if not xy_points:
+        return None
+
+    xs = [point[0] for point in xy_points]
+    ys = [point[1] for point in xy_points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _iter_label_candidates(ocr_boxes: Sequence[OCRBox]) -> List[Dict[str, object]]:
+    box_metas: List[Dict[str, object]] = []
+    for idx, box_info in enumerate(ocr_boxes):
+        box_text = box_info[1] if len(box_info) > 1 else ""
+        raw_text = unicodedata.normalize("NFKC", str(box_text or "")).strip()
+        if not raw_text:
+            continue
+
+        rect = _extract_box_rect(box_info[0] if box_info else None)
+        if rect is None:
+            continue
+
+        x1, y1, x2, y2 = rect
+        width = max(x2 - x1, 1.0)
+        height = max(y2 - y1, 1.0)
+        confidence = (
+            float(box_info[2])
+            if len(box_info) > 2 and isinstance(box_info[2], (int, float))
+            else 0.0
+        )
+        box_metas.append(
+            {
+                "text": raw_text,
+                "box_indices": [idx],
+                "x1": x1,
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+                "width": width,
+                "height": height,
+                "center_y": (y1 + y2) / 2.0,
+                "confidence": confidence,
+            }
+        )
+
+    box_metas.sort(key=lambda item: (item["center_y"], item["x1"]))
+    candidates: List[Dict[str, object]] = []
+
+    for meta in box_metas:
+        candidates.append(
+            {
+                "text": meta["text"],
+                "box_indices": list(meta["box_indices"]),
+                "confidence": meta["confidence"],
+            }
+        )
+
+    for left, right in zip(box_metas, box_metas[1:]):
+        vertical_overlap = max(0.0, min(left["y2"], right["y2"]) - max(left["y1"], right["y1"]))
+        min_height = min(left["height"], right["height"])
+        if vertical_overlap < 0.55 * min_height:
+            continue
+
+        if abs(left["center_y"] - right["center_y"]) > 0.4 * max(left["height"], right["height"]):
+            continue
+
+        horizontal_gap = float(right["x1"]) - float(left["x2"])
+        if horizontal_gap < -0.1 * max(left["height"], right["height"]):
+            continue
+        if horizontal_gap > max(24.0, 0.35 * max(left["height"], right["height"])):
+            continue
+
+        candidates.append(
+            {
+                "text": f"{left['text']} {right['text']}".strip(),
+                "box_indices": list(left["box_indices"]) + list(right["box_indices"]),
+                "confidence": min(left["confidence"], right["confidence"]),
+            }
+        )
+
+    return candidates
+
+
+def _extract_label_match_from_candidate(
+    field_name: str,
+    raw_text: str,
+) -> tuple[str, int, float] | None:
+    pattern = FIELD_LABEL_REGEXES.get(field_name)
+    if pattern is not None:
+        match = pattern.search(raw_text)
+        if match:
+            return match.group(1).strip(), 1, 1.0
+
+    alpha_count = len(re.findall(r"[A-Za-z]", raw_text))
+    digit_count = len(re.findall(r"\d", raw_text))
+    if alpha_count < 3 or digit_count > 1:
+        return None
+
+    raw_norm = normalize_text_for_match(raw_text)
+    if len(raw_norm) < 3:
+        return None
+
+    best_alias = None
+    best_score = 0.0
+    for alias in FIELD_LABEL_ALIASES.get(field_name, ()):
+        alias_norm = normalize_text_for_match(alias)
+        if len(alias_norm) < 2:
+            continue
+        score = SequenceMatcher(None, raw_norm, alias_norm).ratio()
+        if score > best_score:
+            best_score = score
+            best_alias = alias_norm
+
+    if best_alias is None or best_score < FIELD_LABEL_FUZZY_MIN_SCORE:
+        return None
+
+    if abs(len(raw_norm) - len(best_alias)) > max(2, int(len(best_alias) * 0.35)):
+        return None
+
+    return raw_text.strip(), 0, best_score
+
+
+def extract_field_labels_from_ocr_boxes(
+    ocr_boxes: Sequence[OCRBox],
+    field_names: Sequence[str],
+) -> Dict[str, Dict[str, object]]:
+    """
+    Extract observed field-label captions from OCR boxes.
+
+    Only returns fields with a confident label-like OCR hit.
+    """
+    observed: Dict[str, Dict[str, object]] = {}
+    candidates = _iter_label_candidates(ocr_boxes)
+
+    for field_name in field_names:
+        if field_name not in FIELD_LABEL_REGEXES and field_name not in FIELD_LABEL_ALIASES:
+            continue
+
+        best_candidate = None
+        for candidate in candidates:
+            raw_text = str(candidate.get("text") or "").strip()
+            if not raw_text:
+                continue
+
+            match_result = _extract_label_match_from_candidate(field_name, raw_text)
+            if match_result is None:
+                continue
+
+            label_text, exact_rank, match_score = match_result
+            label_norm = normalize_label_text_for_compare(label_text)
+            box_norm = normalize_label_text_for_compare(raw_text)
+            if not label_norm or not box_norm:
+                continue
+
+            extra_chars = max(len(box_norm) - len(label_norm), 0)
+            confidence = float(candidate.get("confidence") or 0.0)
+            score = (exact_rank, match_score, len(label_norm), -extra_chars, confidence)
+
+            if best_candidate is None or score > best_candidate["score"]:
+                best_candidate = {
+                    "text": label_text,
+                    "box_indices": list(candidate.get("box_indices") or []),
+                    "score": score,
+                }
+
+        if best_candidate is not None:
+            observed[field_name] = {
+                "text": best_candidate["text"],
+                "box_indices": best_candidate["box_indices"],
+            }
+
+    return observed
 
 
 def _normalize_raw_text(text: object) -> str:

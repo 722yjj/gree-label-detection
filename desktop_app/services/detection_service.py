@@ -8,7 +8,7 @@ from typing import Any, Mapping
 
 from desktop_app.models import DetectionJobRequest, DetectionJobResult
 from label_detection.core.config import PROJECT_ROOT
-from label_detection.matching.ocr import field_values_match
+from label_detection.matching.ocr import text_field_values_match
 
 
 class DetectionService:
@@ -79,7 +79,11 @@ class DetectionService:
         text_match_count = sum(
             1
             for field_name in field_names
-            if field_values_match(template_data.get(field_name), target_data.get(field_name))
+            if text_field_values_match(
+                field_name,
+                template_data.get(field_name),
+                target_data.get(field_name),
+            )
         )
 
         graphic = dict(result.get("graphic_comparison") or {})

@@ -49,6 +49,27 @@ def test_build_summary_text_uses_structured_counts():
     assert "图形不一致: 1" in text
 
 
+def test_summarize_result_counts_label_text_difference():
+    result = {
+        "success": True,
+        "verdict": "需复核",
+        "text_detection": {
+            "fields": ["weight", "label:weight"],
+            "template_data": {"weight": "13.5kg", "label:weight": "Weight"},
+            "target_data": {"weight": "13.5kg", "label:weight": "weiGht"},
+        },
+        "graphic_comparison": {
+            "resolved_match_count": 0,
+            "comparison_results": [],
+        },
+    }
+
+    summary = DetectionService._summarize_result(result)
+
+    assert summary["text_match_count"] == 1
+    assert summary["text_total_count"] == 2
+
+
 def test_detection_service_passes_output_mode_to_workflow(tmp_path, monkeypatch):
     from desktop_app.models import DetectionJobRequest, TemplateRecord
 

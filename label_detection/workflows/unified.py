@@ -53,7 +53,15 @@ from label_detection.matching.layout import (
     infer_corresponding_region,
     estimate_region_foreground_ratio,
 )
-from label_detection.matching.ocr import field_values_match, find_matching_ocr_boxes
+from label_detection.matching.ocr import (
+    extract_field_labels_from_ocr_boxes,
+    field_values_match,
+    find_matching_ocr_boxes,
+    get_base_field_name,
+    is_label_field_name,
+    make_label_field_name,
+    text_field_values_match,
+)
 from label_detection.schema import LABEL_KIND_COMPACT, get_label_model, infer_label_kind
 from label_detection.preprocessing.border import crop_to_border, find_template_crop_rect
 from label_detection.preprocessing.pipeline import preprocess_target
@@ -355,7 +363,7 @@ def run_llm_extraction(
     return model_cls()
 
 
-def compare_text_results(data1, data2, output_path=None):
+def compare_text_results(data1, data2, output_path=None, extra_fields=None):
     """
     对比两张图片的文字检测结果，输出 Excel
 
@@ -370,13 +378,20 @@ def compare_text_results(data1, data2, output_path=None):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     field_names = list(type(data1).model_fields.keys())
+    template_values = {field_name: getattr(data1, field_name) for field_name in field_names}
+    target_values = {field_name: getattr(data2, field_name) for field_name in field_names}
+    extra_fields = dict(extra_fields or {})
+    for field_name, values in extra_fields.items():
+        field_names.append(field_name)
+        template_values[field_name], target_values[field_name] = values
+
     data_dict = {"参数": [], "模板图片": [], "实拍图片": [], "是否一致": []}
     match_flags: List[bool] = []
 
     for k in field_names:
-        v1 = getattr(data1, k)
-        v2 = getattr(data2, k)
-        is_match = field_values_match(v1, v2)
+        v1 = template_values.get(k)
+        v2 = target_values.get(k)
+        is_match = text_field_values_match(k, v1, v2)
         data_dict["参数"].append(k)
         data_dict["模板图片"].append(v1 if v1 else "-")
         data_dict["实拍图片"].append(v2 if v2 else "-")
@@ -801,8 +816,8 @@ def run_unified_detection(
 
         label_kind = infer_label_kind(template_text or target_text)
         model_cls = get_label_model(label_kind)
-        comparison_fields = list(model_cls.model_fields.keys())
-        print(f"\n[2.3] 识别文字标签类型: {label_kind} ({len(comparison_fields)} 个字段)")
+        structured_fields = list(model_cls.model_fields.keys())
+        print(f"\n[2.3] 识别文字标签类型: {label_kind} ({len(structured_fields)} 个字段)")
         print("[2.3] LLM/规则提取模板结构化信息...")
         llm_start = time.time()
         data1 = run_llm_extraction(template_path, template_text, model_cls, label_kind)
@@ -818,6 +833,34 @@ def run_unified_detection(
         )
         print(f"  LLM 耗时: {time.time() - llm_start:.2f} 秒")
 
+        template_data = data1.model_dump()
+        target_data = data2.model_dump()
+        template_label_hits = extract_field_labels_from_ocr_boxes(
+            template_boxes,
+            structured_fields,
+        )
+        target_label_hits = extract_field_labels_from_ocr_boxes(
+            target_boxes,
+            structured_fields,
+        )
+        label_extra_fields = {}
+        label_fields = []
+        for field_name in structured_fields:
+            template_label = (template_label_hits.get(field_name) or {}).get("text")
+            target_label = (target_label_hits.get(field_name) or {}).get("text")
+            if not template_label or not target_label:
+                continue
+
+            label_field_name = make_label_field_name(field_name)
+            label_fields.append(label_field_name)
+            label_extra_fields[label_field_name] = (template_label, target_label)
+            template_data[label_field_name] = template_label
+            target_data[label_field_name] = target_label
+
+        comparison_fields = structured_fields + label_fields
+        if label_fields:
+            print(f"  附加标签名比对: {len(label_fields)} 项")
+
         # 2.5 对比文字结果
         print("\n[2.5] 对比文字结果...")
         if output_options.save_text_excel:
@@ -825,13 +868,24 @@ def run_unified_detection(
                 data1,
                 data2,
                 str(work_root / "text_comparison.xlsx"),
+                extra_fields=label_extra_fields,
             )
 
         results["text_detection"] = {
             "label_kind": label_kind,
             "fields": comparison_fields,
-            "template_data": data1.model_dump(),
-            "target_data": data2.model_dump(),
+            "value_fields": structured_fields,
+            "label_fields": label_fields,
+            "template_data": template_data,
+            "target_data": target_data,
+            "detected_labels": {
+                "template": {
+                    field_name: item["text"] for field_name, item in template_label_hits.items()
+                },
+                "target": {
+                    field_name: item["text"] for field_name, item in target_label_hits.items()
+                },
+            },
             "excel_path": text_excel_path,
             "time": time.time() - start_time,
         }
@@ -1101,10 +1155,53 @@ def run_unified_detection(
 
         print("  寻找并标注差异文字区域...")
         for k in comparison_fields:
-            v1 = getattr(data1, k)
-            v2 = getattr(data2, k)
+            v1 = template_data.get(k)
+            v2 = target_data.get(k)
 
-            if not field_values_match(v1, v2):
+            if not text_field_values_match(k, v1, v2):
+                if is_label_field_name(k):
+                    base_field_name = get_base_field_name(k)
+                    label_hit = target_label_hits.get(base_field_name)
+                    if label_hit is None:
+                        print(
+                            f"    - 字段标签 '{base_field_name}' 差异 (值: {v2}) -> 未找到对应 OCR 框"
+                        )
+                        continue
+
+                    matched_box_indices = [
+                        int(box_idx)
+                        for box_idx in (label_hit.get("box_indices") or [])
+                    ]
+                    if not matched_box_indices:
+                        print(
+                            f"    - 字段标签 '{base_field_name}' 差异 (值: {v2}) -> 未找到对应 OCR 框"
+                        )
+                        continue
+                    matched_texts = [target_boxes[b_idx][1] for b_idx in matched_box_indices]
+                    print(
+                        f"    - 字段标签 '{base_field_name}' 差异 (值: {v2}) -> 对应 "
+                        f"{len(matched_box_indices)} 个 OCR 框: {matched_texts}"
+                    )
+                    for b_idx in matched_box_indices:
+                        pts = np.array(target_boxes[b_idx][0], dtype=np.int32)
+                        if pts.shape == (4,):
+                            x1, y1, x2, y2 = pts
+                            poly = np.array(
+                                [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+                                dtype=np.int32,
+                            )
+                        else:
+                            poly = pts.reshape((-1, 1, 2))
+                        cv2.polylines(
+                            vis_image,
+                            [poly],
+                            isClosed=True,
+                            color=(0, 0, 255),
+                            thickness=3,
+                        )
+                        diff_count += 1
+                    continue
+
                 target_val = str(v2) if v2 else ""
                 if not target_val or target_val == "None":
                     continue
@@ -1230,7 +1327,7 @@ def run_unified_detection(
         match_count = sum(
             1
             for k in comparison_fields
-            if field_values_match(getattr(data1, k), getattr(data2, k))
+            if text_field_values_match(k, template_data.get(k), target_data.get(k))
         )
         total_fields = len(comparison_fields)
 

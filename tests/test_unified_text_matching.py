@@ -32,3 +32,28 @@ def test_compare_text_results_uses_normalized_field_matching(tmp_path):
 
     assert worksheet.cell(row=2, column=4).value == "✓"
     assert worksheet.cell(row=3, column=4).value == "✗"
+
+
+def test_compare_text_results_marks_label_text_case_difference(tmp_path):
+    template = DummyLabel(
+        manufacturer="GREE ELECTRIC APPLIANCES,INC.OF ZHUHAI",
+        weight="13.5kg",
+    )
+    target = DummyLabel(
+        manufacturer="GREE ELECTRIC APPLIANCES,INC.OF ZHUHAI",
+        weight="13.5kg",
+    )
+
+    output_path = tmp_path / "text_comparison.xlsx"
+    compare_text_results(
+        template,
+        target,
+        str(output_path),
+        extra_fields={"label:weight": ("Weight", "weiGht")},
+    )
+
+    workbook = load_workbook(output_path)
+    worksheet = workbook["文字对比"]
+
+    assert worksheet.cell(row=4, column=1).value == "label:weight"
+    assert worksheet.cell(row=4, column=4).value == "✗"
