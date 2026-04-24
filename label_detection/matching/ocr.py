@@ -136,9 +136,36 @@ def label_values_match(expected: object, actual: object) -> bool:
     return normalize_label_text_for_compare(expected) == normalize_label_text_for_compare(actual)
 
 
+def label_field_values_match(field_name: object, expected: object, actual: object) -> bool:
+    expected_norm = normalize_label_text_for_compare(expected)
+    actual_norm = normalize_label_text_for_compare(actual)
+    if expected_norm == actual_norm:
+        return True
+
+    # Keep OCR label comparisons case-sensitive when the text is otherwise the
+    # same: "Weight" and "weiGht" should still surface as a possible print/OCR
+    # issue. Alias matching below is for genuinely shorter but valid captions
+    # such as "Date" vs "Manufactured Date".
+    if expected_norm.casefold() == actual_norm.casefold():
+        return False
+
+    base_field_name = get_base_field_name(field_name)
+    alias_norms = {
+        normalize_text_for_match(alias)
+        for alias in FIELD_LABEL_ALIASES.get(base_field_name, ())
+    }
+    if not alias_norms:
+        return False
+
+    return (
+        normalize_text_for_match(expected) in alias_norms
+        and normalize_text_for_match(actual) in alias_norms
+    )
+
+
 def text_field_values_match(field_name: object, expected: object, actual: object) -> bool:
     if is_label_field_name(field_name):
-        return label_values_match(expected, actual)
+        return label_field_values_match(field_name, expected, actual)
     return field_values_match(expected, actual)
 
 

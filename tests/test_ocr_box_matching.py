@@ -53,6 +53,30 @@ class TestTextFieldValuesMatch:
     def test_treats_label_case_change_as_difference(self):
         assert not text_field_values_match("label:weight", "Weight", "weiGht")
 
+    def test_treats_short_ocr_label_aliases_as_match(self):
+        assert text_field_values_match(
+            "label:voltage",
+            "Rated Voltage",
+            "Voltage",
+        )
+        assert text_field_values_match(
+            "label:frequency",
+            "Rated Frequency",
+            "Frequency",
+        )
+        assert text_field_values_match(
+            "label:mfg_date",
+            "Manufactured Date",
+            "Date",
+        )
+
+    def test_rejects_noisy_label_alias_prefix(self):
+        assert not text_field_values_match(
+            "label:voltage",
+            "Rated Voltage",
+            "dVoltage",
+        )
+
 
 class TestFindMatchingOcrBoxes:
     def _make_box(self, text):
