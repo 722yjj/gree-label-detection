@@ -931,11 +931,19 @@ def merge_fragmented_split_regions(regions: Sequence[Dict]) -> List[Dict]:
                     candidate_metrics = _box_metrics(candidate["coordinate"])
                     min_area = min(current_metrics["area"], candidate_metrics["area"])
                     max_area = max(current_metrics["area"], candidate_metrics["area"])
-                    mergeable = (
+                    close_small_fragment = (
                         overlap >= 0.60
                         and gap <= max(14.0, parent_metrics["height"] * 0.14)
                         and min_area / max(1.0, max_area) <= 0.70
                     )
+                    stacked_symbol_fragment = (
+                        overlap >= 0.55
+                        and gap <= max(14.0, parent_metrics["height"] * 0.65)
+                        and min_area / max(1.0, max_area) >= 0.40
+                        and current_metrics["width"] <= parent_metrics["width"] * 0.45
+                        and candidate_metrics["width"] <= parent_metrics["width"] * 0.45
+                    )
+                    mergeable = close_small_fragment or stacked_symbol_fragment
                     if not mergeable:
                         continue
 

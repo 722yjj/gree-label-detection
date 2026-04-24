@@ -384,6 +384,24 @@ class TestSplitRegionPostFilter:
         assert merged[0]["coordinate"] == [40, 60, 110, 162]
         assert merged[1]["coordinate"] == [250, 55, 320, 175]
 
+    def test_merge_fragmented_split_regions_merges_stacked_symbol_fragments(self):
+        parent = [38, 527, 236, 619]
+        regions = [
+            self._make_region(42, 528, 94, 624, parent_box=parent, child_idx=0),
+            self._make_region(113, 528, 165, 624, parent_box=parent, child_idx=1),
+            self._make_region(185, 535, 227, 556, parent_box=parent, child_idx=2),
+            self._make_region(175, 604, 233, 621, parent_box=parent, child_idx=3),
+        ]
+
+        merged = merge_fragmented_split_regions(regions)
+
+        assert len(merged) == 3
+        merged = sorted(merged, key=lambda item: item["coordinate"][0])
+        assert merged[0]["coordinate"] == [42, 528, 94, 624]
+        assert merged[1]["coordinate"] == [113, 528, 165, 624]
+        assert merged[2]["coordinate"] == [175, 535, 233, 621]
+        assert merged[2]["merged_child_indices"] == [2, 3]
+
     def test_filter_split_image_regions_skips_barcode_clusters(self):
         img = np.full((240, 360, 3), 255, dtype=np.uint8)
         for x in range(140, 310, 8):
