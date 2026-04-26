@@ -63,6 +63,8 @@ from label_detection.matching.ocr import (
     get_base_field_name,
     is_label_field_name,
     make_label_field_name,
+    normalize_text_for_compare,
+    normalize_text_for_match,
     text_field_values_match,
 )
 from label_detection.schema import (
@@ -168,7 +170,7 @@ def preprocess_template_image(template_path, output_dir=DEFAULT_OUTPUT_DIR):
         print(f"  裁剪后尺寸: {cropped.shape}")
 
     # 保存预处理结果
-    output_path = os.path.join(output_dir, "template_preprocessed.jpg")
+    output_path = os.path.join(output_dir, "template_preprocessed.png")
     cv2.imwrite(output_path, cropped)
     print(f"  已保存: {output_path}")
 
@@ -545,6 +547,850 @@ def _should_suppress_graphic_visual_box(evidence: Dict[str, Any]) -> bool:
         and float(evidence.get("unmatched_template_ratio", 1.0)) <= 0.10
         and float(evidence.get("largest_component_ratio", 1.0)) <= 0.04
     )
+
+
+def _ignored_regions_for_uncovered_recovery(
+    regions: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    barcode_skip_reasons = {
+        "barcode",
+        "barcode_cluster",
+        "local_barcode_subregion",
+    }
+    return [
+        dict(region)
+        for region in regions
+        if str(region.get("skip_reason") or "") not in barcode_skip_reasons
+    ]
+
+
+def _ocr_points_to_box(points: object) -> Optional[List[int]]:
+    if points is None:
+        return None
+    arr = np.asarray(points, dtype=float)
+    if arr.size == 4 and arr.ndim == 1:
+        x1, y1, x2, y2 = arr.tolist()
+        return _clip_box_to_image([x1, y1, x2, y2], (10**9, 10**9))
+
+    if arr.ndim == 1:
+        if arr.size % 2 != 0:
+            return None
+        arr = arr.reshape((-1, 2))
+    if arr.ndim != 2 or arr.shape[1] < 2 or arr.shape[0] == 0:
+        return None
+
+    xs = arr[:, 0]
+    ys = arr[:, 1]
+    return [
+        int(round(float(xs.min()))),
+        int(round(float(ys.min()))),
+        int(round(float(xs.max()))),
+        int(round(float(ys.max()))),
+    ]
+
+
+def _ocr_points_to_poly_and_box(points: object) -> Tuple[np.ndarray, Optional[List[int]]]:
+    box = _ocr_points_to_box(points)
+    pts = np.array(points, dtype=np.int32)
+    if pts.shape == (4,):
+        x1, y1, x2, y2 = [int(v) for v in pts]
+        poly = np.array(
+            [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+            dtype=np.int32,
+        )
+        box = [x1, y1, x2, y2]
+    else:
+        poly = pts.reshape((-1, 1, 2))
+        if box is None:
+            x, y, w, h = cv2.boundingRect(poly)
+            box = [x, y, x + w, y + h]
+    return poly, box
+
+
+def _box_iou(box1: Sequence[float], box2: Sequence[float]) -> float:
+    x1 = max(float(box1[0]), float(box2[0]))
+    y1 = max(float(box1[1]), float(box2[1]))
+    x2 = min(float(box1[2]), float(box2[2]))
+    y2 = min(float(box1[3]), float(box2[3]))
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    intersection = (x2 - x1) * (y2 - y1)
+    area1 = max(0.0, float(box1[2]) - float(box1[0])) * max(
+        0.0,
+        float(box1[3]) - float(box1[1]),
+    )
+    area2 = max(0.0, float(box2[2]) - float(box2[0])) * max(
+        0.0,
+        float(box2[3]) - float(box2[1]),
+    )
+    union = area1 + area2 - intersection
+    return float(intersection / union) if union > 0 else 0.0
+
+
+def _box_overlap_coverage(box1: Sequence[float], box2: Sequence[float]) -> float:
+    x1 = max(float(box1[0]), float(box2[0]))
+    y1 = max(float(box1[1]), float(box2[1]))
+    x2 = min(float(box1[2]), float(box2[2]))
+    y2 = min(float(box1[3]), float(box2[3]))
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    intersection = (x2 - x1) * (y2 - y1)
+    area1 = max(1.0, (float(box1[2]) - float(box1[0])) * (float(box1[3]) - float(box1[1])))
+    return float(intersection / area1)
+
+
+def _local_text_diff_evidence(
+    template_image: np.ndarray,
+    target_image: np.ndarray,
+    target_box: Sequence[float],
+    template_box: Sequence[float] | None = None,
+) -> Dict[str, Any]:
+    mapped_template_box = (
+        _map_box_between_shapes(
+            target_box,
+            target_image.shape[:2],
+            template_image.shape[:2],
+        )
+        if template_box is None
+        else _clip_box_to_image(template_box, template_image.shape[:2])
+    )
+    evidence = _local_graphic_diff_evidence(
+        template_image,
+        target_image,
+        mapped_template_box,
+        target_box,
+    )
+    evidence["mapped_template_box"] = mapped_template_box
+    return evidence
+
+
+def _should_suppress_text_visual_box(
+    evidence: Dict[str, Any],
+    annotation: Optional[Dict[str, Any]] = None,
+) -> bool:
+    if os.getenv("ENABLE_TEXT_LOCAL_DIFF_FILTER", "1") == "0":
+        return False
+    if not evidence.get("valid"):
+        return False
+    field_name = str((annotation or {}).get("field") or "")
+    if field_name == make_label_field_name("air_volume") and max(
+        float(evidence.get("diff_ratio", 0.0)),
+        float(evidence.get("unmatched_template_ratio", 0.0)),
+        float(evidence.get("unmatched_target_ratio", 0.0)),
+    ) >= 0.009:
+        return False
+    return (
+        float(evidence.get("diff_ratio", 1.0)) <= 0.05
+        and float(evidence.get("unmatched_target_ratio", 1.0)) <= 0.05
+        and float(evidence.get("unmatched_template_ratio", 1.0)) <= 0.07
+        and float(evidence.get("largest_component_ratio", 1.0)) <= 0.045
+    )
+
+
+def _add_text_visualization_annotation(
+    *,
+    vis_image: np.ndarray,
+    visualization_annotations: List[Dict],
+    suppressed_annotations: List[Dict],
+    template_image: np.ndarray,
+    target_image: np.ndarray,
+    box: Sequence[float],
+    poly: Optional[np.ndarray],
+    annotation: Dict[str, Any],
+    template_box: Sequence[float] | None = None,
+    force: bool = False,
+) -> bool:
+    clipped_box = _clip_box_to_image(box, target_image.shape[:2])
+    if clipped_box is None:
+        return False
+    if _has_existing_text_annotation(clipped_box, visualization_annotations):
+        return False
+
+    evidence = _local_text_diff_evidence(
+        template_image,
+        target_image,
+        clipped_box,
+        template_box=template_box,
+    )
+    annotation = {
+        **annotation,
+        "box": [int(v) for v in clipped_box],
+        "local_diff_evidence": evidence,
+    }
+    if not force and _should_suppress_text_visual_box(evidence, annotation):
+        suppressed_annotations.append(
+            {
+                **annotation,
+                "kind": "text",
+                "status": "suppressed",
+                "reason": "local_diff_low",
+            }
+        )
+        print(
+            "    - 文字框过滤: "
+            f"{annotation.get('field', annotation.get('source', 'text'))} "
+            f"(local_diff={evidence.get('diff_ratio')}, "
+            f"component={evidence.get('largest_component_ratio')})"
+        )
+        return False
+
+    if poly is not None:
+        cv2.polylines(
+            vis_image,
+            [poly],
+            isClosed=True,
+            color=(0, 0, 255),
+            thickness=3,
+        )
+    else:
+        x1, y1, x2, y2 = [int(v) for v in clipped_box]
+        cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 0, 255), 3)
+
+    visualization_annotations.append(annotation)
+    return True
+
+
+def _ocr_box_and_poly_for_index(
+    ocr_boxes: Sequence[tuple],
+    box_idx: int,
+    image_shape: Tuple[int, int],
+) -> Tuple[Optional[np.ndarray], Optional[List[int]], str]:
+    if box_idx < 0 or box_idx >= len(ocr_boxes):
+        return None, None, ""
+
+    box_info = ocr_boxes[box_idx]
+    text = str(box_info[1] if len(box_info) > 1 else "").strip()
+    poly, box = _ocr_points_to_poly_and_box(box_info[0] if box_info else None)
+    clipped_box = _clip_box_to_image(box or [], image_shape) if box is not None else None
+    return poly, clipped_box, text
+
+
+def _union_boxes(boxes: Sequence[Sequence[float]]) -> Optional[List[int]]:
+    valid_boxes = [box for box in boxes if box is not None and len(box) == 4]
+    if not valid_boxes:
+        return None
+
+    return [
+        int(round(min(float(box[0]) for box in valid_boxes))),
+        int(round(min(float(box[1]) for box in valid_boxes))),
+        int(round(max(float(box[2]) for box in valid_boxes))),
+        int(round(max(float(box[3]) for box in valid_boxes))),
+    ]
+
+
+def _combined_ocr_text(
+    ocr_boxes: Sequence[tuple],
+    box_indices: Sequence[int],
+) -> str:
+    texts = []
+    for box_idx in box_indices:
+        if box_idx < 0 or box_idx >= len(ocr_boxes):
+            continue
+        text = str(ocr_boxes[box_idx][1] if len(ocr_boxes[box_idx]) > 1 else "").strip()
+        if text:
+            texts.append(text)
+    return " ".join(texts).strip()
+
+
+def _overlapping_ocr_indices(
+    ocr_boxes: Sequence[tuple],
+    image_shape: Tuple[int, int],
+    anchor_box: Sequence[float],
+) -> List[int]:
+    clipped_anchor = _clip_box_to_image(anchor_box, image_shape)
+    if clipped_anchor is None:
+        return []
+
+    ax1, ay1, ax2, ay2 = [float(v) for v in clipped_anchor]
+    expanded_anchor = [
+        max(0.0, ax1 - 10.0),
+        max(0.0, ay1 - 8.0),
+        ax2 + 10.0,
+        ay2 + 8.0,
+    ]
+    matches: List[Tuple[float, int]] = []
+    for box_idx, box_info in enumerate(ocr_boxes):
+        box = _ocr_points_to_box(box_info[0] if box_info else None)
+        box = _clip_box_to_image(box or [], image_shape) if box is not None else None
+        if box is None:
+            continue
+
+        bx1, by1, bx2, by2 = [float(v) for v in box]
+        cx = (bx1 + bx2) / 2.0
+        cy = (by1 + by2) / 2.0
+        center_inside = (
+            expanded_anchor[0] <= cx <= expanded_anchor[2]
+            and expanded_anchor[1] <= cy <= expanded_anchor[3]
+        )
+        ocr_coverage = _box_overlap_coverage(box, clipped_anchor)
+        anchor_coverage = _box_overlap_coverage(clipped_anchor, box)
+        if not center_inside and ocr_coverage < 0.35 and anchor_coverage < 0.20:
+            continue
+
+        vertical_overlap = max(0.0, min(ay2, by2) - max(ay1, by1))
+        min_height = max(1.0, min(ay2 - ay1, by2 - by1))
+        if vertical_overlap / min_height < 0.35:
+            continue
+
+        distance = abs(cx - ((ax1 + ax2) / 2.0)) + abs(cy - ((ay1 + ay2) / 2.0)) * 2.0
+        score = max(ocr_coverage, anchor_coverage) - distance / 10000.0
+        matches.append((score, box_idx))
+
+    matches.sort(key=lambda item: item[0], reverse=True)
+    return [box_idx for _, box_idx in matches]
+
+
+def _draw_ocr_indices_as_text_diff(
+    *,
+    vis_image: np.ndarray,
+    visualization_annotations: List[Dict],
+    suppressed_annotations: List[Dict],
+    template_image: np.ndarray,
+    target_image: np.ndarray,
+    target_boxes: Sequence[tuple],
+    field_name: str,
+    target_box_indices: Sequence[int],
+    target_value: object,
+    template_value: object = None,
+    source: Optional[str] = None,
+    template_box: Sequence[float] | None = None,
+    base_field: Optional[str] = None,
+) -> int:
+    added_count = 0
+    for b_idx in target_box_indices:
+        poly, text_box, ocr_text = _ocr_box_and_poly_for_index(
+            target_boxes,
+            int(b_idx),
+            target_image.shape[:2],
+        )
+        if text_box is None:
+            continue
+
+        annotation = {
+            "kind": "text",
+            "status": "diff",
+            "field": field_name,
+            "ocr_text": ocr_text,
+            "target_value": target_value,
+        }
+        if source:
+            annotation["source"] = source
+        if template_value is not None:
+            annotation["template_value"] = template_value
+        if base_field:
+            annotation["base_field"] = base_field
+
+        added = _add_text_visualization_annotation(
+            vis_image=vis_image,
+            visualization_annotations=visualization_annotations,
+            suppressed_annotations=suppressed_annotations,
+            template_image=template_image,
+            target_image=target_image,
+            box=text_box,
+            poly=poly,
+            annotation=annotation,
+            template_box=template_box,
+        )
+        if added:
+            added_count += 1
+    return added_count
+
+
+def _draw_mapped_template_text_diff(
+    *,
+    vis_image: np.ndarray,
+    visualization_annotations: List[Dict],
+    suppressed_annotations: List[Dict],
+    template_image: np.ndarray,
+    target_image: np.ndarray,
+    field_name: str,
+    template_box: Sequence[float],
+    template_value: object,
+    target_value: object = None,
+    source: str,
+    base_field: Optional[str] = None,
+    force: bool = False,
+) -> bool:
+    target_box = _map_box_between_shapes(
+        template_box,
+        template_image.shape[:2],
+        target_image.shape[:2],
+    )
+    if target_box is None:
+        return False
+
+    annotation = {
+        "kind": "text",
+        "status": "diff",
+        "field": field_name,
+        "source": source,
+        "template_value": template_value,
+        "target_value": target_value,
+        "ocr_text": target_value,
+    }
+    if base_field:
+        annotation["base_field"] = base_field
+
+    return _add_text_visualization_annotation(
+        vis_image=vis_image,
+        visualization_annotations=visualization_annotations,
+        suppressed_annotations=suppressed_annotations,
+        template_image=template_image,
+        target_image=target_image,
+        box=target_box,
+        poly=None,
+        annotation=annotation,
+        template_box=template_box,
+        force=force,
+    )
+
+
+def _ocr_text_matches_expected(
+    field_name: str,
+    expected_value: object,
+    observed_text: object,
+) -> bool:
+    if text_field_values_match(field_name, expected_value, observed_text):
+        return True
+
+    if (
+        not is_label_field_name(field_name)
+        and field_name in {"product_type", "brand"}
+        and normalize_text_for_match(expected_value)
+        == normalize_text_for_match(observed_text)
+    ):
+        return True
+
+    expected_norm = normalize_text_for_compare(expected_value)
+    observed_norm = normalize_text_for_compare(observed_text)
+    if not expected_norm or not observed_norm:
+        return False
+    return expected_norm in observed_norm
+
+
+def _add_label_anchor_text_diffs(
+    *,
+    vis_image: np.ndarray,
+    visualization_annotations: List[Dict],
+    suppressed_annotations: List[Dict],
+    template_image: np.ndarray,
+    target_image: np.ndarray,
+    template_boxes: Sequence[tuple],
+    target_boxes: Sequence[tuple],
+    structured_fields: Sequence[str],
+    template_label_hits: Dict[str, Dict[str, object]],
+    target_label_hits: Dict[str, Dict[str, object]],
+) -> int:
+    if os.getenv("ENABLE_TEXT_FIELD_ANCHOR_FALLBACK", "1") == "0":
+        return 0
+
+    added_count = 0
+    for field_name in structured_fields:
+        if field_name == "address":
+            continue
+        template_hit = template_label_hits.get(field_name)
+        if not template_hit:
+            continue
+
+        template_label = template_hit.get("text")
+        if not template_label:
+            continue
+
+        label_field_name = make_label_field_name(field_name)
+        target_hit = target_label_hits.get(field_name)
+        target_label = (target_hit or {}).get("text")
+        if text_field_values_match(label_field_name, template_label, target_label):
+            continue
+
+        template_indices = [
+            int(box_idx) for box_idx in (template_hit.get("box_indices") or [])
+        ]
+        template_label_boxes = []
+        for b_idx in template_indices:
+            _, box, _ = _ocr_box_and_poly_for_index(
+                template_boxes,
+                b_idx,
+                template_image.shape[:2],
+            )
+            if box is not None:
+                template_label_boxes.append(box)
+        template_label_box = _union_boxes(template_label_boxes)
+
+        target_indices = [
+            int(box_idx) for box_idx in ((target_hit or {}).get("box_indices") or [])
+        ]
+        if target_indices:
+            added_count += _draw_ocr_indices_as_text_diff(
+                vis_image=vis_image,
+                visualization_annotations=visualization_annotations,
+                suppressed_annotations=suppressed_annotations,
+                template_image=template_image,
+                target_image=target_image,
+                target_boxes=target_boxes,
+                field_name=label_field_name,
+                target_box_indices=target_indices,
+                target_value=target_label,
+                template_value=template_label,
+                source="label_anchor",
+                template_box=template_label_box,
+                base_field=field_name,
+            )
+            continue
+
+        if template_label_box is None:
+            continue
+
+        mapped_box = _map_box_between_shapes(
+            template_label_box,
+            template_image.shape[:2],
+            target_image.shape[:2],
+        )
+        target_overlap_indices = (
+            _overlapping_ocr_indices(target_boxes, target_image.shape[:2], mapped_box)
+            if mapped_box is not None
+            else []
+        )
+        target_overlap_text = _combined_ocr_text(target_boxes, target_overlap_indices)
+        if target_overlap_text and not _ocr_text_matches_expected(
+            label_field_name,
+            template_label,
+            target_overlap_text,
+        ):
+            added_count += _draw_ocr_indices_as_text_diff(
+                vis_image=vis_image,
+                visualization_annotations=visualization_annotations,
+                suppressed_annotations=suppressed_annotations,
+                template_image=template_image,
+                target_image=target_image,
+                target_boxes=target_boxes,
+                field_name=label_field_name,
+                target_box_indices=target_overlap_indices[:1],
+                target_value=target_overlap_text,
+                template_value=template_label,
+                source="label_anchor_position",
+                template_box=template_label_box,
+                base_field=field_name,
+            )
+            continue
+
+        added = _draw_mapped_template_text_diff(
+            vis_image=vis_image,
+            visualization_annotations=visualization_annotations,
+            suppressed_annotations=suppressed_annotations,
+            template_image=template_image,
+            target_image=target_image,
+            field_name=label_field_name,
+            template_box=template_label_box,
+            template_value=template_label,
+            target_value=target_overlap_text or target_label,
+            source="label_anchor_mapped",
+            base_field=field_name,
+        )
+        if added:
+            added_count += 1
+
+    return added_count
+
+
+def _add_value_anchor_text_diffs(
+    *,
+    vis_image: np.ndarray,
+    visualization_annotations: List[Dict],
+    suppressed_annotations: List[Dict],
+    template_image: np.ndarray,
+    target_image: np.ndarray,
+    template_boxes: Sequence[tuple],
+    target_boxes: Sequence[tuple],
+    structured_fields: Sequence[str],
+    template_data: Dict[str, object],
+) -> int:
+    if os.getenv("ENABLE_TEXT_FIELD_ANCHOR_FALLBACK", "1") == "0":
+        return 0
+
+    added_count = 0
+    for field_name in structured_fields:
+        template_value = template_data.get(field_name)
+        if template_value is None or str(template_value).strip() in {"", "None"}:
+            continue
+        if field_name in {"air_volume", "barcode", "manufacturer"}:
+            continue
+
+        template_match_indices = find_matching_ocr_boxes(
+            template_value,
+            template_boxes,
+            field_name=field_name,
+        )
+        if not template_match_indices:
+            continue
+
+        for template_box_idx in template_match_indices[:2]:
+            _, template_box, template_ocr_text = _ocr_box_and_poly_for_index(
+                template_boxes,
+                int(template_box_idx),
+                template_image.shape[:2],
+            )
+            if template_box is None:
+                continue
+
+            mapped_box = _map_box_between_shapes(
+                template_box,
+                template_image.shape[:2],
+                target_image.shape[:2],
+            )
+            if mapped_box is None:
+                continue
+
+            target_overlap_indices = _overlapping_ocr_indices(
+                target_boxes,
+                target_image.shape[:2],
+                mapped_box,
+            )
+            target_overlap_text = _combined_ocr_text(
+                target_boxes,
+                target_overlap_indices,
+            )
+            if target_overlap_text and _ocr_text_matches_expected(
+                field_name,
+                template_value,
+                target_overlap_text,
+            ):
+                continue
+
+            if target_overlap_indices:
+                added = _draw_ocr_indices_as_text_diff(
+                    vis_image=vis_image,
+                    visualization_annotations=visualization_annotations,
+                    suppressed_annotations=suppressed_annotations,
+                    template_image=template_image,
+                    target_image=target_image,
+                    target_boxes=target_boxes,
+                    field_name=field_name,
+                    target_box_indices=target_overlap_indices[:1],
+                    target_value=target_overlap_text,
+                    template_value=template_ocr_text or template_value,
+                    source="value_anchor_position",
+                    template_box=template_box,
+                )
+                added_count += added
+                continue
+
+            added = _draw_mapped_template_text_diff(
+                vis_image=vis_image,
+                visualization_annotations=visualization_annotations,
+                suppressed_annotations=suppressed_annotations,
+                template_image=template_image,
+                target_image=target_image,
+                field_name=field_name,
+                template_box=template_box,
+                template_value=template_ocr_text or template_value,
+                target_value=None,
+                source="value_anchor_mapped",
+            )
+            if added:
+                added_count += 1
+
+    return added_count
+
+
+def _ocr_items_for_position_matching(
+    ocr_boxes: Sequence[tuple],
+    image_shape: Tuple[int, int],
+) -> List[Dict[str, Any]]:
+    img_h, img_w = image_shape[:2]
+    items: List[Dict[str, Any]] = []
+    for idx, box_info in enumerate(ocr_boxes):
+        text = str(box_info[1] if len(box_info) > 1 else "").strip()
+        if not text:
+            continue
+        box = _ocr_points_to_box(box_info[0] if box_info else None)
+        box = _clip_box_to_image(box or [], image_shape) if box is not None else None
+        if box is None:
+            continue
+
+        x1, y1, x2, y2 = box
+        width = max(1, x2 - x1)
+        height = max(1, y2 - y1)
+        alpha_count = len(re.findall(r"[A-Za-z]", text))
+        digit_count = len(re.findall(r"\d", text))
+        normalized = normalize_text_for_compare(text)
+        if not normalized:
+            continue
+        if digit_count >= 10 and alpha_count == 0:
+            continue
+
+        items.append(
+            {
+                "idx": idx,
+                "text": text,
+                "normalized": normalized,
+                "box": box,
+                "cx": ((x1 + x2) / 2.0) / max(1.0, img_w),
+                "cy": ((y1 + y2) / 2.0) / max(1.0, img_h),
+                "w": width / max(1.0, img_w),
+                "h": height / max(1.0, img_h),
+                "area": width * height,
+            }
+        )
+    return items
+
+
+def _match_ocr_items_by_position(
+    template_items: Sequence[Dict[str, Any]],
+    target_items: Sequence[Dict[str, Any]],
+) -> Tuple[List[Tuple[int, int, float]], List[int], List[int]]:
+    candidates: List[Tuple[float, int, int]] = []
+    for t_idx, template_item in enumerate(template_items):
+        for s_idx, target_item in enumerate(target_items):
+            dy = abs(float(template_item["cy"]) - float(target_item["cy"]))
+            dx = abs(float(template_item["cx"]) - float(target_item["cx"]))
+            max_h = max(float(template_item["h"]), float(target_item["h"]))
+            max_w = max(float(template_item["w"]), float(target_item["w"]))
+            if dy > max(0.035, max_h * 0.95):
+                continue
+            if dx > max(0.10, max_w * 0.90):
+                continue
+
+            width_delta = abs(float(template_item["w"]) - float(target_item["w"]))
+            height_delta = abs(float(template_item["h"]) - float(target_item["h"]))
+            cost = dy * 1.8 + dx + width_delta * 0.35 + height_delta * 0.25
+            if cost <= 0.16:
+                candidates.append((cost, t_idx, s_idx))
+
+    candidates.sort(key=lambda item: item[0])
+    used_template: set[int] = set()
+    used_target: set[int] = set()
+    pairs: List[Tuple[int, int, float]] = []
+    for cost, t_idx, s_idx in candidates:
+        if t_idx in used_template or s_idx in used_target:
+            continue
+        used_template.add(t_idx)
+        used_target.add(s_idx)
+        pairs.append((t_idx, s_idx, cost))
+
+    unmatched_template = [
+        idx for idx in range(len(template_items)) if idx not in used_template
+    ]
+    unmatched_target = [
+        idx for idx in range(len(target_items)) if idx not in used_target
+    ]
+    return pairs, unmatched_template, unmatched_target
+
+
+def _has_existing_text_annotation(
+    box: Sequence[float],
+    visualization_annotations: Sequence[Dict[str, Any]],
+) -> bool:
+    for annotation in visualization_annotations:
+        if annotation.get("kind") != "text":
+            continue
+        existing_box = annotation.get("box")
+        if existing_box is None:
+            continue
+        if _box_iou(box, existing_box) >= 0.15:
+            return True
+        if _box_overlap_coverage(box, existing_box) >= 0.65:
+            return True
+    return False
+
+
+def _add_ocr_position_text_diffs(
+    *,
+    vis_image: np.ndarray,
+    visualization_annotations: List[Dict],
+    suppressed_annotations: List[Dict],
+    template_image: np.ndarray,
+    target_image: np.ndarray,
+    template_boxes: Sequence[tuple],
+    target_boxes: Sequence[tuple],
+) -> int:
+    template_items = _ocr_items_for_position_matching(
+        template_boxes,
+        template_image.shape[:2],
+    )
+    target_items = _ocr_items_for_position_matching(
+        target_boxes,
+        target_image.shape[:2],
+    )
+    pairs, unmatched_template, _ = _match_ocr_items_by_position(
+        template_items,
+        target_items,
+    )
+
+    added_count = 0
+    for template_item_idx, target_item_idx, cost in pairs:
+        template_item = template_items[template_item_idx]
+        target_item = target_items[target_item_idx]
+        if template_item["normalized"] == target_item["normalized"]:
+            continue
+
+        target_box = target_item["box"]
+        if _has_existing_text_annotation(target_box, visualization_annotations):
+            continue
+
+        poly, _ = _ocr_points_to_poly_and_box(target_boxes[target_item["idx"]][0])
+        added = _add_text_visualization_annotation(
+            vis_image=vis_image,
+            visualization_annotations=visualization_annotations,
+            suppressed_annotations=suppressed_annotations,
+            template_image=template_image,
+            target_image=target_image,
+            box=target_box,
+            poly=poly,
+            annotation={
+                "kind": "text",
+                "status": "diff",
+                "field": "ocr_position",
+                "source": "ocr_position",
+                "match_cost": round(float(cost), 4),
+                "template_text": template_item["text"],
+                "ocr_text": target_item["text"],
+                "target_value": target_item["text"],
+            },
+            template_box=template_item["box"],
+        )
+        if added:
+            added_count += 1
+            print(
+                "    - OCR位置文字差异: "
+                f"'{template_item['text']}' -> '{target_item['text']}'"
+            )
+
+    for template_item_idx in unmatched_template:
+        template_item = template_items[template_item_idx]
+        target_box = _map_box_between_shapes(
+            template_item["box"],
+            template_image.shape[:2],
+            target_image.shape[:2],
+        )
+        if target_box is None:
+            continue
+        if _has_existing_text_annotation(target_box, visualization_annotations):
+            continue
+
+        added = _add_text_visualization_annotation(
+            vis_image=vis_image,
+            visualization_annotations=visualization_annotations,
+            suppressed_annotations=suppressed_annotations,
+            template_image=template_image,
+            target_image=target_image,
+            box=target_box,
+            poly=None,
+            annotation={
+                "kind": "text",
+                "status": "diff",
+                "field": "ocr_position_missing",
+                "source": "ocr_position",
+                "template_text": template_item["text"],
+                "ocr_text": None,
+                "target_value": None,
+            },
+            template_box=template_item["box"],
+        )
+        if added:
+            added_count += 1
+            print(f"    - OCR位置文字缺失: '{template_item['text']}'")
+
+    return added_count
 
 
 def run_llm_extraction(
@@ -1078,7 +1924,7 @@ def run_unified_detection(
         if graphic_output_dir is not None:
             graphic_output_dir.mkdir(parents=True, exist_ok=True)
         graphic_output_dir_str = str(graphic_output_dir) if graphic_output_dir is not None else None
-        target_preprocessed_path = preprocess_dir / "target_preprocessed.jpg"
+        target_preprocessed_path = preprocess_dir / "target_preprocessed.png"
         text_excel_path = None
 
         # ========== Step 1: 预处理 ==========
@@ -1169,9 +2015,11 @@ def run_unified_detection(
         label_extra_fields = {}
         label_fields = []
         for field_name in structured_fields:
+            if field_name == "address":
+                continue
             template_label = (template_label_hits.get(field_name) or {}).get("text")
             target_label = (target_label_hits.get(field_name) or {}).get("text")
-            if not template_label or not target_label:
+            if not template_label:
                 continue
 
             label_field_name = make_label_field_name(field_name)
@@ -1272,7 +2120,9 @@ def run_unified_detection(
                     template_regions,
                     template_cropped,
                     template_boxes,
-                    ignored_regions=skipped_template_regions + skipped_split_template_regions,
+                    ignored_regions=_ignored_regions_for_uncovered_recovery(
+                        skipped_template_regions + skipped_split_template_regions
+                    ),
                 )
             )
             target_regions, recovered_uncovered_target_regions = (
@@ -1280,7 +2130,9 @@ def run_unified_detection(
                     target_regions,
                     target_cropped,
                     target_boxes,
-                    ignored_regions=skipped_target_regions + skipped_split_target_regions,
+                    ignored_regions=_ignored_regions_for_uncovered_recovery(
+                        skipped_target_regions + skipped_split_target_regions
+                    ),
                 )
             )
 
@@ -1502,6 +2354,7 @@ def run_unified_detection(
         vis_image = target_cropped.copy()
         diff_count = 0
         visualization_annotations: List[Dict] = []
+        suppressed_visualization_annotations: List[Dict] = []
 
         print("  寻找并标注差异文字区域...")
         for k in comparison_fields:
@@ -1533,36 +2386,28 @@ def run_unified_detection(
                         f"{len(matched_box_indices)} 个 OCR 框: {matched_texts}"
                     )
                     for b_idx in matched_box_indices:
-                        pts = np.array(target_boxes[b_idx][0], dtype=np.int32)
-                        if pts.shape == (4,):
-                            x1, y1, x2, y2 = pts
-                            poly = np.array(
-                                [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
-                                dtype=np.int32,
-                            )
-                        else:
-                            poly = pts.reshape((-1, 1, 2))
-                            x, y, w, h = cv2.boundingRect(poly)
-                            x1, y1, x2, y2 = x, y, x + w, y + h
-                        cv2.polylines(
-                            vis_image,
-                            [poly],
-                            isClosed=True,
-                            color=(0, 0, 255),
-                            thickness=3,
-                        )
-                        visualization_annotations.append(
-                            {
+                        poly, text_box = _ocr_points_to_poly_and_box(target_boxes[b_idx][0])
+                        if text_box is None:
+                            continue
+                        added = _add_text_visualization_annotation(
+                            vis_image=vis_image,
+                            visualization_annotations=visualization_annotations,
+                            suppressed_annotations=suppressed_visualization_annotations,
+                            template_image=template_cropped,
+                            target_image=target_cropped,
+                            box=text_box,
+                            poly=poly,
+                            annotation={
                                 "kind": "text",
                                 "status": "diff",
                                 "field": k,
                                 "base_field": base_field_name,
-                                "box": [int(x1), int(y1), int(x2), int(y2)],
                                 "ocr_text": target_boxes[b_idx][1],
                                 "target_value": v2,
-                            }
+                            },
                         )
-                        diff_count += 1
+                        if added:
+                            diff_count += 1
                     continue
 
                 target_val = str(v2) if v2 else ""
@@ -1584,39 +2429,148 @@ def run_unified_detection(
                         f"{len(matched_box_indices)} 个 OCR 框: {matched_texts}"
                     )
                     for b_idx in matched_box_indices:
-                        pts = np.array(target_boxes[b_idx][0], dtype=np.int32)
-                        if pts.shape == (4,):
-                            x1, y1, x2, y2 = pts
-                            poly = np.array(
-                                [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
-                                dtype=np.int32,
-                            )
-                        else:
-                            poly = pts.reshape((-1, 1, 2))
-                            x, y, w, h = cv2.boundingRect(poly)
-                            x1, y1, x2, y2 = x, y, x + w, y + h
-                        cv2.polylines(
-                            vis_image,
-                            [poly],
-                            isClosed=True,
-                            color=(0, 0, 255),
-                            thickness=3,
-                        )
-                        visualization_annotations.append(
-                            {
+                        poly, text_box = _ocr_points_to_poly_and_box(target_boxes[b_idx][0])
+                        if text_box is None:
+                            continue
+                        added = _add_text_visualization_annotation(
+                            vis_image=vis_image,
+                            visualization_annotations=visualization_annotations,
+                            suppressed_annotations=suppressed_visualization_annotations,
+                            template_image=template_cropped,
+                            target_image=target_cropped,
+                            box=text_box,
+                            poly=poly,
+                            annotation={
                                 "kind": "text",
                                 "status": "diff",
                                 "field": k,
-                                "box": [int(x1), int(y1), int(x2), int(y2)],
                                 "ocr_text": target_boxes[b_idx][1],
                                 "target_value": target_val,
-                            }
+                            },
                         )
-                        diff_count += 1
+                        if added:
+                            diff_count += 1
                 else:
                     print(
                         f"    - 字段 '{k}' 差异 (值: {target_val}) -> 未找到对应 OCR 框"
                     )
+                    if k not in {"brand", "product_type", "manufacturer", "barcode"}:
+                        template_val = str(v1) if v1 else ""
+                        template_match_indices = find_matching_ocr_boxes(
+                            template_val,
+                            template_boxes,
+                            field_name=k,
+                        )
+                        added_mapped_field = False
+                        for template_box_idx in template_match_indices[:1]:
+                            _, template_box, template_ocr_text = (
+                                _ocr_box_and_poly_for_index(
+                                    template_boxes,
+                                    int(template_box_idx),
+                                    template_cropped.shape[:2],
+                                )
+                            )
+                            if template_box is None:
+                                continue
+                            added = _draw_mapped_template_text_diff(
+                                vis_image=vis_image,
+                                visualization_annotations=visualization_annotations,
+                                suppressed_annotations=suppressed_visualization_annotations,
+                                template_image=template_cropped,
+                                target_image=target_cropped,
+                                field_name=k,
+                                template_box=template_box,
+                                template_value=template_ocr_text or template_val,
+                                target_value=target_val,
+                                source="structured_value_mapped",
+                                force=True,
+                            )
+                            if added:
+                                diff_count += 1
+                                added_mapped_field = True
+                                print(
+                                    f"    - 字段 '{k}' 使用模板位置补框: "
+                                    f"{template_ocr_text or template_val}"
+                                )
+                                break
+                        if not added_mapped_field:
+                            template_label_hit = template_label_hits.get(k)
+                            label_indices = [
+                                int(box_idx)
+                                for box_idx in (
+                                    (template_label_hit or {}).get("box_indices") or []
+                                )
+                            ]
+                            label_boxes = []
+                            for label_box_idx in label_indices:
+                                _, label_box, _ = _ocr_box_and_poly_for_index(
+                                    template_boxes,
+                                    label_box_idx,
+                                    template_cropped.shape[:2],
+                                )
+                                if label_box is not None:
+                                    label_boxes.append(label_box)
+                            template_label_box = _union_boxes(label_boxes)
+                            if template_label_box is not None:
+                                added = _draw_mapped_template_text_diff(
+                                    vis_image=vis_image,
+                                    visualization_annotations=visualization_annotations,
+                                    suppressed_annotations=suppressed_visualization_annotations,
+                                    template_image=template_cropped,
+                                    target_image=target_cropped,
+                                    field_name=k,
+                                    template_box=template_label_box,
+                                    template_value=template_val,
+                                    target_value=target_val,
+                                    source="structured_label_position_mapped",
+                                    force=True,
+                                )
+                                if added:
+                                    diff_count += 1
+                                    print(
+                                        f"    - 字段 '{k}' 使用模板标签位置补框"
+                                    )
+
+        supplemental_text_count = _add_label_anchor_text_diffs(
+            vis_image=vis_image,
+            visualization_annotations=visualization_annotations,
+            suppressed_annotations=suppressed_visualization_annotations,
+            template_image=template_cropped,
+            target_image=target_cropped,
+            template_boxes=template_boxes,
+            target_boxes=target_boxes,
+            structured_fields=structured_fields,
+            template_label_hits=template_label_hits,
+            target_label_hits=target_label_hits,
+        )
+        supplemental_text_count += _add_value_anchor_text_diffs(
+            vis_image=vis_image,
+            visualization_annotations=visualization_annotations,
+            suppressed_annotations=suppressed_visualization_annotations,
+            template_image=template_cropped,
+            target_image=target_cropped,
+            template_boxes=template_boxes,
+            target_boxes=target_boxes,
+            structured_fields=structured_fields,
+            template_data=template_data,
+        )
+        diff_count += supplemental_text_count
+        if supplemental_text_count:
+            print(f"  字段锚点文字补框: {supplemental_text_count} 处")
+
+        if os.getenv("ENABLE_OCR_POSITION_TEXT_FALLBACK", "0") == "1":
+            position_text_count = _add_ocr_position_text_diffs(
+                vis_image=vis_image,
+                visualization_annotations=visualization_annotations,
+                suppressed_annotations=suppressed_visualization_annotations,
+                template_image=template_cropped,
+                target_image=target_cropped,
+                template_boxes=template_boxes,
+                target_boxes=target_boxes,
+            )
+            diff_count += position_text_count
+            if position_text_count:
+                print(f"  OCR位置文字兜底补框: {position_text_count} 处")
 
         print("  标注差异和需复核的图形区域...")
         needs_review_regions = []
@@ -1677,6 +2631,7 @@ def run_unified_detection(
                             "summary": res.get("summary", ""),
                         }
                         suppressed_graphic_regions.append(suppressed_annotation)
+                        suppressed_visualization_annotations.append(suppressed_annotation)
                         print(
                             "    - 图形框过滤: 区域 "
                             f"#{target_idx if target_idx is not None else 'recovered'} "
@@ -1779,7 +2734,9 @@ def run_unified_detection(
             f"过滤 {len(suppressed_graphic_regions)} 处)"
         )
         results["visualization_annotations"] = visualization_annotations
-        results["suppressed_visualization_annotations"] = suppressed_graphic_regions
+        results["suppressed_visualization_annotations"] = (
+            suppressed_visualization_annotations
+        )
 
         # ========== 输出汇总 ==========
         print("\n" + "=" * 60)

@@ -318,9 +318,17 @@ def split_barcode_regions(
         region_copy.setdefault("original_idx", idx)
         is_barcode, meta = detect_barcode_region(region_copy, image, ocr_boxes)
         if is_barcode:
-            region_copy["skip_reason"] = "barcode"
-            region_copy["barcode_hint"] = meta
-            skipped.append(region_copy)
+            salvaged_regions, salvaged_skipped = _salvage_mixed_barcode_region(
+                region_copy,
+                image,
+            )
+            if salvaged_regions and salvaged_skipped:
+                comparable.extend(salvaged_regions)
+                skipped.extend(salvaged_skipped)
+            else:
+                region_copy["skip_reason"] = "barcode"
+                region_copy["barcode_hint"] = meta
+                skipped.append(region_copy)
         else:
             salvaged_regions, salvaged_skipped = _salvage_mixed_barcode_region(
                 region_copy,
@@ -1464,7 +1472,7 @@ def recover_uncovered_graphic_regions(
     )
 
     contours, _ = cv2.findContours(grouped, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    min_area = max(3000.0, float(img_h * img_w) * 0.00050)
+    min_area = max(1200.0, float(img_h * img_w) * 0.00030)
 
     for contour in contours:
         x, y, width, height = cv2.boundingRect(contour)
@@ -1485,7 +1493,20 @@ def recover_uncovered_graphic_regions(
         if aspect_ratio < 0.08 and width < 30:
             continue
 
-        candidate_box = [int(x), int(y), int(x + width), int(y + height)]
+        pad_x = max(5, int(round(width * 0.35)))
+        pad_y = max(5, int(round(height * 0.35)))
+        candidate_box = clip_box_to_image(
+            [
+                int(x) - pad_x,
+                int(y) - pad_y,
+                int(x + width) + pad_x,
+                int(y + height) + pad_y,
+            ],
+            image.shape[:2],
+            min_size=12,
+        )
+        if candidate_box is None:
+            continue
         local_binary = binary[y : y + height, x : x + width]
         foreground_ratio = float((local_binary > 0).mean()) if local_binary.size else 0.0
         if foreground_ratio < 0.025:
@@ -1524,7 +1545,7 @@ def recover_uncovered_graphic_regions(
             image,
             ocr_boxes,
         )
-        if is_barcode and barcode_meta.get("barcode_digits"):
+        if is_barcode:
             continue
 
         recovered_region = {
