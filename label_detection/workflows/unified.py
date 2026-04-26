@@ -80,6 +80,21 @@ from label_detection.services.ocr_service import get_ocr_with_boxes
 
 _llm = None
 
+FORCE_CONFIRMED_TEXT_FIELDS = {
+    "model_number",
+    "voltage",
+    "frequency",
+    "heating_capacity",
+    "cooling_capacity",
+    "air_volume",
+    "weight",
+    "noise",
+    "mfg_date",
+    "barcode",
+}
+
+ALIGNED_VALUE_VISUAL_SCAN_FIELDS = FORCE_CONFIRMED_TEXT_FIELDS | {"address"}
+
 
 @dataclass(frozen=True)
 class WorkflowOutputOptions:
@@ -549,6 +564,42 @@ def _should_suppress_graphic_visual_box(evidence: Dict[str, Any]) -> bool:
     )
 
 
+def _expand_small_graphic_visual_box(
+    box: Sequence[float],
+    image_shape: Tuple[int, int],
+    evidence: Optional[Dict[str, Any]],
+) -> Optional[List[int]]:
+    clipped = _clip_box_to_image(box, image_shape)
+    if clipped is None:
+        return None
+    if not evidence or not evidence.get("valid"):
+        return clipped
+    if float(evidence.get("unmatched_target_ratio", 0.0)) < 0.45:
+        return clipped
+
+    x1, y1, x2, y2 = clipped
+    width = x2 - x1
+    height = y2 - y1
+    min_side = max(48, min(96, int(round(min(image_shape[:2]) * 0.20))))
+    if width >= min_side and height >= min_side:
+        return clipped
+
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    new_width = max(width, min_side)
+    new_height = max(height, min_side)
+    return _clip_box_to_image(
+        [
+            cx - new_width / 2.0,
+            cy - new_height / 2.0,
+            cx + new_width / 2.0,
+            cy + new_height / 2.0,
+        ],
+        image_shape,
+        min_size=8,
+    )
+
+
 def _ignored_regions_for_uncovered_recovery(
     regions: Sequence[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
@@ -639,6 +690,158 @@ def _box_overlap_coverage(box1: Sequence[float], box2: Sequence[float]) -> float
     return float(intersection / area1)
 
 
+def _images_nearly_same_size(
+    template_image: np.ndarray,
+    target_image: np.ndarray,
+    *,
+    tolerance: int = 2,
+) -> bool:
+    th, tw = template_image.shape[:2]
+    sh, sw = target_image.shape[:2]
+    return abs(th - sh) <= tolerance and abs(tw - sw) <= tolerance
+
+
+def _estimate_value_subspan_box(
+    *,
+    field_name: str,
+    ocr_text: object,
+    target_value: object,
+    box: Sequence[float],
+    image_shape: Tuple[int, int],
+) -> Optional[List[int]]:
+    if is_label_field_name(field_name):
+        return None
+    text = str(ocr_text or "").strip()
+    value = str(target_value or "").strip()
+    if not text or not value or len(text) <= len(value) + 4:
+        return None
+
+    start = text.casefold().find(value.casefold())
+    end = start + len(value)
+    if start < 0:
+        compact_text = normalize_text_for_match(text)
+        compact_value = normalize_text_for_match(value)
+        if not compact_text or not compact_value:
+            return None
+        compact_start = compact_text.find(compact_value)
+        if compact_start < 0:
+            return None
+        compact_to_original: List[int] = []
+        for original_idx, char in enumerate(text):
+            if normalize_text_for_match(char):
+                compact_to_original.append(original_idx)
+        if compact_start >= len(compact_to_original):
+            return None
+        start = compact_to_original[compact_start]
+        compact_end = min(
+            len(compact_to_original) - 1,
+            compact_start + len(compact_value) - 1,
+        )
+        end = compact_to_original[compact_end] + 1
+
+    clipped = _clip_box_to_image(box, image_shape)
+    if clipped is None:
+        return None
+    x1, y1, x2, y2 = clipped
+    text_len = max(1, len(text))
+    left = x1 + (x2 - x1) * max(0, start) / text_len
+    right = x1 + (x2 - x1) * min(text_len, end) / text_len
+    if right - left < 8:
+        return None
+    return _clip_box_to_image(
+        [left - 6, y1 - 3, right + 6, y2 + 3],
+        image_shape,
+        min_size=6,
+    )
+
+
+def _local_text_component_box(
+    *,
+    template_image: np.ndarray,
+    target_image: np.ndarray,
+    target_box: Sequence[float],
+    template_box: Sequence[float] | None = None,
+) -> Optional[List[int]]:
+    if not _images_nearly_same_size(template_image, target_image):
+        return None
+
+    clipped_target_box = _clip_box_to_image(target_box, target_image.shape[:2])
+    if clipped_target_box is None:
+        return None
+    mapped_template_box = (
+        _map_box_between_shapes(
+            clipped_target_box,
+            target_image.shape[:2],
+            template_image.shape[:2],
+        )
+        if template_box is None
+        else _clip_box_to_image(template_box, template_image.shape[:2])
+    )
+    if mapped_template_box is None:
+        return None
+
+    tx1, ty1, tx2, ty2 = mapped_template_box
+    sx1, sy1, sx2, sy2 = clipped_target_box
+    template_crop = template_image[ty1:ty2, tx1:tx2]
+    target_crop = target_image[sy1:sy2, sx1:sx2]
+    if template_crop.size == 0 or target_crop.size == 0:
+        return None
+    target_h, target_w = target_crop.shape[:2]
+    if template_crop.shape[:2] != target_crop.shape[:2]:
+        template_crop = cv2.resize(
+            template_crop,
+            (target_w, target_h),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    template_gray = cv2.cvtColor(template_crop, cv2.COLOR_BGR2GRAY)
+    target_gray = cv2.cvtColor(target_crop, cv2.COLOR_BGR2GRAY)
+    diff = cv2.absdiff(template_gray, target_gray)
+    foreground = (
+        _foreground_mask_for_local_diff(template_crop)
+        | _foreground_mask_for_local_diff(target_crop)
+    )
+    diff_mask = ((diff > 18) & foreground).astype(np.uint8)
+    diff_mask = cv2.morphologyEx(
+        diff_mask,
+        cv2.MORPH_CLOSE,
+        np.ones((2, 2), np.uint8),
+    )
+    component_count, _, stats, _ = cv2.connectedComponentsWithStats(
+        diff_mask,
+        connectivity=8,
+    )
+    if component_count <= 1:
+        return None
+
+    components = []
+    for idx in range(1, component_count):
+        x = int(stats[idx, cv2.CC_STAT_LEFT])
+        y = int(stats[idx, cv2.CC_STAT_TOP])
+        w = int(stats[idx, cv2.CC_STAT_WIDTH])
+        h = int(stats[idx, cv2.CC_STAT_HEIGHT])
+        area = int(stats[idx, cv2.CC_STAT_AREA])
+        if area < 4 or w < 2 or h < 2:
+            continue
+        components.append((area, x, y, w, h))
+    if not components:
+        return None
+
+    components.sort(reverse=True)
+    area, x, y, w, h = components[0]
+    box_area = max(1, (sx2 - sx1) * (sy2 - sy1))
+    if area / box_area > 0.18:
+        return None
+    if h > max(8, int(round((sy2 - sy1) * 0.72))):
+        return None
+
+    return _clip_box_to_image(
+        [sx1 + x - 5, sy1 + y - 5, sx1 + x + w + 5, sy1 + y + h + 5],
+        target_image.shape[:2],
+        min_size=6,
+    )
+
+
 def _local_text_diff_evidence(
     template_image: np.ndarray,
     target_image: np.ndarray,
@@ -664,6 +867,46 @@ def _local_text_diff_evidence(
     return evidence
 
 
+def _raw_text_box_diff_ratio(
+    template_image: np.ndarray,
+    target_image: np.ndarray,
+    target_box: Sequence[float],
+    template_box: Sequence[float] | None = None,
+) -> float:
+    clipped_target_box = _clip_box_to_image(target_box, target_image.shape[:2])
+    if clipped_target_box is None:
+        return 0.0
+    mapped_template_box = (
+        _map_box_between_shapes(
+            clipped_target_box,
+            target_image.shape[:2],
+            template_image.shape[:2],
+        )
+        if template_box is None
+        else _clip_box_to_image(template_box, template_image.shape[:2])
+    )
+    if mapped_template_box is None:
+        return 0.0
+
+    tx1, ty1, tx2, ty2 = mapped_template_box
+    sx1, sy1, sx2, sy2 = clipped_target_box
+    template_crop = template_image[ty1:ty2, tx1:tx2]
+    target_crop = target_image[sy1:sy2, sx1:sx2]
+    if template_crop.size == 0 or target_crop.size == 0:
+        return 0.0
+    if template_crop.shape[:2] != target_crop.shape[:2]:
+        target_h, target_w = target_crop.shape[:2]
+        template_crop = cv2.resize(
+            template_crop,
+            (target_w, target_h),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    template_gray = cv2.cvtColor(template_crop, cv2.COLOR_BGR2GRAY)
+    target_gray = cv2.cvtColor(target_crop, cv2.COLOR_BGR2GRAY)
+    return float((cv2.absdiff(template_gray, target_gray) > 12).mean())
+
+
 def _should_suppress_text_visual_box(
     evidence: Dict[str, Any],
     annotation: Optional[Dict[str, Any]] = None,
@@ -684,6 +927,13 @@ def _should_suppress_text_visual_box(
         and float(evidence.get("unmatched_target_ratio", 1.0)) <= 0.05
         and float(evidence.get("unmatched_template_ratio", 1.0)) <= 0.07
         and float(evidence.get("largest_component_ratio", 1.0)) <= 0.045
+    )
+
+
+def _should_force_confirmed_text_field(field_name: str) -> bool:
+    return (
+        not is_label_field_name(field_name)
+        and field_name in FORCE_CONFIRMED_TEXT_FIELDS
     )
 
 
@@ -717,7 +967,29 @@ def _add_text_visualization_annotation(
         "box": [int(v) for v in clipped_box],
         "local_diff_evidence": evidence,
     }
-    if not force and _should_suppress_text_visual_box(evidence, annotation):
+    localized_text_component = False
+    if str(annotation.get("field") or "") == "air_volume":
+        component_box = _local_text_component_box(
+            template_image=template_image,
+            target_image=target_image,
+            target_box=clipped_box,
+            template_box=template_box,
+        )
+        if component_box is not None:
+            clipped_box = component_box
+            annotation = {
+                **annotation,
+                "box": [int(v) for v in clipped_box],
+                "localized_component_box": True,
+            }
+            poly = None
+            localized_text_component = True
+
+    if (
+        not localized_text_component
+        and not force
+        and _should_suppress_text_visual_box(evidence, annotation)
+    ):
         suppressed_annotations.append(
             {
                 **annotation,
@@ -734,6 +1006,9 @@ def _add_text_visualization_annotation(
         )
         return False
 
+    if _has_existing_text_annotation(clipped_box, visualization_annotations):
+        return False
+
     if poly is not None:
         cv2.polylines(
             vis_image,
@@ -748,7 +1023,6 @@ def _add_text_visualization_annotation(
 
     visualization_annotations.append(annotation)
     return True
-
 
 def _ocr_box_and_poly_for_index(
     ocr_boxes: Sequence[tuple],
@@ -855,6 +1129,7 @@ def _draw_ocr_indices_as_text_diff(
     source: Optional[str] = None,
     template_box: Sequence[float] | None = None,
     base_field: Optional[str] = None,
+    force: bool = False,
 ) -> int:
     added_count = 0
     for b_idx in target_box_indices:
@@ -865,6 +1140,18 @@ def _draw_ocr_indices_as_text_diff(
         )
         if text_box is None:
             continue
+        draw_box = text_box
+        draw_poly = poly
+        refined_box = _estimate_value_subspan_box(
+            field_name=field_name,
+            ocr_text=ocr_text,
+            target_value=target_value,
+            box=text_box,
+            image_shape=target_image.shape[:2],
+        )
+        if refined_box is not None:
+            draw_box = refined_box
+            draw_poly = None
 
         annotation = {
             "kind": "text",
@@ -886,10 +1173,11 @@ def _draw_ocr_indices_as_text_diff(
             suppressed_annotations=suppressed_annotations,
             template_image=template_image,
             target_image=target_image,
-            box=text_box,
-            poly=poly,
+            box=draw_box,
+            poly=draw_poly,
             annotation=annotation,
             template_box=template_box,
+            force=force,
         )
         if added:
             added_count += 1
@@ -1034,6 +1322,7 @@ def _add_label_anchor_text_diffs(
                 source="label_anchor",
                 template_box=template_label_box,
                 base_field=field_name,
+                force=True,
             )
             continue
 
@@ -1070,6 +1359,7 @@ def _add_label_anchor_text_diffs(
                 source="label_anchor_position",
                 template_box=template_label_box,
                 base_field=field_name,
+                force=True,
             )
             continue
 
@@ -1085,6 +1375,7 @@ def _add_label_anchor_text_diffs(
             target_value=target_overlap_text or target_label,
             source="label_anchor_mapped",
             base_field=field_name,
+            force=True,
         )
         if added:
             added_count += 1
@@ -1109,6 +1400,8 @@ def _add_value_anchor_text_diffs(
 
     added_count = 0
     for field_name in structured_fields:
+        if _has_existing_text_field_annotation(field_name, visualization_annotations):
+            continue
         template_value = template_data.get(field_name)
         if template_value is None or str(template_value).strip() in {"", "None"}:
             continue
@@ -1165,11 +1458,12 @@ def _add_value_anchor_text_diffs(
                     target_image=target_image,
                     target_boxes=target_boxes,
                     field_name=field_name,
-                    target_box_indices=target_overlap_indices[:1],
+                    target_box_indices=target_overlap_indices,
                     target_value=target_overlap_text,
                     template_value=template_ocr_text or template_value,
                     source="value_anchor_position",
                     template_box=template_box,
+                    force=_should_force_confirmed_text_field(field_name),
                 )
                 added_count += added
                 continue
@@ -1188,6 +1482,159 @@ def _add_value_anchor_text_diffs(
             )
             if added:
                 added_count += 1
+
+    return added_count
+
+
+def _add_aligned_value_visual_diffs(
+    *,
+    vis_image: np.ndarray,
+    visualization_annotations: List[Dict],
+    suppressed_annotations: List[Dict],
+    template_image: np.ndarray,
+    target_image: np.ndarray,
+    template_boxes: Sequence[tuple],
+    structured_fields: Sequence[str],
+    template_data: Dict[str, object],
+) -> int:
+    if os.getenv("ENABLE_ALIGNED_TEXT_VISUAL_SCAN", "1") == "0":
+        return 0
+    if not _images_nearly_same_size(template_image, target_image):
+        return 0
+
+    added_count = 0
+    for field_name in structured_fields:
+        if field_name not in ALIGNED_VALUE_VISUAL_SCAN_FIELDS:
+            continue
+        if field_name in {"barcode"}:
+            continue
+        if _has_existing_text_field_annotation(field_name, visualization_annotations):
+            continue
+        template_value = template_data.get(field_name)
+        if template_value is None or str(template_value).strip() in {"", "None"}:
+            continue
+
+        template_match_indices = find_matching_ocr_boxes(
+            template_value,
+            template_boxes,
+            field_name=field_name,
+        )
+        if not template_match_indices and field_name == "address":
+            template_match_indices = _fallback_address_template_indices(
+                template_boxes,
+                template_image.shape[:2],
+            )
+        for template_box_idx in template_match_indices[:2]:
+            _, template_box, template_ocr_text = _ocr_box_and_poly_for_index(
+                template_boxes,
+                int(template_box_idx),
+                template_image.shape[:2],
+            )
+            if template_box is None:
+                continue
+            target_box = _map_box_between_shapes(
+                template_box,
+                template_image.shape[:2],
+                target_image.shape[:2],
+            )
+            if target_box is None:
+                continue
+            evidence = _local_text_diff_evidence(
+                template_image,
+                target_image,
+                target_box,
+                template_box=template_box,
+            )
+            if not evidence.get("valid"):
+                continue
+            if field_name == "address":
+                raw_diff_ratio = _raw_text_box_diff_ratio(
+                    template_image,
+                    target_image,
+                    target_box,
+                    template_box=template_box,
+                )
+                if raw_diff_ratio < 0.08:
+                    continue
+                added = _draw_mapped_template_text_diff(
+                    vis_image=vis_image,
+                    visualization_annotations=visualization_annotations,
+                    suppressed_annotations=suppressed_annotations,
+                    template_image=template_image,
+                    target_image=target_image,
+                    field_name=field_name,
+                    template_box=template_box,
+                    template_value=template_ocr_text or template_value,
+                    target_value=None,
+                    source="aligned_address_visual",
+                    force=True,
+                )
+                if added:
+                    added_count += 1
+                    break
+                continue
+            if field_name == "air_volume":
+                component_box = _local_text_component_box(
+                    template_image=template_image,
+                    target_image=target_image,
+                    target_box=target_box,
+                    template_box=template_box,
+                )
+                if component_box is not None:
+                    added = _add_text_visualization_annotation(
+                        vis_image=vis_image,
+                        visualization_annotations=visualization_annotations,
+                        suppressed_annotations=suppressed_annotations,
+                        template_image=template_image,
+                        target_image=target_image,
+                        box=component_box,
+                        poly=None,
+                        annotation={
+                            "kind": "text",
+                            "status": "diff",
+                            "field": field_name,
+                            "source": "aligned_value_visual_component",
+                            "template_value": template_ocr_text or template_value,
+                            "target_value": None,
+                            "ocr_text": None,
+                            "localized_component_box": True,
+                        },
+                        template_box=template_box,
+                        force=True,
+                    )
+                    if added:
+                        added_count += 1
+                        break
+            diff_ratio = float(evidence.get("diff_ratio", 0.0))
+            largest_component_ratio = float(
+                evidence.get("largest_component_ratio", 0.0)
+            )
+            max_unmatched_ratio = max(
+                float(evidence.get("unmatched_template_ratio", 0.0)),
+                float(evidence.get("unmatched_target_ratio", 0.0)),
+            )
+            if (
+                diff_ratio < 0.10
+                or largest_component_ratio < 0.04
+                or max_unmatched_ratio < 0.08
+            ):
+                continue
+            added = _draw_mapped_template_text_diff(
+                vis_image=vis_image,
+                visualization_annotations=visualization_annotations,
+                suppressed_annotations=suppressed_annotations,
+                template_image=template_image,
+                target_image=target_image,
+                field_name=field_name,
+                template_box=template_box,
+                template_value=template_ocr_text or template_value,
+                target_value=None,
+                source="aligned_value_visual",
+                force=True,
+            )
+            if added:
+                added_count += 1
+                break
 
     return added_count
 
@@ -1288,9 +1735,55 @@ def _has_existing_text_annotation(
             continue
         if _box_iou(box, existing_box) >= 0.15:
             return True
-        if _box_overlap_coverage(box, existing_box) >= 0.65:
+        if _box_overlap_coverage(box, existing_box) >= 0.50:
             return True
     return False
+
+
+def _has_existing_text_field_annotation(
+    field_name: str,
+    visualization_annotations: Sequence[Dict[str, Any]],
+) -> bool:
+    return any(
+        annotation.get("kind") == "text"
+        and annotation.get("field") == field_name
+        for annotation in visualization_annotations
+    )
+
+
+def _fallback_address_template_indices(
+    template_boxes: Sequence[tuple],
+    image_shape: Tuple[int, int],
+) -> List[int]:
+    img_h, img_w = image_shape[:2]
+    candidates: List[Tuple[float, int]] = []
+    for idx, box_info in enumerate(template_boxes):
+        text = str(box_info[1] if len(box_info) > 1 else "").strip()
+        box = _ocr_points_to_box(box_info[0] if box_info else None)
+        box = _clip_box_to_image(box or [], image_shape) if box is not None else None
+        if box is None:
+            continue
+
+        x1, y1, x2, y2 = box
+        width_ratio = (x2 - x1) / max(1.0, img_w)
+        bottom_ratio = y2 / max(1.0, img_h)
+        starts_near_left = x1 <= max(20, int(round(img_w * 0.08)))
+        text_norm = normalize_text_for_compare(text)
+        looks_like_address = (
+            "add" in text_norm
+            or "west" in text_norm
+            or (bottom_ratio >= 0.92 and width_ratio >= 0.35)
+        )
+        if not looks_like_address or not starts_near_left:
+            continue
+
+        score = width_ratio + bottom_ratio
+        if "add" in text_norm:
+            score += 0.5
+        candidates.append((score, idx))
+
+    candidates.sort(reverse=True)
+    return [idx for _, idx in candidates[:1]]
 
 
 def _add_ocr_position_text_diffs(
@@ -2405,6 +2898,7 @@ def run_unified_detection(
                                 "ocr_text": target_boxes[b_idx][1],
                                 "target_value": v2,
                             },
+                            force=True,
                         )
                         if added:
                             diff_count += 1
@@ -2432,21 +2926,35 @@ def run_unified_detection(
                         poly, text_box = _ocr_points_to_poly_and_box(target_boxes[b_idx][0])
                         if text_box is None:
                             continue
+                        ocr_text = target_boxes[b_idx][1]
+                        draw_box = text_box
+                        draw_poly = poly
+                        refined_box = _estimate_value_subspan_box(
+                            field_name=k,
+                            ocr_text=ocr_text,
+                            target_value=target_val,
+                            box=text_box,
+                            image_shape=target_cropped.shape[:2],
+                        )
+                        if refined_box is not None:
+                            draw_box = refined_box
+                            draw_poly = None
                         added = _add_text_visualization_annotation(
                             vis_image=vis_image,
                             visualization_annotations=visualization_annotations,
                             suppressed_annotations=suppressed_visualization_annotations,
                             template_image=template_cropped,
                             target_image=target_cropped,
-                            box=text_box,
-                            poly=poly,
+                            box=draw_box,
+                            poly=draw_poly,
                             annotation={
                                 "kind": "text",
                                 "status": "diff",
                                 "field": k,
-                                "ocr_text": target_boxes[b_idx][1],
+                                "ocr_text": ocr_text,
                                 "target_value": target_val,
                             },
+                            force=_should_force_confirmed_text_field(k),
                         )
                         if added:
                             diff_count += 1
@@ -2554,6 +3062,16 @@ def run_unified_detection(
             structured_fields=structured_fields,
             template_data=template_data,
         )
+        supplemental_text_count += _add_aligned_value_visual_diffs(
+            vis_image=vis_image,
+            visualization_annotations=visualization_annotations,
+            suppressed_annotations=suppressed_visualization_annotations,
+            template_image=template_cropped,
+            target_image=target_cropped,
+            template_boxes=template_boxes,
+            structured_fields=structured_fields,
+            template_data=template_data,
+        )
         diff_count += supplemental_text_count
         if supplemental_text_count:
             print(f"  字段锚点文字补框: {supplemental_text_count} 处")
@@ -2639,6 +3157,16 @@ def run_unified_detection(
                             f"component={verification_evidence.get('largest_component_ratio')})"
                         )
                         continue
+
+                visual_region_box = _expand_small_graphic_visual_box(
+                    region_box,
+                    target_cropped.shape[:2],
+                    verification_evidence,
+                )
+                if visual_region_box is not None:
+                    x1, y1, x2, y2 = [int(v) for v in visual_region_box]
+                    if verification_evidence is not None:
+                        verification_evidence["visual_box"] = visual_region_box
 
                 if res.get("unresolved_unmatched"):
                     cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 128, 255), 3)

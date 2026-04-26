@@ -154,10 +154,26 @@ def _collect_region_ocr_texts(
     min_overlap: float = 0.35,
 ) -> List[str]:
     """Collect OCR texts that substantially overlap the region."""
+    return [
+        text
+        for _, text, _ in _collect_region_ocr_matches(
+            region_box,
+            ocr_boxes,
+            min_overlap=min_overlap,
+        )
+    ]
+
+
+def _collect_region_ocr_matches(
+    region_box: Sequence[float],
+    ocr_boxes: Sequence[Tuple[object, str, float]] | None,
+    min_overlap: float = 0.35,
+) -> List[Tuple[List[float], str, float]]:
+    """Collect OCR boxes/texts that substantially overlap the region."""
     if not ocr_boxes:
         return []
 
-    matched_texts: List[str] = []
+    matched: List[Tuple[List[float], str, float]] = []
     for box_info in ocr_boxes:
         if len(box_info) < 2:
             continue
@@ -172,9 +188,10 @@ def _collect_region_ocr_texts(
 
         overlap = _intersection_area(region_box, ocr_box)
         if overlap / ocr_area >= min_overlap:
-            matched_texts.append(text)
+            score = float(box_info[2]) if len(box_info) > 2 else 0.0
+            matched.append((ocr_box, text, score))
 
-    return matched_texts
+    return matched
 
 
 def _compute_barcode_texture(crop: np.ndarray) -> Dict[str, float]:
@@ -321,6 +338,7 @@ def split_barcode_regions(
             salvaged_regions, salvaged_skipped = _salvage_mixed_barcode_region(
                 region_copy,
                 image,
+                ocr_boxes,
             )
             if salvaged_regions and salvaged_skipped:
                 comparable.extend(salvaged_regions)
@@ -333,6 +351,7 @@ def split_barcode_regions(
             salvaged_regions, salvaged_skipped = _salvage_mixed_barcode_region(
                 region_copy,
                 image,
+                ocr_boxes,
             )
             if salvaged_regions and salvaged_skipped:
                 comparable.extend(salvaged_regions)
@@ -474,6 +493,8 @@ def _extract_split_candidate_boxes(crop: np.ndarray) -> List[List[int]]:
     """Extract multiple icon-like groups inside one layout image region."""
     if crop.size == 0:
         return []
+    if crop.shape[0] < 120 and crop.shape[1] < 120:
+        return []
 
     cv2 = _require_cv2()
 
@@ -485,7 +506,7 @@ def _extract_split_candidate_boxes(crop: np.ndarray) -> List[List[int]]:
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    noise_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    noise_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, noise_kernel)
 
     connect_w = max(5, min(int(round(crop.shape[1] * 0.04)), 17))
@@ -679,6 +700,141 @@ def _recover_barcode_cluster_from_upper_band(
     return [], []
 
 
+def _local_foreground_ratio(local_box: Sequence[int], crop: np.ndarray) -> float:
+    x1, y1, x2, y2 = [int(v) for v in local_box]
+    x1 = max(0, min(x1, crop.shape[1]))
+    x2 = max(0, min(x2, crop.shape[1]))
+    y1 = max(0, min(y1, crop.shape[0]))
+    y2 = max(0, min(y2, crop.shape[0]))
+    local_crop = crop[y1:y2, x1:x2]
+    if local_crop.size == 0:
+        return 0.0
+    if local_crop.ndim == 3:
+        gray = local_crop.mean(axis=2)
+    else:
+        gray = local_crop
+    return float((gray < 245).mean())
+
+
+def _local_foreground_box(local_box: Sequence[int], crop: np.ndarray) -> List[int] | None:
+    x1, y1, x2, y2 = [int(v) for v in local_box]
+    x1 = max(0, min(x1, crop.shape[1]))
+    x2 = max(0, min(x2, crop.shape[1]))
+    y1 = max(0, min(y1, crop.shape[0]))
+    y2 = max(0, min(y2, crop.shape[0]))
+    local_crop = crop[y1:y2, x1:x2]
+    if local_crop.size == 0:
+        return None
+    if local_crop.ndim == 3:
+        gray = local_crop.mean(axis=2)
+    else:
+        gray = local_crop
+    mask = gray < 245
+    if float(mask.mean()) < 0.025:
+        return None
+    ys, xs = np.where(mask)
+    if xs.size == 0 or ys.size == 0:
+        return None
+    return [
+        x1 + int(xs.min()),
+        y1 + int(ys.min()),
+        x1 + int(xs.max()) + 1,
+        y1 + int(ys.max()) + 1,
+    ]
+
+
+def _recover_mixed_barcode_from_ocr(
+    region: Dict,
+    crop: np.ndarray,
+    ocr_boxes: Sequence[Tuple[object, str, float]] | None,
+) -> Tuple[List[List[int]], List[Tuple[List[int], Dict[str, float]]]]:
+    """Use OCR digit position to split a barcode box that also contains an icon."""
+    if not ocr_boxes or crop.size == 0:
+        return [], []
+
+    x1, y1, x2, y2 = [int(v) for v in region["coordinate"]]
+    region_box = [x1, y1, x2, y2]
+    crop_h, crop_w = crop.shape[:2]
+
+    digit_boxes: List[List[int]] = []
+    for ocr_box, text, _ in _collect_region_ocr_matches(
+        region_box,
+        ocr_boxes,
+        min_overlap=0.15,
+    ):
+        digits = re.sub(r"\D+", "", text)
+        if len(digits) < 10:
+            continue
+
+        local_box = [
+            max(0, int(round(float(ocr_box[0]) - x1))),
+            max(0, int(round(float(ocr_box[1]) - y1))),
+            min(crop_w, int(round(float(ocr_box[2]) - x1))),
+            min(crop_h, int(round(float(ocr_box[3]) - y1))),
+        ]
+        if local_box[2] - local_box[0] < 20 or local_box[3] - local_box[1] < 6:
+            continue
+        digit_boxes.append(local_box)
+
+    if not digit_boxes:
+        return [], []
+
+    digit_union = list(digit_boxes[0])
+    for local_box in digit_boxes[1:]:
+        digit_union = _box_union(digit_union, local_box)
+
+    pad_x = max(4, int(round(crop_w * 0.03)))
+    center_x = (digit_union[0] + digit_union[2]) / 2.0
+    if center_x >= crop_w * 0.45:
+        barcode_box = [
+            max(0, digit_union[0] - pad_x),
+            0,
+            crop_w,
+            crop_h,
+        ]
+    elif center_x <= crop_w * 0.55:
+        barcode_box = [
+            0,
+            0,
+            min(crop_w, digit_union[2] + pad_x),
+            crop_h,
+        ]
+    else:
+        pad_y = max(4, int(round(crop_h * 0.08)))
+        barcode_box = [
+            max(0, digit_union[0] - pad_x),
+            max(0, digit_union[1] - pad_y),
+            min(crop_w, digit_union[2] + pad_x),
+            min(crop_h, digit_union[3] + pad_y),
+        ]
+
+    min_side_width = max(18, int(round(crop_w * 0.08)))
+    candidate_boxes: List[List[int]] = []
+    if barcode_box[0] >= min_side_width:
+        candidate_boxes.append([0, 0, barcode_box[0], crop_h])
+    if crop_w - barcode_box[2] >= min_side_width:
+        candidate_boxes.append([barcode_box[2], 0, crop_w, crop_h])
+
+    non_barcode_children: List[List[int]] = []
+    for candidate in candidate_boxes:
+        foreground_box = _local_foreground_box(candidate, crop)
+        if foreground_box is None:
+            continue
+        child_is_barcode, _ = _is_local_barcode_box(foreground_box, crop)
+        if child_is_barcode:
+            continue
+        metrics = _box_metrics(foreground_box)
+        if metrics["height"] < max(8, crop_h * 0.30):
+            continue
+        non_barcode_children.append(foreground_box)
+
+    if not non_barcode_children:
+        return [], []
+
+    meta = _describe_local_box_barcode_features(barcode_box, crop)
+    return non_barcode_children, [(barcode_box, meta)]
+
+
 def _trim_local_box_against_barcode(
     local_box: Sequence[int],
     barcode_boxes: Sequence[Sequence[int]],
@@ -707,6 +863,7 @@ def _trim_local_box_against_barcode(
 def _salvage_mixed_barcode_region(
     region: Dict,
     image: np.ndarray,
+    ocr_boxes: Sequence[Tuple[object, str, float]] | None = None,
 ) -> Tuple[List[Dict], List[Dict]]:
     """
     Split one mixed region into non-barcode children and skipped barcode children.
@@ -742,6 +899,13 @@ def _salvage_mixed_barcode_region(
 
     if not barcode_children or not non_barcode_children:
         non_barcode_children, barcode_children = _recover_barcode_cluster_from_upper_band(crop)
+
+    if not barcode_children or not non_barcode_children:
+        non_barcode_children, barcode_children = _recover_mixed_barcode_from_ocr(
+            region,
+            crop,
+            ocr_boxes,
+        )
 
     if not barcode_children or not non_barcode_children:
         return [], []
@@ -1509,7 +1673,7 @@ def recover_uncovered_graphic_regions(
             continue
         local_binary = binary[y : y + height, x : x + width]
         foreground_ratio = float((local_binary > 0).mean()) if local_binary.size else 0.0
-        if foreground_ratio < 0.025:
+        if foreground_ratio < 0.012:
             continue
 
         overlaps_reliable_text = False
@@ -1793,6 +1957,9 @@ def _compute_traditional_score(
     if crop1.size == 0 or crop2.size == 0:
         return {"shape_score": 0.0}
 
+    foreground_ratio1 = estimate_region_foreground_ratio(img1, box1)
+    foreground_ratio2 = estimate_region_foreground_ratio(img2, box2)
+
     aligned_crop2, _ = align_images_sift(crop1, crop2)
 
     contours1 = extract_main_contours(crop1)
@@ -1824,7 +1991,11 @@ def _compute_traditional_score(
         pass
 
     shape_score = hu_avg * 0.5 + float(hull_score) * 0.3 + float(ssim_score) * 0.2
-    return {"shape_score": float(shape_score)}
+    return {
+        "shape_score": float(shape_score),
+        "foreground_ratio1": float(foreground_ratio1),
+        "foreground_ratio2": float(foreground_ratio2),
+    }
 
 
 def compare_region_pair(
@@ -1882,6 +2053,12 @@ def compare_region_pair(
             # 计算传统分数用于融合判定
             trad_result = _compute_traditional_score(img1, img2, box1, box2)
             shape_score = trad_result.get("shape_score", 0.5)
+            foreground_ratio1 = float(trad_result.get("foreground_ratio1", 0.0))
+            foreground_ratio2 = float(trad_result.get("foreground_ratio2", 0.0))
+            one_side_has_foreground = (
+                min(foreground_ratio1, foreground_ratio2) < 0.08
+                and max(foreground_ratio1, foreground_ratio2) >= 0.12
+            )
             vlm_decision = vlm_result.get("decision", "unknown")
             summary_text = str(vlm_result.get("summary", "")).lower()
             barcode_ignored = "barcode_ignored" in summary_text
@@ -1895,7 +2072,12 @@ def compare_region_pair(
                 return vlm_result
 
             # 融合判定规则
-            if shape_score >= 0.8:
+            if vlm_decision == "mismatch" and one_side_has_foreground:
+                vlm_result["decision"] = "mismatch"
+                vlm_result["is_match"] = False
+                vlm_result["needs_review"] = False
+                vlm_result["judgment_source"] = "foreground_presence"
+            elif shape_score >= 0.8:
                 # 传统高置信度 match → 直接判 match
                 vlm_result["decision"] = "match"
                 vlm_result["is_match"] = True
@@ -1924,6 +2106,8 @@ def compare_region_pair(
                 vlm_result["judgment_source"] = "vlm"
 
             vlm_result["traditional_shape_score"] = shape_score
+            vlm_result["traditional_foreground_ratio1"] = foreground_ratio1
+            vlm_result["traditional_foreground_ratio2"] = foreground_ratio2
             return vlm_result
     # 裁剪区域
     x1, y1, x2, y2 = [int(v) for v in box1]
