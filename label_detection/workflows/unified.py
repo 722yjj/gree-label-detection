@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Type
 
 import cv2
 import numpy as np
@@ -313,6 +313,237 @@ def build_final_verdict(
         "❌ 标签差异较大 "
         f"(文字 {match_count}/{total_fields}，图形 {mismatch_count} 处不匹配, "
         f"{unresolved_graphics} 个未恢复{review_suffix})"
+    )
+
+
+def _clip_box_to_image(
+    box: Sequence[float],
+    image_shape: Tuple[int, int],
+    *,
+    min_size: int = 2,
+) -> Optional[List[int]]:
+    img_h, img_w = image_shape[:2]
+    x1, y1, x2, y2 = [int(round(float(v))) for v in box]
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    x1 = max(0, min(x1, img_w))
+    x2 = max(0, min(x2, img_w))
+    y1 = max(0, min(y1, img_h))
+    y2 = max(0, min(y2, img_h))
+    if x2 - x1 < min_size or y2 - y1 < min_size:
+        return None
+    return [x1, y1, x2, y2]
+
+
+def _expand_box(
+    box: Sequence[float],
+    image_shape: Tuple[int, int],
+    *,
+    pad_ratio: float = 0.18,
+    min_pad: int = 8,
+    max_pad: int = 28,
+) -> Optional[List[int]]:
+    clipped = _clip_box_to_image(box, image_shape)
+    if clipped is None:
+        return None
+    x1, y1, x2, y2 = clipped
+    pad = int(round(max(min_pad, min(max_pad, max(x2 - x1, y2 - y1) * pad_ratio))))
+    return _clip_box_to_image([x1 - pad, y1 - pad, x2 + pad, y2 + pad], image_shape)
+
+
+def _map_box_between_shapes(
+    box: Sequence[float],
+    source_shape: Tuple[int, int],
+    target_shape: Tuple[int, int],
+) -> Optional[List[int]]:
+    source_h, source_w = source_shape[:2]
+    target_h, target_w = target_shape[:2]
+    if source_w <= 0 or source_h <= 0:
+        return None
+    x1, y1, x2, y2 = [float(v) for v in box]
+    mapped = [
+        x1 * target_w / source_w,
+        y1 * target_h / source_h,
+        x2 * target_w / source_w,
+        y2 * target_h / source_h,
+    ]
+    return _clip_box_to_image(mapped, target_shape)
+
+
+def _foreground_mask_for_local_diff(crop: np.ndarray) -> np.ndarray:
+    if crop.size == 0:
+        return np.zeros((0, 0), dtype=bool)
+
+    if crop.ndim == 2:
+        gray = crop
+        saturation = np.zeros_like(gray)
+        value = gray
+    else:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
+
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    block_size = max(15, min(41, (min(gray.shape[:2]) // 2) * 2 + 1))
+    adaptive = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        block_size,
+        9,
+    )
+    dark_or_colored = (
+        (gray < 220)
+        | ((saturation > 35) & (value < 248))
+    ).astype(np.uint8) * 255
+    mask = cv2.bitwise_or(adaptive, dark_or_colored)
+    kernel = np.ones((2, 2), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return mask > 0
+
+
+def _shift_mask(mask: np.ndarray, dx: int, dy: int) -> np.ndarray:
+    h, w = mask.shape[:2]
+    matrix = np.float32([[1, 0, dx], [0, 1, dy]])
+    shifted = cv2.warpAffine(
+        mask.astype(np.uint8) * 255,
+        matrix,
+        (w, h),
+        flags=cv2.INTER_NEAREST,
+        borderValue=0,
+    )
+    return shifted > 0
+
+
+def _largest_component_ratio(diff_mask: np.ndarray, reference_area: int) -> float:
+    if reference_area <= 0 or diff_mask.size == 0:
+        return 0.0
+    component_count, _, stats, _ = cv2.connectedComponentsWithStats(
+        diff_mask.astype(np.uint8),
+        connectivity=8,
+    )
+    if component_count <= 1:
+        return 0.0
+    largest_area = int(stats[1:, cv2.CC_STAT_AREA].max())
+    return float(largest_area / max(1, reference_area))
+
+
+def _local_graphic_diff_evidence(
+    template_image: np.ndarray,
+    target_image: np.ndarray,
+    template_box: Sequence[float] | None,
+    target_box: Sequence[float] | None,
+) -> Dict[str, Any]:
+    if template_box is None or target_box is None:
+        return {"valid": False, "reason": "missing_reference_box"}
+
+    expanded_template_box = _expand_box(template_box, template_image.shape[:2])
+    expanded_target_box = _expand_box(target_box, target_image.shape[:2])
+    if expanded_template_box is None or expanded_target_box is None:
+        return {"valid": False, "reason": "invalid_box"}
+
+    tx1, ty1, tx2, ty2 = expanded_template_box
+    sx1, sy1, sx2, sy2 = expanded_target_box
+    template_crop = template_image[ty1:ty2, tx1:tx2]
+    target_crop = target_image[sy1:sy2, sx1:sx2]
+    if template_crop.size == 0 or target_crop.size == 0:
+        return {"valid": False, "reason": "empty_crop"}
+
+    target_h, target_w = target_crop.shape[:2]
+    if template_crop.shape[:2] != target_crop.shape[:2]:
+        template_crop = cv2.resize(
+            template_crop,
+            (target_w, target_h),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    template_mask = _foreground_mask_for_local_diff(template_crop)
+    target_mask = _foreground_mask_for_local_diff(target_crop)
+    if template_mask.size == 0 or target_mask.size == 0:
+        return {"valid": False, "reason": "empty_mask"}
+
+    template_area = int(template_mask.sum())
+    target_area = int(target_mask.sum())
+    foreground_area = max(template_area, target_area)
+    crop_area = max(1, int(template_mask.size))
+    if foreground_area < max(20, int(crop_area * 0.002)):
+        return {
+            "valid": False,
+            "reason": "low_foreground",
+            "template_foreground_ratio": round(template_area / crop_area, 4),
+            "target_foreground_ratio": round(target_area / crop_area, 4),
+        }
+
+    tolerance_radius = max(2, min(5, int(round(max(target_h, target_w) * 0.015))))
+    tolerance_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (tolerance_radius * 2 + 1, tolerance_radius * 2 + 1),
+    )
+    max_shift = max(2, min(8, int(round(max(target_h, target_w) * 0.035))))
+
+    best: Dict[str, Any] | None = None
+    for dy in range(-max_shift, max_shift + 1):
+        for dx in range(-max_shift, max_shift + 1):
+            shifted_template = _shift_mask(template_mask, dx, dy)
+            shifted_template_dilated = (
+                cv2.dilate(shifted_template.astype(np.uint8), tolerance_kernel) > 0
+            )
+            target_dilated = cv2.dilate(target_mask.astype(np.uint8), tolerance_kernel) > 0
+            unmatched_template = shifted_template & ~target_dilated
+            unmatched_target = target_mask & ~shifted_template_dilated
+            diff_mask = cv2.morphologyEx(
+                (unmatched_template | unmatched_target).astype(np.uint8),
+                cv2.MORPH_CLOSE,
+                np.ones((3, 3), np.uint8),
+            ) > 0
+            diff_area = int(diff_mask.sum())
+            union_area = int((shifted_template | target_mask).sum())
+            ratio = diff_area / max(1, union_area)
+            candidate = {
+                "diff_ratio": ratio,
+                "unmatched_template_ratio": int(unmatched_template.sum()) / max(1, template_area),
+                "unmatched_target_ratio": int(unmatched_target.sum()) / max(1, target_area),
+                "largest_component_ratio": _largest_component_ratio(diff_mask, max(1, foreground_area)),
+                "shift": [dx, dy],
+                "diff_area": diff_area,
+                "union_area": union_area,
+            }
+            if best is None or candidate["diff_ratio"] < best["diff_ratio"]:
+                best = candidate
+
+    assert best is not None
+    return {
+        "valid": True,
+        "expanded_template_box": expanded_template_box,
+        "expanded_target_box": expanded_target_box,
+        "template_foreground_ratio": round(template_area / crop_area, 4),
+        "target_foreground_ratio": round(target_area / crop_area, 4),
+        "tolerance_radius": tolerance_radius,
+        "max_shift": max_shift,
+        "diff_ratio": round(float(best["diff_ratio"]), 4),
+        "unmatched_template_ratio": round(float(best["unmatched_template_ratio"]), 4),
+        "unmatched_target_ratio": round(float(best["unmatched_target_ratio"]), 4),
+        "largest_component_ratio": round(float(best["largest_component_ratio"]), 4),
+        "best_shift": best["shift"],
+        "diff_area": int(best["diff_area"]),
+        "union_area": int(best["union_area"]),
+    }
+
+
+def _should_suppress_graphic_visual_box(evidence: Dict[str, Any]) -> bool:
+    if os.getenv("ENABLE_GRAPHIC_LOCAL_DIFF_FILTER", "1") == "0":
+        return False
+    if not evidence.get("valid"):
+        return False
+    return (
+        float(evidence.get("diff_ratio", 1.0)) <= 0.08
+        and float(evidence.get("unmatched_target_ratio", 1.0)) <= 0.08
+        and float(evidence.get("unmatched_template_ratio", 1.0)) <= 0.10
+        and float(evidence.get("largest_component_ratio", 1.0)) <= 0.04
     )
 
 
@@ -1390,18 +1621,69 @@ def run_unified_detection(
         print("  标注差异和需复核的图形区域...")
         needs_review_regions = []
         unresolved_regions = []
+        suppressed_graphic_regions = []
         for res in comparison_results:
             decision = res.get("decision", "unknown")
             target_idx = res.get("target_idx")
+            template_idx = res.get("template_idx")
             region_box = None
+            template_region_box = None
 
             if target_idx is not None and target_idx < len(target_regions):
                 region_box = target_regions[target_idx]["coordinate"]
             elif res.get("inferred_target_box") is not None:
                 region_box = res["inferred_target_box"]
 
+            if template_idx is not None and template_idx < len(template_regions):
+                template_region_box = template_regions[template_idx]["coordinate"]
+            elif res.get("inferred_template_box") is not None:
+                template_region_box = res["inferred_template_box"]
+
             if region_box is not None:
                 x1, y1, x2, y2 = [int(v) for v in region_box]
+                verification_evidence = None
+                if (
+                    res.get("unresolved_unmatched")
+                    or decision == "unknown"
+                    or decision == "mismatch"
+                ):
+                    mapped_template_box = _map_box_between_shapes(
+                        region_box,
+                        target_cropped.shape[:2],
+                        template_cropped.shape[:2],
+                    )
+                    verification_template_box = mapped_template_box or template_region_box
+                    verification_evidence = _local_graphic_diff_evidence(
+                        template_cropped,
+                        target_cropped,
+                        verification_template_box,
+                        region_box,
+                    )
+                    verification_evidence["detector_template_box"] = template_region_box
+                    verification_evidence["mapped_template_box"] = mapped_template_box
+                    res["local_diff_evidence"] = verification_evidence
+                    if _should_suppress_graphic_visual_box(verification_evidence):
+                        res["visualization_suppressed"] = True
+                        res["visualization_suppression_reason"] = "local_diff_low"
+                        suppressed_annotation = {
+                            "kind": "graphic",
+                            "status": "suppressed",
+                            "decision": decision,
+                            "target_idx": target_idx,
+                            "template_idx": template_idx,
+                            "box": [int(x1), int(y1), int(x2), int(y2)],
+                            "reason": "local_diff_low",
+                            "local_diff_evidence": verification_evidence,
+                            "summary": res.get("summary", ""),
+                        }
+                        suppressed_graphic_regions.append(suppressed_annotation)
+                        print(
+                            "    - 图形框过滤: 区域 "
+                            f"#{target_idx if target_idx is not None else 'recovered'} "
+                            f"(local_diff={verification_evidence.get('diff_ratio')}, "
+                            f"component={verification_evidence.get('largest_component_ratio')})"
+                        )
+                        continue
 
                 if res.get("unresolved_unmatched"):
                     cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 128, 255), 3)
@@ -1421,6 +1703,7 @@ def run_unified_detection(
                             "decision": decision,
                             "target_idx": target_idx,
                             "box": [int(x1), int(y1), int(x2), int(y2)],
+                            "local_diff_evidence": verification_evidence,
                             "summary": res.get("summary", ""),
                         }
                     )
@@ -1448,6 +1731,7 @@ def run_unified_detection(
                             "decision": decision,
                             "target_idx": target_idx,
                             "box": [int(x1), int(y1), int(x2), int(y2)],
+                            "local_diff_evidence": verification_evidence,
                             "summary": res.get("summary", ""),
                         }
                     )
@@ -1475,6 +1759,7 @@ def run_unified_detection(
                             "decision": decision,
                             "target_idx": target_idx,
                             "box": [int(x1), int(y1), int(x2), int(y2)],
+                            "local_diff_evidence": verification_evidence,
                             "summary": res.get("summary", ""),
                         }
                     )
@@ -1490,9 +1775,11 @@ def run_unified_detection(
         print(
             f"  差异可视化已保存: {vis_path} "
             f"(差异 {diff_count} 处, 未恢复 {len(unresolved_regions)} 处, "
-            f"待复核 {len(needs_review_regions)} 处)"
+            f"待复核 {len(needs_review_regions)} 处, "
+            f"过滤 {len(suppressed_graphic_regions)} 处)"
         )
         results["visualization_annotations"] = visualization_annotations
+        results["suppressed_visualization_annotations"] = suppressed_graphic_regions
 
         # ========== 输出汇总 ==========
         print("\n" + "=" * 60)
@@ -1555,11 +1842,13 @@ def run_unified_detection(
             r
             for r in comparison_results
             if r.get("decision") == "mismatch"
+            and not r.get("visualization_suppressed")
         ]
         review_needed = [
             r
             for r in comparison_results
             if r.get("decision") == "unknown"
+            and not r.get("visualization_suppressed")
         ]
 
         graphic_pass = True
@@ -1581,6 +1870,8 @@ def run_unified_detection(
         if review_needed:
             for res in review_needed:
                 print(f"   - ⚠️ 需复核: {res.get('summary')}")
+        if suppressed_graphic_regions:
+            print(f"   - 局部差异过滤: {len(suppressed_graphic_regions)} 个图形框")
 
         if (
             confirmed_match
