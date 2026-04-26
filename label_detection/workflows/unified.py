@@ -95,6 +95,10 @@ FORCE_CONFIRMED_TEXT_FIELDS = {
 
 ALIGNED_VALUE_VISUAL_SCAN_FIELDS = FORCE_CONFIRMED_TEXT_FIELDS | {"address"}
 
+MATCHED_VALUE_VISUAL_SCAN_FIELDS = (
+    FORCE_CONFIRMED_TEXT_FIELDS - {"air_volume", "barcode"}
+)
+
 
 @dataclass(frozen=True)
 class WorkflowOutputOptions:
@@ -907,6 +911,63 @@ def _raw_text_box_diff_ratio(
     return float((cv2.absdiff(template_gray, target_gray) > 12).mean())
 
 
+def _raw_aligned_image_diff_ratio(
+    template_image: np.ndarray,
+    target_image: np.ndarray,
+) -> Optional[float]:
+    if not _images_nearly_same_size(template_image, target_image):
+        return None
+
+    template_crop = template_image
+    target_crop = target_image
+    if template_crop.shape[:2] != target_crop.shape[:2]:
+        target_h, target_w = target_crop.shape[:2]
+        template_crop = cv2.resize(
+            template_crop,
+            (target_w, target_h),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    template_gray = cv2.cvtColor(template_crop, cv2.COLOR_BGR2GRAY)
+    target_gray = cv2.cvtColor(target_crop, cv2.COLOR_BGR2GRAY)
+    return float((cv2.absdiff(template_gray, target_gray) > 12).mean())
+
+
+def _can_scan_matching_structured_value(
+    field_name: str,
+    global_diff_ratio: Optional[float],
+) -> bool:
+    if os.getenv("ENABLE_MATCHED_VALUE_VISUAL_SCAN", "1") == "0":
+        return False
+    if field_name not in MATCHED_VALUE_VISUAL_SCAN_FIELDS:
+        return False
+    if global_diff_ratio is None:
+        return False
+    min_ratio = float(os.getenv("MATCHED_VALUE_VISUAL_GLOBAL_DIFF_MIN", "0.0005"))
+    max_ratio = float(os.getenv("MATCHED_VALUE_VISUAL_GLOBAL_DIFF_MAX", "0.035"))
+    return min_ratio <= global_diff_ratio <= max_ratio
+
+
+def _matched_structured_value_visual_evidence_is_strong(
+    evidence: Dict[str, Any],
+    raw_diff_ratio: float,
+) -> bool:
+    if not evidence.get("valid"):
+        return False
+    diff_ratio = float(evidence.get("diff_ratio", 0.0))
+    largest_component_ratio = float(evidence.get("largest_component_ratio", 0.0))
+    max_unmatched_ratio = max(
+        float(evidence.get("unmatched_template_ratio", 0.0)),
+        float(evidence.get("unmatched_target_ratio", 0.0)),
+    )
+    return (
+        raw_diff_ratio >= 0.025
+        and diff_ratio >= 0.12
+        and largest_component_ratio >= 0.045
+        and max_unmatched_ratio >= 0.12
+    )
+
+
 def _should_suppress_text_visual_box(
     evidence: Dict[str, Any],
     annotation: Optional[Dict[str, Any]] = None,
@@ -934,6 +995,21 @@ def _should_force_confirmed_text_field(field_name: str) -> bool:
     return (
         not is_label_field_name(field_name)
         and field_name in FORCE_CONFIRMED_TEXT_FIELDS
+    )
+
+
+def _structured_field_values_match(
+    field_name: str,
+    template_data: Dict[str, object],
+    target_data: Optional[Dict[str, object]],
+) -> bool:
+    return (
+        target_data is not None
+        and text_field_values_match(
+            field_name,
+            template_data.get(field_name),
+            target_data.get(field_name),
+        )
     )
 
 
@@ -1241,6 +1317,20 @@ def _ocr_text_matches_expected(
     if text_field_values_match(field_name, expected_value, observed_text):
         return True
 
+    if is_label_field_name(field_name):
+        expected_tokens = [
+            token
+            for token in re.findall(r"[A-Za-z]+", str(expected_value).lower())
+            if len(token) >= 2
+        ]
+        observed_tokens = {
+            token
+            for token in re.findall(r"[A-Za-z]+", str(observed_text).lower())
+            if len(token) >= 2
+        }
+        if expected_tokens and all(token in observed_tokens for token in expected_tokens):
+            return True
+
     if (
         not is_label_field_name(field_name)
         and field_name in {"product_type", "brand"}
@@ -1326,6 +1416,9 @@ def _add_label_anchor_text_diffs(
             )
             continue
 
+        if os.getenv("ENABLE_MISSING_LABEL_MAPPED_FALLBACK", "1") == "0":
+            continue
+
         if template_label_box is None:
             continue
 
@@ -1334,17 +1427,19 @@ def _add_label_anchor_text_diffs(
             template_image.shape[:2],
             target_image.shape[:2],
         )
+        if mapped_box is None:
+            continue
         target_overlap_indices = (
             _overlapping_ocr_indices(target_boxes, target_image.shape[:2], mapped_box)
-            if mapped_box is not None
-            else []
         )
         target_overlap_text = _combined_ocr_text(target_boxes, target_overlap_indices)
-        if target_overlap_text and not _ocr_text_matches_expected(
+        if target_overlap_text and _ocr_text_matches_expected(
             label_field_name,
             template_label,
             target_overlap_text,
         ):
+            continue
+        if target_overlap_text:
             added_count += _draw_ocr_indices_as_text_diff(
                 vis_image=vis_image,
                 visualization_annotations=visualization_annotations,
@@ -1363,6 +1458,18 @@ def _add_label_anchor_text_diffs(
             )
             continue
 
+        if (
+            target_overlap_text == ""
+            and _raw_text_box_diff_ratio(
+                template_image,
+                target_image,
+                mapped_box,
+                template_box=template_label_box,
+            )
+            < 0.01
+        ):
+            continue
+
         added = _draw_mapped_template_text_diff(
             vis_image=vis_image,
             visualization_annotations=visualization_annotations,
@@ -1375,7 +1482,6 @@ def _add_label_anchor_text_diffs(
             target_value=target_overlap_text or target_label,
             source="label_anchor_mapped",
             base_field=field_name,
-            force=True,
         )
         if added:
             added_count += 1
@@ -1394,6 +1500,7 @@ def _add_value_anchor_text_diffs(
     target_boxes: Sequence[tuple],
     structured_fields: Sequence[str],
     template_data: Dict[str, object],
+    target_data: Optional[Dict[str, object]] = None,
 ) -> int:
     if os.getenv("ENABLE_TEXT_FIELD_ANCHOR_FALLBACK", "1") == "0":
         return 0
@@ -1404,6 +1511,8 @@ def _add_value_anchor_text_diffs(
             continue
         template_value = template_data.get(field_name)
         if template_value is None or str(template_value).strip() in {"", "None"}:
+            continue
+        if _structured_field_values_match(field_name, template_data, target_data):
             continue
         if field_name in {"air_volume", "barcode", "manufacturer"}:
             continue
@@ -1496,6 +1605,7 @@ def _add_aligned_value_visual_diffs(
     template_boxes: Sequence[tuple],
     structured_fields: Sequence[str],
     template_data: Dict[str, object],
+    target_data: Optional[Dict[str, object]] = None,
 ) -> int:
     if os.getenv("ENABLE_ALIGNED_TEXT_VISUAL_SCAN", "1") == "0":
         return 0
@@ -1503,10 +1613,22 @@ def _add_aligned_value_visual_diffs(
         return 0
 
     added_count = 0
+    global_diff_ratio = _raw_aligned_image_diff_ratio(template_image, target_image)
     for field_name in structured_fields:
         if field_name not in ALIGNED_VALUE_VISUAL_SCAN_FIELDS:
             continue
         if field_name in {"barcode"}:
+            continue
+        structured_values_match = _structured_field_values_match(
+            field_name,
+            template_data,
+            target_data,
+        )
+        matching_value_visual_scan = (
+            structured_values_match
+            and _can_scan_matching_structured_value(field_name, global_diff_ratio)
+        )
+        if structured_values_match and not matching_value_visual_scan:
             continue
         if _has_existing_text_field_annotation(field_name, visualization_annotations):
             continue
@@ -1547,6 +1669,18 @@ def _add_aligned_value_visual_diffs(
             )
             if not evidence.get("valid"):
                 continue
+            if matching_value_visual_scan:
+                raw_diff_ratio = _raw_text_box_diff_ratio(
+                    template_image,
+                    target_image,
+                    target_box,
+                    template_box=template_box,
+                )
+                if not _matched_structured_value_visual_evidence_is_strong(
+                    evidence,
+                    raw_diff_ratio,
+                ):
+                    continue
             if field_name == "address":
                 raw_diff_ratio = _raw_text_box_diff_ratio(
                     template_image,
@@ -1628,8 +1762,16 @@ def _add_aligned_value_visual_diffs(
                 field_name=field_name,
                 template_box=template_box,
                 template_value=template_ocr_text or template_value,
-                target_value=None,
-                source="aligned_value_visual",
+                target_value=(
+                    target_data.get(field_name)
+                    if matching_value_visual_scan and target_data is not None
+                    else None
+                ),
+                source=(
+                    "aligned_matching_value_visual"
+                    if matching_value_visual_scan
+                    else "aligned_value_visual"
+                ),
                 force=True,
             )
             if added:
@@ -2597,6 +2739,12 @@ def run_unified_detection(
                 template_cropped,
                 template_boxes,
             )
+            template_regions, post_split_skipped_template_regions = split_barcode_regions(
+                template_regions,
+                template_cropped,
+                template_boxes,
+            )
+            skipped_split_template_regions.extend(post_split_skipped_template_regions)
             target_regions, split_target_regions = split_composite_image_regions(
                 target_regions,
                 target_cropped,
@@ -2608,6 +2756,12 @@ def run_unified_detection(
                 target_cropped,
                 target_boxes,
             )
+            target_regions, post_split_skipped_target_regions = split_barcode_regions(
+                target_regions,
+                target_cropped,
+                target_boxes,
+            )
+            skipped_split_target_regions.extend(post_split_skipped_target_regions)
             template_regions, recovered_uncovered_template_regions = (
                 recover_uncovered_graphic_regions(
                     template_regions,
@@ -3061,6 +3215,7 @@ def run_unified_detection(
             target_boxes=target_boxes,
             structured_fields=structured_fields,
             template_data=template_data,
+            target_data=target_data,
         )
         supplemental_text_count += _add_aligned_value_visual_diffs(
             vis_image=vis_image,
@@ -3071,6 +3226,7 @@ def run_unified_detection(
             template_boxes=template_boxes,
             structured_fields=structured_fields,
             template_data=template_data,
+            target_data=target_data,
         )
         diff_count += supplemental_text_count
         if supplemental_text_count:
@@ -3170,15 +3326,6 @@ def run_unified_detection(
 
                 if res.get("unresolved_unmatched"):
                     cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 128, 255), 3)
-                    cv2.putText(
-                        vis_image,
-                        "Unmatched",
-                        (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6,
-                        (0, 128, 255),
-                        2,
-                    )
                     visualization_annotations.append(
                         {
                             "kind": "graphic",
@@ -3198,15 +3345,6 @@ def run_unified_detection(
                     )
                 elif decision == "unknown":
                     cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 200, 255), 3)
-                    cv2.putText(
-                        vis_image,
-                        "Review",
-                        (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (0, 200, 255),
-                        2,
-                    )
                     visualization_annotations.append(
                         {
                             "kind": "graphic",
@@ -3226,15 +3364,6 @@ def run_unified_detection(
                     )
                 elif decision == "mismatch":
                     cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                    cv2.putText(
-                        vis_image,
-                        "Diff",
-                        (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (0, 0, 255),
-                        2,
-                    )
                     visualization_annotations.append(
                         {
                             "kind": "graphic",

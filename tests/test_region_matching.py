@@ -303,6 +303,19 @@ class TestBarcodeRegionFilter:
         assert len(skipped) == 1
         assert skipped[0]["skip_reason"] == "barcode"
 
+    def test_barcode_fragment_region_is_skipped_without_digits(self):
+        img = np.full((420, 420, 3), 255, dtype=np.uint8)
+        for x in range(270, 340, 7):
+            img[250:308, x : x + 3] = 0
+
+        region = self._make_region(266, 242, 346, 314)
+        comparable, skipped = split_barcode_regions([region], img, None)
+
+        assert comparable == []
+        assert len(skipped) == 1
+        assert skipped[0]["skip_reason"] == "barcode"
+        assert skipped[0]["barcode_hint"]["stripe_fragment"] is True
+
 
 class TestCompositeImageRegionSplit:
     def _make_region(self, x1, y1, x2, y2):
@@ -507,3 +520,22 @@ class TestSplitRegionPostFilter:
         assert recovered_box[2] >= 346
         assert recovered_box[3] >= 235
         assert recovered[0]["recovered_uncovered_graphic"] is True
+
+    def test_recover_uncovered_graphic_regions_ignores_lower_text_fragments(self):
+        img = np.full((260, 420, 3), 255, dtype=np.uint8)
+        img[224:244, 24:74] = 0
+        ocr_boxes = [
+            (
+                np.array(
+                    [[76, 222], [250, 222], [250, 246], [76, 246]],
+                    dtype=np.float32,
+                ),
+                "West Jinji Rd",
+                0.92,
+            )
+        ]
+
+        regions, recovered = recover_uncovered_graphic_regions([], img, ocr_boxes)
+
+        assert regions == []
+        assert recovered == []

@@ -301,6 +301,15 @@ def detect_barcode_region(
         and texture["vertical_bias"] >= 2.2
         and texture["dark_column_ratio"] >= 0.12
     )
+    stripe_fragment_barcode = (
+        height_ratio <= 0.24
+        and center_y_ratio >= 0.45
+        and width >= max(28, int(round(img_w * 0.012)))
+        and aspect_ratio >= 0.35
+        and texture["transition_density"] >= 0.14
+        and 0.06 <= texture["dark_column_ratio"] <= 0.90
+        and texture["vertical_bias"] >= 4.0
+    )
 
     is_barcode = (
         (has_long_digits and stripe_like and height_ratio <= 0.50)
@@ -308,6 +317,7 @@ def detect_barcode_region(
         or texture_only_barcode
         or (has_barcode_token and stripe_like)
         or strong_texture_barcode
+        or stripe_fragment_barcode
     )
 
     return is_barcode, {
@@ -317,6 +327,7 @@ def detect_barcode_region(
         "transition_density": texture["transition_density"],
         "dark_column_ratio": texture["dark_column_ratio"],
         "vertical_bias": texture["vertical_bias"],
+        "stripe_fragment": bool(stripe_fragment_barcode),
         "ocr_texts": texts,
     }
 
@@ -1552,6 +1563,51 @@ def _paint_box(mask: np.ndarray, box: Sequence[float], pad_x: int, pad_y: int) -
     )
 
 
+def _candidate_overlaps_lower_text_line(
+    candidate_box: Sequence[float],
+    image_shape: Tuple[int, int],
+    ocr_boxes: Sequence[Tuple[object, str, float]] | None,
+) -> bool:
+    """Reject recovered lower-band text fragments before treating them as graphics."""
+    if not ocr_boxes:
+        return False
+
+    img_h, img_w = image_shape[:2]
+    cx1, cy1, cx2, cy2 = [float(v) for v in candidate_box]
+    cand_w = max(1.0, cx2 - cx1)
+    cand_h = max(1.0, cy2 - cy1)
+    center_y_ratio = ((cy1 + cy2) / 2.0) / max(1.0, float(img_h))
+    if center_y_ratio < 0.78:
+        return False
+
+    for box_info in ocr_boxes:
+        if len(box_info) < 2:
+            continue
+        text = str(box_info[1] or "").strip()
+        if len(text) < 2:
+            continue
+
+        ocr_box = _poly_to_bbox(box_info[0])
+        ox1, oy1, ox2, oy2 = [float(v) for v in ocr_box]
+        ocr_w = max(1.0, ox2 - ox1)
+        ocr_h = max(1.0, oy2 - oy1)
+        ocr_center_y_ratio = ((oy1 + oy2) / 2.0) / max(1.0, float(img_h))
+        if ocr_center_y_ratio < 0.72:
+            continue
+
+        vertical_overlap = min(cy2, oy2) - max(cy1, oy1)
+        if vertical_overlap <= 0:
+            continue
+        if vertical_overlap / max(1.0, min(cand_h, ocr_h)) < 0.25:
+            continue
+
+        horizontal_gap = max(ox1 - cx2, cx1 - ox2, 0.0)
+        if horizontal_gap <= max(30.0, cand_w * 0.45, ocr_w * 0.08):
+            return True
+
+    return False
+
+
 def recover_uncovered_graphic_regions(
     regions: Sequence[Dict],
     image: np.ndarray,
@@ -1702,6 +1758,13 @@ def recover_uncovered_graphic_regions(
                 overlaps_existing = True
                 break
         if overlaps_existing:
+            continue
+
+        if _candidate_overlaps_lower_text_line(
+            candidate_box,
+            image.shape[:2],
+            ocr_boxes,
+        ):
             continue
 
         is_barcode, barcode_meta = detect_barcode_region(
