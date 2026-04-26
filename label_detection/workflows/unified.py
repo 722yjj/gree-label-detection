@@ -1270,6 +1270,7 @@ def run_unified_detection(
 
         vis_image = target_cropped.copy()
         diff_count = 0
+        visualization_annotations: List[Dict] = []
 
         print("  寻找并标注差异文字区域...")
         for k in comparison_fields:
@@ -1310,12 +1311,25 @@ def run_unified_detection(
                             )
                         else:
                             poly = pts.reshape((-1, 1, 2))
+                            x, y, w, h = cv2.boundingRect(poly)
+                            x1, y1, x2, y2 = x, y, x + w, y + h
                         cv2.polylines(
                             vis_image,
                             [poly],
                             isClosed=True,
                             color=(0, 0, 255),
                             thickness=3,
+                        )
+                        visualization_annotations.append(
+                            {
+                                "kind": "text",
+                                "status": "diff",
+                                "field": k,
+                                "base_field": base_field_name,
+                                "box": [int(x1), int(y1), int(x2), int(y2)],
+                                "ocr_text": target_boxes[b_idx][1],
+                                "target_value": v2,
+                            }
                         )
                         diff_count += 1
                     continue
@@ -1348,12 +1362,24 @@ def run_unified_detection(
                             )
                         else:
                             poly = pts.reshape((-1, 1, 2))
+                            x, y, w, h = cv2.boundingRect(poly)
+                            x1, y1, x2, y2 = x, y, x + w, y + h
                         cv2.polylines(
                             vis_image,
                             [poly],
                             isClosed=True,
                             color=(0, 0, 255),
                             thickness=3,
+                        )
+                        visualization_annotations.append(
+                            {
+                                "kind": "text",
+                                "status": "diff",
+                                "field": k,
+                                "box": [int(x1), int(y1), int(x2), int(y2)],
+                                "ocr_text": target_boxes[b_idx][1],
+                                "target_value": target_val,
+                            }
                         )
                         diff_count += 1
                 else:
@@ -1388,6 +1414,16 @@ def run_unified_detection(
                         (0, 128, 255),
                         2,
                     )
+                    visualization_annotations.append(
+                        {
+                            "kind": "graphic",
+                            "status": "unmatched",
+                            "decision": decision,
+                            "target_idx": target_idx,
+                            "box": [int(x1), int(y1), int(x2), int(y2)],
+                            "summary": res.get("summary", ""),
+                        }
+                    )
                     unresolved_regions.append(res)
                     print(
                         "    - 图形未恢复: 区域 "
@@ -1404,6 +1440,16 @@ def run_unified_detection(
                         0.7,
                         (0, 200, 255),
                         2,
+                    )
+                    visualization_annotations.append(
+                        {
+                            "kind": "graphic",
+                            "status": "review",
+                            "decision": decision,
+                            "target_idx": target_idx,
+                            "box": [int(x1), int(y1), int(x2), int(y2)],
+                            "summary": res.get("summary", ""),
+                        }
                     )
                     needs_review_regions.append(res)
                     print(
@@ -1422,6 +1468,16 @@ def run_unified_detection(
                         (0, 0, 255),
                         2,
                     )
+                    visualization_annotations.append(
+                        {
+                            "kind": "graphic",
+                            "status": "diff",
+                            "decision": decision,
+                            "target_idx": target_idx,
+                            "box": [int(x1), int(y1), int(x2), int(y2)],
+                            "summary": res.get("summary", ""),
+                        }
+                    )
                     diff_count += 1
                     print(
                         "    - 图形差异: 区域 "
@@ -1436,6 +1492,7 @@ def run_unified_detection(
             f"(差异 {diff_count} 处, 未恢复 {len(unresolved_regions)} 处, "
             f"待复核 {len(needs_review_regions)} 处)"
         )
+        results["visualization_annotations"] = visualization_annotations
 
         # ========== 输出汇总 ==========
         print("\n" + "=" * 60)
