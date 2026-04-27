@@ -70,6 +70,18 @@ class TestTextFieldValuesMatch:
             "Date",
         )
 
+    def test_treats_split_and_reordered_label_tokens_as_match(self):
+        assert text_field_values_match(
+            "label:heating_capacity",
+            "Heatin g Capacity",
+            "Capacity Heating",
+        )
+        assert text_field_values_match(
+            "label:air_volume",
+            "Air Flow Volum e",
+            "Volume Air Flow",
+        )
+
     def test_rejects_noisy_label_alias_prefix(self):
         assert not text_field_values_match(
             "label:voltage",
@@ -182,6 +194,48 @@ class TestExtractFieldLabelsFromOcrBoxes:
 
         assert labels == {
             "mfg_date": {"text": "Manufactured Date", "box_indices": [0, 1]},
+        }
+
+    def test_merges_label_words_by_x_when_value_sorts_between_them_by_y(self):
+        boxes = [
+            self._make_box("Heating", x1=841, y1=280, x2=1057, y2=375),
+            self._make_box("3400W", x1=1414, y1=290, x2=1604, y2=370),
+            self._make_box("Capacity", x1=1051, y1=286, x2=1289, y2=379),
+        ]
+
+        labels = extract_field_labels_from_ocr_boxes(boxes, ["heating_capacity"])
+
+        assert labels == {
+            "heating_capacity": {"text": "Heating Capacity", "box_indices": [0, 2]},
+        }
+
+    def test_merges_three_word_air_volume_label(self):
+        boxes = [
+            self._make_box("50Hz", x1=683, y1=376, x2=823, y2=449),
+            self._make_box("Air", x1=843, y1=377, x2=939, y2=449),
+            self._make_box("Flow", x1=933, y1=374, x2=1076, y2=452),
+            self._make_box("Volume", x1=1072, y1=377, x2=1268, y2=451),
+            self._make_box("590m/h", x1=1390, y1=364, x2=1606, y2=452),
+        ]
+
+        labels = extract_field_labels_from_ocr_boxes(boxes, ["air_volume"])
+
+        assert labels == {
+            "air_volume": {"text": "Air Flow Volume", "box_indices": [1, 2, 3]},
+        }
+
+    def test_merges_three_word_noise_label(self):
+        boxes = [
+            self._make_box("Sound", x1=26, y1=575, x2=174, y2=643),
+            self._make_box("Pressure", x1=184, y1=576, x2=366, y2=646),
+            self._make_box("Level(H)", x1=376, y1=569, x2=548, y2=657),
+            self._make_box("37dB(A)", x1=700, y1=575, x2=900, y2=646),
+        ]
+
+        labels = extract_field_labels_from_ocr_boxes(boxes, ["noise"])
+
+        assert labels == {
+            "noise": {"text": "Sound Pressure Level(H)", "box_indices": [0, 1, 2]},
         }
 
     def test_supports_numpy_coordinate_arrays_from_real_ocr(self):

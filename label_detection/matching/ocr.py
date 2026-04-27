@@ -62,6 +62,7 @@ FIELD_LABEL_REGEXES: Dict[str, re.Pattern[str]] = {
 }
 
 FIELD_LABEL_FUZZY_MIN_SCORE = 0.88
+MAX_LABEL_WORD_CANDIDATE_LENGTH = 4
 
 
 def make_label_field_name(field_name: str) -> str:
@@ -132,6 +133,27 @@ def normalize_label_text_for_compare(text: object) -> str:
     return re.sub(r"[^0-9A-Za-z]+", "", normalized)
 
 
+def _label_tokens_for_compare(text: object) -> List[str]:
+    """Tokenize label captions and repair common OCR single-letter splits."""
+    if text is None:
+        return []
+
+    normalized = unicodedata.normalize("NFKC", str(text)).replace("³", "3")
+    raw_tokens = re.findall(r"[A-Za-z]+|\d+", normalized)
+    tokens: List[str] = []
+    for token in raw_tokens:
+        if (
+            token.isalpha()
+            and len(token) == 1
+            and tokens
+            and tokens[-1].isalpha()
+        ):
+            tokens[-1] = f"{tokens[-1]}{token}"
+        else:
+            tokens.append(token)
+    return [token.casefold() for token in tokens if token]
+
+
 def label_values_match(expected: object, actual: object) -> bool:
     return normalize_label_text_for_compare(expected) == normalize_label_text_for_compare(actual)
 
@@ -160,7 +182,18 @@ def label_field_values_match(field_name: object, expected: object, actual: objec
     return (
         normalize_text_for_match(expected) in alias_norms
         and normalize_text_for_match(actual) in alias_norms
-    )
+    ) or _label_token_sets_match(expected, actual)
+
+
+def _label_token_sets_match(expected: object, actual: object) -> bool:
+    expected_tokens = _label_tokens_for_compare(expected)
+    actual_tokens = _label_tokens_for_compare(actual)
+    if len(expected_tokens) < 2 or len(actual_tokens) < 2:
+        return False
+
+    expected_set = set(expected_tokens)
+    actual_set = set(actual_tokens)
+    return expected_set == actual_set
 
 
 def text_field_values_match(field_name: object, expected: object, actual: object) -> bool:
@@ -213,6 +246,33 @@ def _extract_box_rect(points: object) -> tuple[float, float, float, float] | Non
     return min(xs), min(ys), max(xs), max(ys)
 
 
+def _boxes_share_text_line(left: Dict[str, object], right: Dict[str, object]) -> bool:
+    vertical_overlap = max(
+        0.0,
+        min(float(left["y2"]), float(right["y2"]))
+        - max(float(left["y1"]), float(right["y1"])),
+    )
+    min_height = min(float(left["height"]), float(right["height"]))
+    if vertical_overlap < 0.45 * min_height:
+        return False
+
+    center_delta = abs(float(left["center_y"]) - float(right["center_y"]))
+    max_height = max(float(left["height"]), float(right["height"]))
+    return center_delta <= 0.55 * max_height
+
+
+def _boxes_can_chain_as_label_words(left: Dict[str, object], right: Dict[str, object]) -> bool:
+    if not _boxes_share_text_line(left, right):
+        return False
+
+    max_height = max(float(left["height"]), float(right["height"]))
+    horizontal_gap = float(right["x1"]) - float(left["x2"])
+    if horizontal_gap < -0.35 * max_height:
+        return False
+
+    return horizontal_gap <= max(48.0, 1.25 * max_height)
+
+
 def _iter_label_candidates(ocr_boxes: Sequence[OCRBox]) -> List[Dict[str, object]]:
     box_metas: List[Dict[str, object]] = []
     for idx, box_info in enumerate(ocr_boxes):
@@ -248,40 +308,53 @@ def _iter_label_candidates(ocr_boxes: Sequence[OCRBox]) -> List[Dict[str, object
             }
         )
 
-    box_metas.sort(key=lambda item: (item["center_y"], item["x1"]))
     candidates: List[Dict[str, object]] = []
+    seen_candidates: set[tuple[int, ...]] = set()
+
+    def add_candidate(items: Sequence[Dict[str, object]]) -> None:
+        if not items:
+            return
+
+        box_indices = [
+            box_idx
+            for item in items
+            for box_idx in list(item.get("box_indices") or [])
+        ]
+        candidate_key = tuple(int(box_idx) for box_idx in box_indices)
+        if candidate_key in seen_candidates:
+            return
+        seen_candidates.add(candidate_key)
+
+        candidates.append(
+            {
+                "text": " ".join(str(item["text"]).strip() for item in items).strip(),
+                "box_indices": box_indices,
+                "confidence": min(float(item["confidence"]) for item in items),
+            }
+        )
 
     for meta in box_metas:
-        candidates.append(
-            {
-                "text": meta["text"],
-                "box_indices": list(meta["box_indices"]),
-                "confidence": meta["confidence"],
-            }
-        )
+        add_candidate([meta])
 
-    for left, right in zip(box_metas, box_metas[1:]):
-        vertical_overlap = max(0.0, min(left["y2"], right["y2"]) - max(left["y1"], right["y1"]))
-        min_height = min(left["height"], right["height"])
-        if vertical_overlap < 0.55 * min_height:
-            continue
+    x_ordered_metas = sorted(box_metas, key=lambda item: (item["x1"], item["center_y"]))
+    for start_idx, start in enumerate(x_ordered_metas):
+        sequence = [start]
+        previous = start
+        for candidate in x_ordered_metas[start_idx + 1 :]:
+            if not _boxes_share_text_line(start, candidate):
+                continue
 
-        if abs(left["center_y"] - right["center_y"]) > 0.4 * max(left["height"], right["height"]):
-            continue
+            if not _boxes_can_chain_as_label_words(previous, candidate):
+                if float(candidate["x1"]) >= float(previous["x2"]):
+                    break
+                continue
 
-        horizontal_gap = float(right["x1"]) - float(left["x2"])
-        if horizontal_gap < -0.1 * max(left["height"], right["height"]):
-            continue
-        if horizontal_gap > max(24.0, 0.35 * max(left["height"], right["height"])):
-            continue
+            sequence.append(candidate)
+            add_candidate(sequence)
+            previous = candidate
 
-        candidates.append(
-            {
-                "text": f"{left['text']} {right['text']}".strip(),
-                "box_indices": list(left["box_indices"]) + list(right["box_indices"]),
-                "confidence": min(left["confidence"], right["confidence"]),
-            }
-        )
+            if len(sequence) >= MAX_LABEL_WORD_CANDIDATE_LENGTH:
+                break
 
     return candidates
 
