@@ -1,41 +1,52 @@
-# Compatibility shim to fix langchain import issues
-# This redirects old langchain imports to new langchain_core locations
+"""Compatibility aliases for PaddleX imports against LangChain 1.x.
 
-# Create the missing langchain module structure
+PaddleX 3.4.0 still imports a couple of pre-1.0 LangChain module paths:
+
+- ``langchain.docstore.document.Document``
+- ``langchain.text_splitter.RecursiveCharacterTextSplitter``
+
+The project pins LangChain 1.x, where those objects live in split packages.
+This module installs narrow aliases before PaddleX/PaddleOCR is imported.
+"""
+
+from __future__ import annotations
+
 import sys
 import types
 
-# Create langchain package if it doesn't exist
-try:
-    import langchain
-except ImportError:
-    sys.modules["langchain"] = types.ModuleType("langchain")
 
-# 1. Fix langchain.docstore import
-# Create langchain.docstore package
-sys.modules["langchain.docstore"] = types.ModuleType("langchain.docstore")
+def ensure_langchain_legacy_imports() -> None:
+    """Expose the old LangChain module paths required by PaddleX 3.4.0."""
 
-# Import the Document class from the new location and expose it in the old location
-from langchain_core.documents.base import Document
+    try:
+        import langchain
+    except ImportError:
+        langchain = types.ModuleType("langchain")
+        sys.modules["langchain"] = langchain
 
-# Expose Document in the old location
-sys.modules["langchain.docstore.document"] = types.ModuleType(
-    "langchain.docstore.document"
-)
-sys.modules["langchain.docstore.document"].Document = Document
+    if "langchain.docstore.document" not in sys.modules:
+        try:
+            from langchain_classic.docstore.document import Document
+        except ImportError:
+            from langchain_core.documents import Document
 
-# 2. Fix langchain.text_splitter import
-# Import RecursiveCharacterTextSplitter from the new location
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+        docstore_mod = sys.modules.setdefault(
+            "langchain.docstore",
+            types.ModuleType("langchain.docstore"),
+        )
+        document_mod = types.ModuleType("langchain.docstore.document")
+        document_mod.Document = Document
+        sys.modules["langchain.docstore.document"] = document_mod
+        setattr(docstore_mod, "document", document_mod)
+        setattr(langchain, "docstore", docstore_mod)
 
-# Create langchain.text_splitter module
-sys.modules["langchain.text_splitter"] = types.ModuleType("langchain.text_splitter")
-sys.modules["langchain.text_splitter"].RecursiveCharacterTextSplitter = (
-    RecursiveCharacterTextSplitter
-)
+    if "langchain.text_splitter" not in sys.modules:
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Make sure the old import paths work
-import langchain.docstore.document
-import langchain.text_splitter
+        text_splitter_mod = types.ModuleType("langchain.text_splitter")
+        text_splitter_mod.RecursiveCharacterTextSplitter = RecursiveCharacterTextSplitter
+        sys.modules["langchain.text_splitter"] = text_splitter_mod
+        setattr(langchain, "text_splitter", text_splitter_mod)
 
-print("LangChain compatibility shim loaded successfully!")
+
+ensure_langchain_legacy_imports()

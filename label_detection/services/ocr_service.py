@@ -2,6 +2,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, List, Tuple
 
+from label_detection.core.langchain_compat import ensure_langchain_legacy_imports
 from label_detection.core.config import OCR_DEVICE, OCR_LANG, OCR_USE_ANGLE_CLS
 from label_detection.core.paddle_runtime import resolve_paddle_device
 
@@ -20,6 +21,7 @@ def get_ocr_engine() -> "PaddleOCR":
     """获取或初始化 OCR 引擎（全局单例）"""
     global _ocr_engine
     if _ocr_engine is None:
+        ensure_langchain_legacy_imports()
         from paddleocr import PaddleOCR
 
         device = resolve_paddle_device(OCR_DEVICE, component="PaddleOCR")

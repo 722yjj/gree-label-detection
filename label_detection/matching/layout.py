@@ -33,6 +33,7 @@ from label_detection.core.config import (
     MATCH_COST_THRESHOLD,
     ENABLE_IMAGE_REGION_SPLIT,
 )
+from label_detection.core.langchain_compat import ensure_langchain_legacy_imports
 from label_detection.core.paddle_runtime import resolve_paddle_device
 
 
@@ -58,6 +59,7 @@ def get_layout_predictor(threshold: float = None):
     if threshold is None:
         threshold = LAYOUT_DETECTION_THRESHOLD
     if _layout_predictor is None:
+        ensure_langchain_legacy_imports()
         from paddlex import create_predictor
 
         device = resolve_paddle_device(LAYOUT_DEVICE, component=LAYOUT_MODEL_NAME)
