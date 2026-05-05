@@ -12,9 +12,13 @@ STATUS: main
 """
 
 from collections import defaultdict
+import atexit
 import json
 import os
 import re
+import select
+import subprocess
+import sys
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -23,6 +27,12 @@ from scipy.optimize import linear_sum_assignment
 
 # 导入公共模块
 from label_detection.core.config import (
+    HF_LAYOUT_DEVICE,
+    HF_LAYOUT_HF_HOME,
+    HF_LAYOUT_MODEL_ID,
+    HF_LAYOUT_PYTHON,
+    HF_LAYOUT_TIMEOUT,
+    LAYOUT_BACKEND,
     LAYOUT_DETECTION_THRESHOLD,
     LAYOUT_DEVICE,
     LAYOUT_MODEL_NAME,
@@ -39,6 +49,9 @@ from label_detection.core.paddle_runtime import resolve_paddle_device
 
 # 创建 PP-DocLayoutV3 预测器（全局复用）
 _layout_predictor = None
+_hf_layout_worker = None
+
+SUPPORTED_LAYOUT_BACKENDS = {"paddlex", "hf-pytorch-gpu"}
 
 
 def _require_cv2():
@@ -51,6 +64,228 @@ def _get_ssim():
     from skimage.metrics import structural_similarity as ssim
 
     return ssim
+
+
+def _resolve_layout_backend() -> str:
+    return os.getenv("LAYOUT_BACKEND", LAYOUT_BACKEND).strip().lower() or "paddlex"
+
+
+def get_layout_backend_name() -> str:
+    """Return the configured layout detection backend name."""
+    return _resolve_layout_backend()
+
+
+def _resolve_hf_layout_python() -> str:
+    return os.getenv("HF_LAYOUT_PYTHON", HF_LAYOUT_PYTHON).strip() or sys.executable
+
+
+def _resolve_hf_layout_timeout() -> float:
+    value = os.getenv("HF_LAYOUT_TIMEOUT", str(HF_LAYOUT_TIMEOUT)).strip()
+    try:
+        return float(value)
+    except ValueError:
+        return HF_LAYOUT_TIMEOUT
+
+
+def _hf_layout_worker_script() -> str:
+    return r'''
+import json
+import os
+import sys
+import traceback
+
+
+def write(payload):
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def to_plain(value):
+    if hasattr(value, "detach"):
+        return value.detach().cpu().tolist()
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {k: to_plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_plain(v) for v in value]
+    return value
+
+
+model_id = os.getenv("HF_LAYOUT_MODEL_ID", "PaddlePaddle/PP-DocLayoutV3_safetensors")
+device = os.getenv("HF_LAYOUT_DEVICE", "cuda").strip() or "cuda"
+
+try:
+    from PIL import Image
+    import torch
+    from transformers import AutoImageProcessor, AutoModelForObjectDetection
+
+    processor = AutoImageProcessor.from_pretrained(model_id)
+    model = AutoModelForObjectDetection.from_pretrained(model_id).to(device).eval()
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+    write({"ready": True, "model_id": model_id, "device": device})
+except Exception:
+    write({"ready": False, "error": traceback.format_exc()})
+    sys.exit(1)
+
+
+def predict(image_path, threshold):
+    image = Image.open(image_path).convert("RGB")
+    inputs = processor(images=[image], return_tensors="pt")
+    inputs = {k: v.to(device) if hasattr(v, "to") else v for k, v in inputs.items()}
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+
+    with torch.inference_mode():
+        outputs = model(**inputs)
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+
+    target_sizes = [image.size[::-1]]
+    result = processor.post_process_object_detection(
+        outputs,
+        threshold=float(threshold),
+        target_sizes=target_sizes,
+    )[0]
+
+    labels = result["labels"].detach().cpu().tolist()
+    scores = result["scores"].detach().cpu().tolist()
+    boxes = result["boxes"].detach().cpu().tolist()
+    polygon_points = result.get("polygon_points")
+    if polygon_points is not None:
+        polygon_points = to_plain(polygon_points)
+
+    regions = []
+    for idx, label_id in enumerate(labels):
+        region = {
+            "label": model.config.id2label[int(label_id)],
+            "score": float(scores[idx]),
+            "coordinate": [float(x) for x in boxes[idx]],
+        }
+        if polygon_points is not None and idx < len(polygon_points):
+            region["polygon_points"] = to_plain(polygon_points[idx])
+        regions.append(region)
+    return regions
+
+
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+        if request.get("op") == "shutdown":
+            write({"ok": True, "shutdown": True})
+            break
+        image_path = request["image_path"]
+        threshold = request.get("threshold", 0.3)
+        write({"ok": True, "regions": predict(image_path, threshold)})
+    except Exception:
+        write({"ok": False, "error": traceback.format_exc()})
+'''
+
+
+class _HFLayoutWorker:
+    def __init__(self):
+        self.python = _resolve_hf_layout_python()
+        self.timeout = _resolve_hf_layout_timeout()
+        self.proc = None
+        self._start()
+
+    def _start(self):
+        env = os.environ.copy()
+        env.setdefault("HF_LAYOUT_MODEL_ID", HF_LAYOUT_MODEL_ID)
+        env.setdefault("HF_LAYOUT_DEVICE", HF_LAYOUT_DEVICE)
+        hf_home = os.getenv("HF_LAYOUT_HF_HOME", HF_LAYOUT_HF_HOME).strip()
+        if hf_home:
+            env.setdefault("HF_HOME", hf_home)
+            env.setdefault("TRANSFORMERS_CACHE", str(os.path.join(hf_home, "transformers")))
+        env.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+        env.setdefault("TRANSFORMERS_VERBOSITY", "error")
+        env.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+        print(
+            "正在初始化 HF Layout "
+            f"(python={self.python}, model={env.get('HF_LAYOUT_MODEL_ID')}, "
+            f"device={env.get('HF_LAYOUT_DEVICE')})..."
+        )
+        self.proc = subprocess.Popen(
+            [self.python, "-c", _hf_layout_worker_script()],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            text=True,
+            bufsize=1,
+        )
+        payload = self._read_response()
+        if not payload.get("ready"):
+            self.close(force=True)
+            raise RuntimeError(payload.get("error", "HF Layout worker failed to initialize"))
+        print(
+            "  HF Layout 就绪: "
+            f"model={payload.get('model_id')}, device={payload.get('device')}"
+        )
+
+    def _read_response(self) -> Dict:
+        if self.proc is None or self.proc.stdout is None:
+            raise RuntimeError("HF Layout worker is not running")
+        ready, _, _ = select.select([self.proc.stdout], [], [], self.timeout)
+        if not ready:
+            self.close(force=True)
+            raise TimeoutError(f"HF Layout worker timeout after {self.timeout:.1f}s")
+        line = self.proc.stdout.readline()
+        if not line:
+            code = self.proc.poll()
+            raise RuntimeError(f"HF Layout worker exited unexpectedly (code={code})")
+        return json.loads(line)
+
+    def predict(self, image_path: str, threshold: float) -> List[Dict]:
+        if self.proc is None or self.proc.poll() is not None:
+            self._start()
+        assert self.proc is not None and self.proc.stdin is not None
+        request = {
+            "op": "predict",
+            "image_path": str(image_path),
+            "threshold": float(threshold),
+        }
+        self.proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+        self.proc.stdin.flush()
+        payload = self._read_response()
+        if not payload.get("ok"):
+            raise RuntimeError(payload.get("error", "HF Layout worker prediction failed"))
+        return list(payload.get("regions", []))
+
+    def close(self, force: bool = False):
+        proc = self.proc
+        self.proc = None
+        if proc is None:
+            return
+        if proc.poll() is None and not force:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.write(json.dumps({"op": "shutdown"}) + "\n")
+                    proc.stdin.flush()
+                proc.wait(timeout=3)
+            except Exception:
+                proc.terminate()
+        if proc.poll() is None:
+            proc.kill()
+
+
+def _close_hf_layout_worker():
+    global _hf_layout_worker
+    if _hf_layout_worker is not None:
+        _hf_layout_worker.close()
+        _hf_layout_worker = None
+
+
+atexit.register(_close_hf_layout_worker)
+
+
+def _get_hf_layout_worker() -> _HFLayoutWorker:
+    global _hf_layout_worker
+    if _hf_layout_worker is None:
+        _hf_layout_worker = _HFLayoutWorker()
+    return _hf_layout_worker
 
 
 def get_layout_predictor(threshold: float = None):
@@ -83,6 +318,12 @@ def detect_layout_regions(image_path: str, threshold: float = 0.3) -> List[Dict]
     Returns:
         检测到的区域列表，每个区域包含 label, score, coordinate
     """
+    backend = _resolve_layout_backend()
+    if backend == "hf-pytorch-gpu":
+        return _get_hf_layout_worker().predict(image_path, threshold)
+    if backend != "paddlex":
+        print(f"未知 LAYOUT_BACKEND={backend}，回退 PaddleX")
+
     predictor = get_layout_predictor(threshold)
     output = predictor.predict(image_path)
     

@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from datetime import datetime as real_datetime
 
@@ -151,6 +152,43 @@ def test_config_from_env_defaults_to_continuous_auto_exposure(monkeypatch):
 
     assert config.exposure_auto == "continuous"
     assert config.gain_auto is None
+
+
+def test_resolve_mvs_python_path_supports_aarch64_layout(tmp_path: Path, monkeypatch):
+    mvs_root = tmp_path / "MVS"
+    mv_import = mvs_root / "Samples" / "aarch64" / "Python" / "MvImport"
+    mv_import.mkdir(parents=True)
+
+    monkeypatch.delenv("HIKROBOT_MVS_PYTHON_PATH", raising=False)
+    monkeypatch.setattr(hikrobot_mvs_module, "_DEFAULT_MVS_ROOT", mvs_root)
+    monkeypatch.setattr(hikrobot_mvs_module.platform, "machine", lambda: "aarch64")
+    monkeypatch.setattr(
+        hikrobot_mvs_module.platform,
+        "architecture",
+        lambda: ("64bit", ""),
+    )
+
+    assert hikrobot_mvs_module._resolve_mvs_python_path() == mv_import
+
+
+def test_prepare_mvs_environment_sets_default_paths(tmp_path: Path, monkeypatch):
+    mvs_root = tmp_path / "MVS"
+    (mvs_root / "lib").mkdir(parents=True)
+
+    monkeypatch.setattr(hikrobot_mvs_module, "_DEFAULT_MVS_ROOT", mvs_root)
+    monkeypatch.delenv("MVCAM_SDK_PATH", raising=False)
+    monkeypatch.delenv("MVCAM_COMMON_RUNENV", raising=False)
+    monkeypatch.delenv("MVCAM_GENICAM_CLPROTOCOL", raising=False)
+    monkeypatch.delenv("ALLUSERSPROFILE", raising=False)
+
+    hikrobot_mvs_module._prepare_mvs_environment()
+
+    assert os.environ["MVCAM_SDK_PATH"] == str(mvs_root)
+    assert os.environ["MVCAM_COMMON_RUNENV"] == str(mvs_root / "lib")
+    assert os.environ["MVCAM_GENICAM_CLPROTOCOL"] == str(
+        mvs_root / "lib" / "CLProtocol"
+    )
+    assert os.environ["ALLUSERSPROFILE"] == str(mvs_root / "MVFG")
 
 
 def test_adapter_capture_uses_helper_and_returns_saved_path(tmp_path: Path, monkeypatch):

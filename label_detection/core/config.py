@@ -40,10 +40,19 @@ GRAPHIC_NUM_PREDICT = int(
 VLM_NUM_PREDICT = GRAPHIC_NUM_PREDICT
 
 # ==================== OCR 配置 ====================
+OCR_BACKEND = os.getenv("OCR_BACKEND", "paddleocr").strip().lower() or "paddleocr"
 OCR_LANG = os.getenv("OCR_LANG", "ch")
 OCR_USE_ANGLE_CLS = True
 PADDLE_DEVICE = os.getenv("PADDLE_DEVICE", "gpu:0").strip() or "gpu:0"
 OCR_DEVICE = os.getenv("OCR_DEVICE", PADDLE_DEVICE).strip() or PADDLE_DEVICE
+RAPIDOCR_PYTHON = os.getenv("RAPIDOCR_PYTHON", "").strip()
+RAPIDOCR_TIMEOUT = float(os.getenv("RAPIDOCR_TIMEOUT", "120"))
+RAPIDOCR_MODEL_TYPE = os.getenv("RAPIDOCR_MODEL_TYPE", "mobile").strip().lower() or "mobile"
+RAPIDOCR_USE_CLS = _env_flag("RAPIDOCR_USE_CLS", "0")
+RAPIDOCR_TRT_CACHE_DIR = os.getenv(
+    "RAPIDOCR_TRT_CACHE_DIR",
+    str(PROJECT_ROOT.parent / "models" / "ocr" / "tensorrt-engines" / "gb10"),
+).strip()
 LAYOUT_DEVICE = os.getenv("LAYOUT_DEVICE", PADDLE_DEVICE).strip() or PADDLE_DEVICE
 PADDLE_DEVICE_REQUIRED = _env_flag("PADDLE_DEVICE_REQUIRED", "0")
 PADDLE_DISABLE_MODEL_SOURCE_CHECK = _env_flag(
@@ -53,8 +62,23 @@ PADDLE_DISABLE_MODEL_SOURCE_CHECK = _env_flag(
 PADDLE_EMPTY_CACHE_AFTER_RUN = _env_flag("PADDLE_EMPTY_CACHE_AFTER_RUN", "1")
 
 # ==================== 布局检测配置 ====================
+LAYOUT_BACKEND = os.getenv("LAYOUT_BACKEND", "paddlex").strip().lower() or "paddlex"
 LAYOUT_DETECTION_THRESHOLD = float(os.getenv("LAYOUT_DETECTION_THRESHOLD", "0.3"))
 LAYOUT_MODEL_NAME = "PP-DocLayoutV3"
+HF_LAYOUT_PYTHON = os.getenv(
+    "HF_LAYOUT_PYTHON",
+    "/home/jnu/venvs/gree-layout-hf-gpu/bin/python",
+).strip()
+HF_LAYOUT_MODEL_ID = os.getenv(
+    "HF_LAYOUT_MODEL_ID",
+    "PaddlePaddle/PP-DocLayoutV3_safetensors",
+).strip()
+HF_LAYOUT_DEVICE = os.getenv("HF_LAYOUT_DEVICE", "cuda").strip() or "cuda"
+HF_LAYOUT_TIMEOUT = float(os.getenv("HF_LAYOUT_TIMEOUT", "120"))
+HF_LAYOUT_HF_HOME = os.getenv(
+    "HF_LAYOUT_HF_HOME",
+    str(Path.home() / "models" / "layout" / "hf_home"),
+).strip()
 
 # ==================== 区域匹配配置 ====================
 REGION_MATCH_DISTANCE_THRESHOLD = 0.2

@@ -45,6 +45,7 @@ from label_detection.extraction.text import (
 from label_detection.matching.layout import (
     detect_layout_regions,
     extract_regions_by_type,
+    get_layout_backend_name,
     match_regions,
     compare_region_pair,
     draw_regions,
@@ -76,7 +77,7 @@ from label_detection.schema import (
 from label_detection.preprocessing.border import crop_to_border, find_template_crop_rect
 from label_detection.preprocessing.pipeline import preprocess_target
 from label_detection.services.ollama_client import OllamaHTTPClient
-from label_detection.services.ocr_service import get_ocr_with_boxes
+from label_detection.services.ocr_service import get_ocr_backend_name, get_ocr_with_boxes
 
 _llm = None
 
@@ -2678,6 +2679,7 @@ def run_unified_detection(
             )
 
         results["text_detection"] = {
+            "ocr_backend": get_ocr_backend_name(),
             "label_kind": label_kind,
             "fields": comparison_fields,
             "value_fields": structured_fields,
@@ -2954,6 +2956,7 @@ def run_unified_detection(
             + len(recovered_target_regions)
         )
         results["graphic_comparison"] = {
+            "layout_backend": get_layout_backend_name(),
             "template_regions_total_count": len(
                 extract_regions_by_type(template_all_regions, "image")
             ),

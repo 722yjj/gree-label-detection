@@ -128,7 +128,7 @@ def test_run_unified_detection_debug_mode_keeps_debug_artifacts(tmp_path, monkey
 
     debug_dir = output_dir / "debug"
     assert (debug_dir / "preprocess" / "template_preprocessed.jpg").exists()
-    assert (debug_dir / "preprocess" / "target_preprocessed.jpg").exists()
+    assert (debug_dir / "preprocess" / "target_preprocessed.png").exists()
     assert (debug_dir / "text_comparison.xlsx").exists()
     assert (debug_dir / "graphic_comparison" / "template_regions_detected.jpg").exists()
     assert (debug_dir / "graphic_comparison" / "target_regions_detected.jpg").exists()
@@ -136,6 +136,7 @@ def test_run_unified_detection_debug_mode_keeps_debug_artifacts(tmp_path, monkey
 
     payload = json.loads((output_dir / "final_result.json").read_text(encoding="utf-8"))
     assert payload["output_mode"] == "debug"
+    assert payload["text_detection"]["ocr_backend"] == "paddleocr"
     assert payload["text_detection"]["excel_path"].endswith("debug/text_comparison.xlsx")
     assert payload["template_input"]["resolved_image_path"].endswith(
         "debug/template_assets/template_page1.png"

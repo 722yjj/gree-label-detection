@@ -613,10 +613,21 @@ def _import_mvs_sdk():
 
 
 def _prepare_mvs_environment() -> None:
+    if not os.getenv("MVCAM_SDK_PATH") and _DEFAULT_MVS_ROOT.exists():
+        os.environ["MVCAM_SDK_PATH"] = str(_DEFAULT_MVS_ROOT)
+
     if not os.getenv("MVCAM_COMMON_RUNENV"):
         default_runenv = _DEFAULT_MVS_ROOT / "lib"
         if default_runenv.exists():
             os.environ["MVCAM_COMMON_RUNENV"] = str(default_runenv)
+
+    if not os.getenv("MVCAM_GENICAM_CLPROTOCOL"):
+        default_clprotocol = _DEFAULT_MVS_ROOT / "lib" / "CLProtocol"
+        os.environ["MVCAM_GENICAM_CLPROTOCOL"] = str(default_clprotocol)
+
+    if not os.getenv("ALLUSERSPROFILE"):
+        default_profile = _DEFAULT_MVS_ROOT / "MVFG"
+        os.environ["ALLUSERSPROFILE"] = str(default_profile)
 
 
 def _resolve_mvs_python_path() -> Path | None:
@@ -624,10 +635,19 @@ def _resolve_mvs_python_path() -> Path | None:
     if override:
         return Path(override).expanduser()
 
-    bitness = "64" if platform.architecture()[0] == "64bit" else "32"
-    candidate = _DEFAULT_MVS_ROOT / "Samples" / bitness / "Python" / "MvImport"
-    if candidate.exists():
-        return candidate
+    machine = platform.machine().strip().lower()
+    sample_arch_candidates: list[str] = []
+    if machine in {"aarch64", "arm64"}:
+        sample_arch_candidates.extend(["aarch64", "arm64"])
+    elif machine in {"armv7l", "armv6l", "armhf"}:
+        sample_arch_candidates.append("armhf")
+
+    sample_arch_candidates.append("64" if platform.architecture()[0] == "64bit" else "32")
+
+    for sample_arch in dict.fromkeys(sample_arch_candidates):
+        candidate = _DEFAULT_MVS_ROOT / "Samples" / sample_arch / "Python" / "MvImport"
+        if candidate.exists():
+            return candidate
     return None
 
 

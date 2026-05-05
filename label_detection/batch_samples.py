@@ -233,6 +233,7 @@ def compute_text_summary(result: Dict[str, object]) -> Dict[str, object]:
     ]
 
     summary = {
+        "ocr_backend": text_detection.get("ocr_backend"),
         "label_kind": text_detection.get("label_kind"),
         "match_count": len(field_names) - len(different_fields),
         "total_fields": len(field_names),
@@ -265,9 +266,22 @@ def compute_graphic_summary(result: Dict[str, object]) -> Dict[str, object]:
         graphic.get("resolved_match_count") or (matched_count + recovered_match_count)
     )
 
-    return {
+    summary = {
+        "layout_backend": graphic.get("layout_backend"),
+        "template_regions_total_count": graphic.get("template_regions_total_count"),
+        "target_regions_total_count": graphic.get("target_regions_total_count"),
         "template_regions_count": graphic.get("template_regions_count"),
         "target_regions_count": graphic.get("target_regions_count"),
+        "skipped_template_regions": list(graphic.get("skipped_template_regions") or []),
+        "skipped_target_regions": list(graphic.get("skipped_target_regions") or []),
+        "split_template_regions": list(graphic.get("split_template_regions") or []),
+        "split_target_regions": list(graphic.get("split_target_regions") or []),
+        "skipped_split_template_regions": list(
+            graphic.get("skipped_split_template_regions") or []
+        ),
+        "skipped_split_target_regions": list(
+            graphic.get("skipped_split_target_regions") or []
+        ),
         "matched_count": matched_count,
         "recovered_match_count": recovered_match_count,
         "resolved_match_count": resolved_match_count,
@@ -278,6 +292,7 @@ def compute_graphic_summary(result: Dict[str, object]) -> Dict[str, object]:
         "review_count": review_count,
         "comparison_results": comparison_results,
     }
+    return {key: value for key, value in summary.items() if value not in (None, [])}
 
 
 def build_saved_payload(
@@ -337,6 +352,24 @@ def write_json(path: Path, payload: Dict[str, object]) -> None:
 
 def get_case_output_dir(output_root: Path, case: BatchCase) -> Path:
     return output_root / case.code / case.case_id
+
+
+def cleanup_report_intermediates(output_root: Path) -> None:
+    """Keep batch output sync-friendly by removing per-case intermediate files."""
+    keep_names = {RESULT_JSON_NAME, RESULT_VIS_NAME, SUMMARY_JSON_NAME}
+    root = Path(output_root)
+    if not root.exists():
+        return
+
+    for path in root.rglob("*"):
+        if path.is_file() and path.name not in keep_names:
+            path.unlink()
+
+    for path in sorted((item for item in root.rglob("*") if item.is_dir()), reverse=True):
+        try:
+            path.rmdir()
+        except OSError:
+            pass
 
 
 def load_existing_record(case: BatchCase, output_root: Path) -> Optional[CaseRunRecord]:

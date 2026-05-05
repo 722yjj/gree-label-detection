@@ -124,6 +124,9 @@ def test_run_case_keeps_only_json_and_visualization(monkeypatch):
                             "target_data": {"barcode": code, "model_number": "B"},
                         },
                         "graphic_comparison": {
+                            "layout_backend": "hf-pytorch-gpu",
+                            "template_regions_total_count": 2,
+                            "target_regions_total_count": 3,
                             "matched_count": 1,
                             "effective_matched_count": 1,
                             "comparison_results": [
@@ -149,6 +152,9 @@ def test_run_case_keeps_only_json_and_visualization(monkeypatch):
         payload = json.loads((case_dir / "result.json").read_text(encoding="utf-8"))
         assert payload["artifacts"]["visualization_diff"].endswith("visualization_diff.jpg")
         assert payload["text_detection"]["different_fields"] == ["model_number"]
+        assert payload["graphic_comparison"]["layout_backend"] == "hf-pytorch-gpu"
+        assert payload["graphic_comparison"]["template_regions_total_count"] == 2
+        assert payload["graphic_comparison"]["target_regions_total_count"] == 3
         assert payload["graphic_comparison"]["mismatch_count"] == 1
         assert payload["graphic_comparison"]["resolved_match_count"] == 1
 
