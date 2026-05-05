@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
-Name=格力标签检测
-Comment=启动格力标签检测桌面端
+Name=标签检测
+Comment=启动标签检测桌面端
 Exec=@PROJECT_ROOT@/scripts/start_desktop.sh
 Path=@PROJECT_ROOT@
 Terminal=true

@@ -68,5 +68,5 @@ if [[ "${CHECK_ONLY}" == "1" ]]; then
   exit 0
 fi
 
-echo "启动格力标签检测桌面端..." | tee -a "${LOG_FILE}"
+echo "启动标签检测桌面端..." | tee -a "${LOG_FILE}"
 exec "${PYTHON}" -m desktop_app.main

@@ -39,8 +39,8 @@ scripts/install_desktop_launcher.sh
 脚本会基于当前 checkout 路径生成：
 
 ```text
-~/.local/share/applications/gree-label-detection.desktop
-~/Desktop/gree-label-detection.desktop
+~/.local/share/applications/label-detection.desktop
+~/Desktop/label-detection.desktop
 ```
 
 如果当前系统没有 `~/Desktop` 目录，只安装应用菜单入口。
