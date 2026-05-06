@@ -62,14 +62,15 @@ def _contour_to_quad(contour):
     return box
 
 
-def _score_quad(quad, contour_area, image_shape, template_ratio):
+def _score_quad(quad, contour_area, image_shape, template_ratio, source_kind="content"):
     """
     对候选四边形打分。
 
     评分目标：
     1. 尽量接近模板长宽比
-    2. 轮廓在四边形中填充充分，避免只取到零散文字
-    3. 避免直接选中整张图边缘
+    2. 内容聚合候选需要填充充分，避免只取到零散文字
+    3. 边框候选允许低填充率，避免真实外框被误过滤
+    4. 避免直接选中触碰图像边缘的相邻标签/背景大块
     """
     ih, iw = image_shape[:2]
     image_area = float(iw * ih)
@@ -97,10 +98,6 @@ def _score_quad(quad, contour_area, image_shape, template_ratio):
     if aspect_ratio < 1.0 or aspect_ratio > 12.0:
         return None
 
-    fill_ratio = contour_area / quad_area
-    if fill_ratio < 0.35:
-        return None
-
     if template_ratio is not None:
         aspect_gap = abs(np.log(aspect_ratio / template_ratio))
         if aspect_gap > np.log(2.8):
@@ -116,21 +113,44 @@ def _score_quad(quad, contour_area, image_shape, template_ratio):
         + int(x + w >= iw - 5)
         + int(y + h >= ih - 5)
     )
-    edge_penalty = {0: 0.0, 1: 0.1, 2: 0.4, 3: 1.0, 4: 1.5}.get(touch_count, 1.5)
+    if touch_count and area_ratio > 0.15:
+        if template_ratio is None or abs(np.log(aspect_ratio / template_ratio)) > np.log(1.15):
+            return None
+
+    fill_ratio = contour_area / quad_area
+    if source_kind == "outline":
+        if fill_ratio < 0.03:
+            return None
+        fill_score = 0.75
+        source_bonus = 0.35
+        edge_penalty = {0: 0.0, 1: 0.35, 2: 0.8, 3: 1.4, 4: 2.0}.get(
+            touch_count, 2.0
+        )
+    else:
+        if fill_ratio < 0.35:
+            return None
+        fill_score = min(fill_ratio, 1.0)
+        source_bonus = 0.0
+        edge_penalty = {0: 0.0, 1: 0.35, 2: 0.8, 3: 1.4, 4: 2.0}.get(
+            touch_count, 2.0
+        )
 
     area_score = 1.0 - min(abs(area_ratio - 0.35) / 0.35, 1.0)
-    fill_score = min(fill_ratio, 1.0)
-    score = aspect_score * 2.0 + area_score + fill_score - edge_penalty
+    score = aspect_score * 2.0 + area_score + fill_score + source_bonus - edge_penalty
 
     return {
         "corners": quad,
         "score": score,
         "area_ratio": area_ratio,
         "aspect_ratio": aspect_ratio,
+        "fill_ratio": fill_ratio,
+        "touch_count": touch_count,
     }
 
 
-def _find_best_candidate(mask, image_shape, template_ratio, method_name):
+def _find_best_candidate(
+    mask, image_shape, template_ratio, method_name, source_kind="content"
+):
     """从当前掩码中挑选最像标签主体的四边形。"""
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -148,7 +168,13 @@ def _find_best_candidate(mask, image_shape, template_ratio, method_name):
         if quad is None:
             continue
 
-        candidate = _score_quad(quad, contour_area, image_shape, template_ratio)
+        candidate = _score_quad(
+            quad,
+            contour_area,
+            image_shape,
+            template_ratio,
+            source_kind=source_kind,
+        )
         if candidate is None:
             continue
 
@@ -164,9 +190,9 @@ def detect_and_correct_perspective(target, template, output_dir=None):
     检测标签四角点并进行透视矫正。
 
     当前策略：
-    1. 方法1：聚合深色前景（文字、边框、条码），找出最像标签主体的四边形
-    2. 方法3：边缘检测后提取候选四边形
-    3. 结合模板长宽比对候选区域打分，避免直接选中整张图或外部背景
+    1. 方法1：聚合深色前景（文字、边框、条码），作为内容候选
+    2. 方法3：边缘检测后提取候选四边形，作为边框候选
+    3. 结合模板长宽比、候选来源和触边情况打分，避免直接选中相邻标签或外部背景
 
     Args:
         target: 目标图片 (BGR)
@@ -201,7 +227,11 @@ def detect_and_correct_perspective(target, template, output_dir=None):
     )
 
     candidate = _find_best_candidate(
-        dark_mask, target.shape, template_ratio, "深色区域聚合"
+        dark_mask,
+        target.shape,
+        template_ratio,
+        "深色区域聚合",
+        source_kind="content",
     )
     if candidate is not None:
         candidates.append(candidate)
@@ -220,7 +250,9 @@ def detect_and_correct_perspective(target, template, output_dir=None):
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, edge_kernel)
     edges = cv2.dilate(edges, edge_kernel, iterations=1)
 
-    candidate = _find_best_candidate(edges, target.shape, template_ratio, "边缘检测")
+    candidate = _find_best_candidate(
+        edges, target.shape, template_ratio, "边缘检测", source_kind="outline"
+    )
     if candidate is not None:
         candidates.append(candidate)
         print(
