@@ -1032,6 +1032,7 @@ def _add_text_visualization_annotation(
         return False
     if _has_existing_text_annotation(clipped_box, visualization_annotations):
         return False
+    preserve_span_box = bool(annotation.get("preserve_span_box"))
 
     evidence = _local_text_diff_evidence(
         template_image,
@@ -1044,8 +1045,9 @@ def _add_text_visualization_annotation(
         "box": [int(v) for v in clipped_box],
         "local_diff_evidence": evidence,
     }
+    annotation.pop("preserve_span_box", None)
     localized_text_component = False
-    if str(annotation.get("field") or "") == "air_volume":
+    if str(annotation.get("field") or "") == "air_volume" and not preserve_span_box:
         component_box = _local_text_component_box(
             template_image=template_image,
             target_image=target_image,
@@ -1189,6 +1191,129 @@ def _overlapping_ocr_indices(
 
     matches.sort(key=lambda item: item[0], reverse=True)
     return [box_idx for _, box_idx in matches]
+
+
+def _vertical_overlap_ratio(box1: Sequence[float], box2: Sequence[float]) -> float:
+    overlap = max(
+        0.0,
+        min(float(box1[3]), float(box2[3]))
+        - max(float(box1[1]), float(box2[1])),
+    )
+    min_height = max(
+        1.0,
+        min(float(box1[3]) - float(box1[1]), float(box2[3]) - float(box2[1])),
+    )
+    return float(overlap / min_height)
+
+
+def _looks_like_value_for_field(field_name: str, text: object) -> bool:
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    normalized = normalize_text_for_compare(raw)
+    digits = re.sub(r"\D+", "", normalized)
+    if not digits:
+        return False
+
+    if field_name == "air_volume":
+        return "m" in normalized and (
+            "/" in normalized or "h" in normalized or "3" in normalized
+        )
+    if field_name == "voltage":
+        return "v" in normalized
+    if field_name == "frequency":
+        return "hz" in normalized or normalized.endswith("h")
+    if field_name in {"heating_capacity", "cooling_capacity"}:
+        return "w" in normalized
+    if field_name == "weight":
+        return "kg" in normalized
+    if field_name == "noise":
+        return "db" in normalized
+    if field_name == "mfg_date":
+        return len(digits) >= 4
+    if field_name == "model_number":
+        return bool(re.search(r"[A-Za-z]", raw)) and len(normalized) >= 6
+    return True
+
+
+def _field_value_span_from_label_anchor(
+    *,
+    ocr_boxes: Sequence[tuple],
+    image_shape: Tuple[int, int],
+    label_box: Sequence[float],
+    label_indices: Sequence[int],
+    field_name: str,
+) -> Tuple[Optional[List[int]], str]:
+    clipped_label = _clip_box_to_image(label_box, image_shape)
+    if clipped_label is None:
+        return None, ""
+
+    img_h, img_w = image_shape[:2]
+    lx1, ly1, lx2, ly2 = clipped_label
+    label_cy = (ly1 + ly2) / 2.0
+    label_height = max(1, ly2 - ly1)
+    ignored = {int(idx) for idx in label_indices}
+    candidates: List[Tuple[float, int, List[int], str]] = []
+
+    for idx, box_info in enumerate(ocr_boxes):
+        if idx in ignored:
+            continue
+        text = str(box_info[1] if len(box_info) > 1 else "").strip()
+        if not text:
+            continue
+        box = _ocr_points_to_box(box_info[0] if box_info else None)
+        box = _clip_box_to_image(box or [], image_shape) if box is not None else None
+        if box is None:
+            continue
+
+        bx1, by1, bx2, by2 = box
+        box_cy = (by1 + by2) / 2.0
+        box_height = max(1, by2 - by1)
+        if (bx1 + bx2) / 2.0 <= lx2:
+            continue
+        if (
+            _vertical_overlap_ratio(clipped_label, box) < 0.25
+            and abs(box_cy - label_cy)
+            > max(label_height, box_height) * 0.70
+        ):
+            continue
+        if not _looks_like_value_for_field(field_name, text):
+            continue
+
+        gap = max(0, bx1 - lx2)
+        y_delta = abs(box_cy - label_cy)
+        score = y_delta / max(1.0, img_h) + gap / max(1.0, img_w)
+        candidates.append((score, idx, box, text))
+
+    if not candidates:
+        return None, ""
+
+    candidates.sort(key=lambda item: item[0])
+    _, _, value_box, value_text = candidates[0]
+    return _union_boxes([clipped_label, value_box]), value_text
+
+
+def _expand_label_box_to_right_value_span(
+    label_box: Sequence[float],
+    image_shape: Tuple[int, int],
+) -> Optional[List[int]]:
+    clipped_label = _clip_box_to_image(label_box, image_shape)
+    if clipped_label is None:
+        return None
+
+    img_h, img_w = image_shape[:2]
+    x1, y1, x2, y2 = clipped_label
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+    right = min(
+        img_w,
+        x2 + max(int(round(width * 1.35)), int(round(img_w * 0.22))),
+    )
+    pad_y = max(4, int(round(height * 0.12)))
+    return _clip_box_to_image(
+        [x1, max(0, y1 - pad_y), right, min(img_h, y2 + pad_y)],
+        image_shape,
+    )
 
 
 def _draw_ocr_indices_as_text_diff(
@@ -3177,23 +3302,99 @@ def run_unified_detection(
                                     label_boxes.append(label_box)
                             template_label_box = _union_boxes(label_boxes)
                             if template_label_box is not None:
-                                added = _draw_mapped_template_text_diff(
-                                    vis_image=vis_image,
-                                    visualization_annotations=visualization_annotations,
-                                    suppressed_annotations=suppressed_visualization_annotations,
-                                    template_image=template_cropped,
-                                    target_image=target_cropped,
-                                    field_name=k,
-                                    template_box=template_label_box,
-                                    template_value=template_val,
-                                    target_value=target_val,
-                                    source="structured_label_position_mapped",
-                                    force=True,
-                                )
+                                fallback_source = "structured_label_position_mapped"
+                                target_label_hit = target_label_hits.get(k)
+                                target_label_indices = [
+                                    int(box_idx)
+                                    for box_idx in (
+                                        (target_label_hit or {}).get("box_indices") or []
+                                    )
+                                ]
+                                target_label_boxes = []
+                                for target_label_idx in target_label_indices:
+                                    _, target_label_box, _ = _ocr_box_and_poly_for_index(
+                                        target_boxes,
+                                        target_label_idx,
+                                        target_cropped.shape[:2],
+                                    )
+                                    if target_label_box is not None:
+                                        target_label_boxes.append(target_label_box)
+                                target_label_box = _union_boxes(target_label_boxes)
+                                target_value_span_box = None
+                                target_value_span_text = ""
+                                if target_label_box is not None:
+                                    target_value_span_box, target_value_span_text = (
+                                        _field_value_span_from_label_anchor(
+                                            ocr_boxes=target_boxes,
+                                            image_shape=target_cropped.shape[:2],
+                                            label_box=target_label_box,
+                                            label_indices=target_label_indices,
+                                            field_name=k,
+                                        )
+                                    )
+                                    if target_value_span_box is None:
+                                        target_value_span_box = (
+                                            _expand_label_box_to_right_value_span(
+                                                target_label_box,
+                                                target_cropped.shape[:2],
+                                            )
+                                        )
+                                        target_value_span_text = ""
+                                if target_value_span_box is None:
+                                    mapped_label_box = _map_box_between_shapes(
+                                        template_label_box,
+                                        template_cropped.shape[:2],
+                                        target_cropped.shape[:2],
+                                    )
+                                    if mapped_label_box is not None:
+                                        target_value_span_box = (
+                                            _expand_label_box_to_right_value_span(
+                                                mapped_label_box,
+                                                target_cropped.shape[:2],
+                                            )
+                                        )
+
+                                if target_value_span_box is not None:
+                                    fallback_source = "structured_label_value_span"
+                                    added = _add_text_visualization_annotation(
+                                        vis_image=vis_image,
+                                        visualization_annotations=visualization_annotations,
+                                        suppressed_annotations=suppressed_visualization_annotations,
+                                        template_image=template_cropped,
+                                        target_image=target_cropped,
+                                        box=target_value_span_box,
+                                        poly=None,
+                                        annotation={
+                                            "kind": "text",
+                                            "status": "diff",
+                                            "field": k,
+                                            "source": fallback_source,
+                                            "template_value": template_val,
+                                            "target_value": target_val,
+                                            "ocr_text": target_value_span_text,
+                                            "preserve_span_box": True,
+                                        },
+                                        template_box=template_label_box,
+                                        force=True,
+                                    )
+                                else:
+                                    added = _draw_mapped_template_text_diff(
+                                        vis_image=vis_image,
+                                        visualization_annotations=visualization_annotations,
+                                        suppressed_annotations=suppressed_visualization_annotations,
+                                        template_image=template_cropped,
+                                        target_image=target_cropped,
+                                        field_name=k,
+                                        template_box=template_label_box,
+                                        template_value=template_val,
+                                        target_value=target_val,
+                                        source="structured_label_position_mapped",
+                                        force=True,
+                                    )
                                 if added:
                                     diff_count += 1
                                     print(
-                                        f"    - 字段 '{k}' 使用模板标签位置补框"
+                                        f"    - 字段 '{k}' 使用{fallback_source}补框"
                                     )
 
         supplemental_text_count = _add_label_anchor_text_diffs(

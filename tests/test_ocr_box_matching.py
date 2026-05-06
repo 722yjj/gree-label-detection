@@ -127,6 +127,22 @@ class TestFindMatchingOcrBoxes:
 
         assert find_matching_ocr_boxes("590m³/h", boxes) == [0]
 
+    def test_matches_air_volume_when_ocr_drops_cubic_marker(self):
+        boxes = [
+            self._make_box("50m/h"),
+            self._make_box("50Hz"),
+        ]
+
+        assert find_matching_ocr_boxes("50 m³/h", boxes, field_name="air_volume") == [0]
+
+    def test_matches_air_volume_when_ocr_misreads_unit_tail(self):
+        boxes = [
+            self._make_box("590m/$"),
+            self._make_box("590"),
+        ]
+
+        assert find_matching_ocr_boxes("590m³/h", boxes, field_name="air_volume") == [0]
+
     def test_rejects_unrelated_high_overlap_noise(self):
         boxes = [
             self._make_box("220240v50hz"),

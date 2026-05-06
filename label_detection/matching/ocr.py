@@ -474,6 +474,41 @@ def _digit_signature(text: str) -> str:
     return re.sub(r"\D+", "", text)
 
 
+def _air_volume_parts(text: object) -> Tuple[str, bool]:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).lower()
+    normalized = normalized.replace("³", "3")
+    compact = re.sub(r"\s+", "", normalized)
+    if "m" not in compact:
+        return "", False
+
+    unit_like = "/" in compact or "h" in compact or "3" in compact or "$" in compact
+    if not unit_like:
+        return "", False
+
+    match = re.search(r"([0-9]+(?:[.,][0-9]+)?)\s*m", compact)
+    if not match:
+        return "", False
+    number = re.sub(r"\D+", "", match.group(1))
+    return number, bool(number)
+
+
+def _air_volume_match_score(target_value: object, ocr_text: object) -> float:
+    target_number, target_ok = _air_volume_parts(target_value)
+    ocr_number, ocr_ok = _air_volume_parts(ocr_text)
+    if not target_ok or not ocr_ok or target_number != ocr_number:
+        return 0.0
+
+    target_norm = normalize_text_for_match(target_value)
+    ocr_norm = normalize_text_for_match(ocr_text)
+    if not target_norm or not ocr_norm:
+        return 0.0
+
+    # OCR often drops the tiny superscript in m³/h, or reads the trailing h as
+    # another symbol. The numeric value and unit marker are the reliable anchors.
+    text_ratio = SequenceMatcher(None, target_norm, ocr_norm).ratio()
+    return max(0.90, text_ratio)
+
+
 def _has_labeled_value(
     target_value: object,
     ocr_text: object,
@@ -585,6 +620,8 @@ def find_matching_ocr_boxes(
             continue
 
         score = _match_score(target_value, ocr_text)
+        if field_name == "air_volume" and score < min_score:
+            score = _air_volume_match_score(target_value, ocr_text)
         if score < min_score and _has_labeled_value(target_value, ocr_text, field_name):
             score = 0.9
         if score >= min_score:

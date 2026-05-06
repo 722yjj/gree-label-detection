@@ -448,3 +448,59 @@ class TestTextVisualizationGuards:
 
         assert count == 1
         assert visualization_annotations[0]["source"] == "label_anchor_mapped"
+
+    def test_value_span_from_label_anchor_includes_right_side_value(self):
+        boxes = [
+            (
+                np.array(
+                    [[1067, 482], [1179, 482], [1179, 564], [1067, 564]],
+                    dtype=np.float32,
+                ),
+                "Air",
+                0.98,
+            ),
+            (
+                np.array(
+                    [[1184, 479], [1349, 479], [1349, 569], [1184, 569]],
+                    dtype=np.float32,
+                ),
+                "Flow",
+                0.98,
+            ),
+            (
+                np.array(
+                    [[1353, 483], [1593, 483], [1593, 570], [1353, 570]],
+                    dtype=np.float32,
+                ),
+                "Volume",
+                0.98,
+            ),
+            (
+                np.array(
+                    [[1737, 461], [2028, 461], [2028, 582], [1737, 582]],
+                    dtype=np.float32,
+                ),
+                "50m/h",
+                0.88,
+            ),
+        ]
+
+        box, text = unified._field_value_span_from_label_anchor(
+            ocr_boxes=boxes,
+            image_shape=(1336, 2052),
+            label_box=[1067, 479, 1593, 570],
+            label_indices=[0, 1, 2],
+            field_name="air_volume",
+        )
+
+        assert box == [1067, 461, 2028, 582]
+        assert text == "50m/h"
+
+    def test_label_box_expansion_extends_to_probable_value_area(self):
+        box = unified._expand_label_box_to_right_value_span(
+            [1067, 479, 1593, 570],
+            (1336, 2052),
+        )
+
+        assert box[0] == 1067
+        assert box[2] > 1737
