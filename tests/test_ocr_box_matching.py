@@ -82,6 +82,13 @@ class TestTextFieldValuesMatch:
             "Volume Air Flow",
         )
 
+    def test_treats_single_letter_label_ocr_join_as_match(self):
+        assert text_field_values_match(
+            "label:noise",
+            "Sound Pressure Level(H)",
+            "Sound PressureL Level(H)",
+        )
+
     def test_rejects_noisy_label_alias_prefix(self):
         assert not text_field_values_match(
             "label:voltage",
@@ -236,6 +243,20 @@ class TestExtractFieldLabelsFromOcrBoxes:
 
         assert labels == {
             "noise": {"text": "Sound Pressure Level(H)", "box_indices": [0, 1, 2]},
+        }
+
+    def test_merges_noise_label_with_overlapping_ocr_tail(self):
+        boxes = [
+            self._make_box("Sound", x1=65, y1=730, x2=260, y2=813),
+            self._make_box("PressureL", x1=260, y1=728, x2=549, y2=819),
+            self._make_box("Level(H)", x1=499, y1=728, x2=756, y2=829),
+            self._make_box("37dB(A)", x1=925, y1=722, x2=1120, y2=837),
+        ]
+
+        labels = extract_field_labels_from_ocr_boxes(boxes, ["noise"])
+
+        assert labels == {
+            "noise": {"text": "Sound PressureL Level(H)", "box_indices": [0, 1, 2]},
         }
 
     def test_supports_numpy_coordinate_arrays_from_real_ocr(self):

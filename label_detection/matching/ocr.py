@@ -62,6 +62,7 @@ FIELD_LABEL_REGEXES: Dict[str, re.Pattern[str]] = {
 }
 
 FIELD_LABEL_FUZZY_MIN_SCORE = 0.88
+FIELD_LABEL_ALIAS_COMPARE_MIN_SCORE = 0.94
 MAX_LABEL_WORD_CANDIDATE_LENGTH = 4
 
 
@@ -179,9 +180,23 @@ def label_field_values_match(field_name: object, expected: object, actual: objec
     if not alias_norms:
         return False
 
+    expected_match_norm = normalize_text_for_match(expected)
+    actual_match_norm = normalize_text_for_match(actual)
+    for alias_norm in alias_norms:
+        if expected_match_norm != alias_norm:
+            continue
+
+        score = SequenceMatcher(None, actual_match_norm, alias_norm).ratio()
+        length_gap = abs(len(actual_match_norm) - len(alias_norm))
+        if (
+            score >= FIELD_LABEL_ALIAS_COMPARE_MIN_SCORE
+            and length_gap <= max(1, int(len(alias_norm) * 0.12))
+        ):
+            return True
+
     return (
-        normalize_text_for_match(expected) in alias_norms
-        and normalize_text_for_match(actual) in alias_norms
+        expected_match_norm in alias_norms
+        and actual_match_norm in alias_norms
     ) or _label_token_sets_match(expected, actual)
 
 
@@ -267,7 +282,7 @@ def _boxes_can_chain_as_label_words(left: Dict[str, object], right: Dict[str, ob
 
     max_height = max(float(left["height"]), float(right["height"]))
     horizontal_gap = float(right["x1"]) - float(left["x2"])
-    if horizontal_gap < -0.35 * max_height:
+    if horizontal_gap < -0.60 * max_height:
         return False
 
     return horizontal_gap <= max(48.0, 1.25 * max_height)
