@@ -14,13 +14,35 @@ def _env_flag(name: str, default: str) -> bool:
     return value not in {"", "0", "false", "no", "off"}
 
 
-# ==================== Ollama / VLM 配置 ====================
+# ==================== LLM / VLM 配置 ====================
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").strip().lower() or "ollama"
 OLLAMA_API_BASE = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
-TEXT_LLM_MODEL = os.getenv("TEXT_LLM_MODEL", OLLAMA_MODEL)
-GRAPHIC_VLM_MODEL = os.getenv("GRAPHIC_VLM_MODEL", OLLAMA_MODEL)
+OPENAI_COMPATIBLE_API_BASE = os.getenv(
+    "OPENAI_COMPATIBLE_API_BASE",
+    os.getenv("VLLM_API_BASE", "http://127.0.0.1:8000/v1"),
+)
+OPENAI_COMPATIBLE_API_KEY = os.getenv(
+    "OPENAI_COMPATIBLE_API_KEY",
+    os.getenv("VLLM_API_KEY", "EMPTY"),
+)
+OPENAI_COMPATIBLE_MODEL = os.getenv(
+    "OPENAI_COMPATIBLE_MODEL",
+    os.getenv("VLLM_MODEL", OLLAMA_MODEL),
+)
+_DEFAULT_LLM_MODEL = (
+    OPENAI_COMPATIBLE_MODEL
+    if LLM_PROVIDER in {"openai-compatible", "openai_compatible", "vllm"}
+    else OLLAMA_MODEL
+)
+TEXT_LLM_MODEL = os.getenv("TEXT_LLM_MODEL", _DEFAULT_LLM_MODEL)
+GRAPHIC_VLM_MODEL = os.getenv("GRAPHIC_VLM_MODEL", _DEFAULT_LLM_MODEL)
 LOCAL_OLLAMA_HOSTS = {"localhost", "127.0.0.1", "::1"}
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "10m")
+OPENAI_COMPATIBLE_DISABLE_THINKING = _env_flag(
+    "OPENAI_COMPATIBLE_DISABLE_THINKING",
+    "1",
+)
 
 # 文本结构化抽取请求超时（秒）
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "60"))
@@ -161,3 +183,9 @@ def ensure_local_ollama_no_proxy(api_base: str | None = None) -> bool:
     os.environ["NO_PROXY"] = merged
     os.environ["no_proxy"] = merged
     return True
+
+
+def is_openai_compatible_provider(provider: str | None = None) -> bool:
+    """Return whether the configured model service uses OpenAI-compatible APIs."""
+    normalized = (provider or LLM_PROVIDER).strip().lower()
+    return normalized in {"openai-compatible", "openai_compatible", "vllm"}

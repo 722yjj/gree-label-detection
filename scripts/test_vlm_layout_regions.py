@@ -14,7 +14,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import cv2
 
-from label_detection.core.config import GRAPHIC_VLM_MODEL, OLLAMA_API_BASE, PROJECT_ROOT as REPO_ROOT, VLM_TIMEOUT
+from label_detection.core.config import (
+    GRAPHIC_VLM_MODEL,
+    OLLAMA_API_BASE,
+    OPENAI_COMPATIBLE_API_BASE,
+    PROJECT_ROOT as REPO_ROOT,
+    VLM_TIMEOUT,
+    is_openai_compatible_provider,
+)
 from label_detection.extraction.pdf import extract_red_box_info
 from label_detection.matching.layout import calculate_iou, detect_layout_regions, draw_regions, extract_regions_by_type
 from label_detection.preprocessing.pipeline import preprocess_target, preprocess_template
@@ -36,7 +43,7 @@ MAX_VLM_REGIONS = 12
 
 OUTPUT_DIR = REPO_ROOT / "results" / "vlm_layout_region_test"
 VLM_MODEL = GRAPHIC_VLM_MODEL
-VLM_API_BASE = OLLAMA_API_BASE
+VLM_API_BASE = OPENAI_COMPATIBLE_API_BASE if is_openai_compatible_provider() else OLLAMA_API_BASE
 VLM_TIMEOUT_SECONDS = VLM_TIMEOUT
 
 VLM_REGION_PROMPT = f"""You are a layout graphic-region detector.

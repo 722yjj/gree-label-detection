@@ -7,6 +7,7 @@ PYTHON="${PROJECT_ROOT}/.venv/bin/python"
 LOG_DIR="${PROJECT_ROOT}/results/desktop_app"
 LOG_FILE="${LOG_DIR}/startup.log"
 OLLAMA_LOG_FILE="${LOG_DIR}/ollama.log"
+LLM_PROVIDER_VALUE="${LLM_PROVIDER:-ollama}"
 OLLAMA_API_BASE_VALUE="${OLLAMA_API_BASE:-http://localhost:11434}"
 OLLAMA_AUTOSTART_VALUE="${OLLAMA_AUTOSTART:-1}"
 OLLAMA_START_TIMEOUT_VALUE="${OLLAMA_START_TIMEOUT:-20}"
@@ -17,9 +18,10 @@ Usage: scripts/start_desktop.sh [--check] [--strict-services]
 
 Options:
   --check             Only run desktop environment checks.
-  --strict-services   Treat Ollama/service connectivity warnings as failures.
+  --strict-services   Treat LLM/service connectivity warnings as failures.
 
 Environment:
+  LLM_PROVIDER=ollama       Use Ollama by default; set vllm/openai-compatible to skip Ollama autostart.
   OLLAMA_AUTOSTART=0       Disable automatic local Ollama startup.
   OLLAMA_BIN=/path/ollama  Override the Ollama executable path.
   OLLAMA_START_TIMEOUT=20  Seconds to wait for Ollama startup.
@@ -83,6 +85,13 @@ find_ollama_bin() {
 }
 
 start_ollama_if_needed() {
+  case "${LLM_PROVIDER_VALUE}" in
+    openai-compatible|openai_compatible|vllm)
+      echo "跳过 Ollama 自动启动: LLM_PROVIDER=${LLM_PROVIDER_VALUE}" | tee -a "${LOG_FILE}"
+      return 0
+      ;;
+  esac
+
   if [[ "${OLLAMA_AUTOSTART_VALUE}" =~ ^(0|false|False|FALSE|no|No|NO|off|Off|OFF)$ ]]; then
     echo "跳过 Ollama 自动启动: OLLAMA_AUTOSTART=${OLLAMA_AUTOSTART_VALUE}" | tee -a "${LOG_FILE}"
     return 0

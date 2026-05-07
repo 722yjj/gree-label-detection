@@ -15,14 +15,19 @@ except ImportError:  # pragma: no cover - exercised only in minimal test environ
     cv2 = None
 
 from label_detection.core.config import (
+    LLM_PROVIDER,
     OLLAMA_API_BASE,
+    OPENAI_COMPATIBLE_API_BASE,
+    OPENAI_COMPATIBLE_API_KEY,
     GRAPHIC_VLM_MODEL,
     GRAPHIC_NUM_PREDICT,
     OLLAMA_KEEP_ALIVE,
     VLM_TIMEOUT,
     ensure_local_ollama_no_proxy,
     is_local_ollama,
+    is_openai_compatible_provider,
 )
+from label_detection.services.openai_compatible_client import OpenAICompatibleHTTPClient
 
 
 def _require_cv2():
@@ -61,14 +66,31 @@ Output rules:
         check_model: bool = True,
     ):
         self.model_name = model_name or GRAPHIC_VLM_MODEL
-        self.api_base = (api_base or OLLAMA_API_BASE).rstrip("/")
+        self.provider = LLM_PROVIDER
+        if is_openai_compatible_provider(self.provider):
+            default_api_base = OPENAI_COMPATIBLE_API_BASE
+        else:
+            default_api_base = OLLAMA_API_BASE
+        self.api_base = (api_base or default_api_base).rstrip("/")
         self.timeout = timeout or VLM_TIMEOUT
-        ensure_local_ollama_no_proxy(self.api_base)
-        self.session = requests.Session()
-        if is_local_ollama(self.api_base):
-            self.session.trust_env = False
-        if check_model:
-            self._check_model()
+        self.client = None
+        if is_openai_compatible_provider(self.provider):
+            self.client = OpenAICompatibleHTTPClient(
+                model_name=self.model_name,
+                api_base=self.api_base,
+                api_key=OPENAI_COMPATIBLE_API_KEY,
+                timeout=self.timeout,
+                num_predict=GRAPHIC_NUM_PREDICT,
+                check_model=check_model,
+            )
+            self.session = self.client.session
+        else:
+            ensure_local_ollama_no_proxy(self.api_base)
+            self.session = requests.Session()
+            if is_local_ollama(self.api_base):
+                self.session.trust_env = False
+            if check_model:
+                self._check_model()
 
     def _check_model(self) -> bool:
         """Check whether the requested Ollama model is available."""
@@ -137,31 +159,41 @@ Output rules:
         ]
 
         try:
-            response = self.session.post(
-                f"{self.api_base}/api/chat",
-                json={
-                    "model": self.model_name,
-                    "messages": messages,
-                    "stream": False,
-                    "format": "json",
-                    "think": False,
-                    "keep_alive": OLLAMA_KEEP_ALIVE,
-                    "options": {
-                        "temperature": 0,
-                        "num_predict": GRAPHIC_NUM_PREDICT,
+            if is_openai_compatible_provider(self.provider):
+                chat_response = self.client.chat(
+                    messages,
+                    json_mode=True,
+                    think=False,
+                    timeout=self.timeout,
+                    num_predict=GRAPHIC_NUM_PREDICT,
+                )
+                content = chat_response.content
+            else:
+                response = self.session.post(
+                    f"{self.api_base}/api/chat",
+                    json={
+                        "model": self.model_name,
+                        "messages": messages,
+                        "stream": False,
+                        "format": "json",
+                        "think": False,
+                        "keep_alive": OLLAMA_KEEP_ALIVE,
+                        "options": {
+                            "temperature": 0,
+                            "num_predict": GRAPHIC_NUM_PREDICT,
+                        },
                     },
-                },
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                message = payload.get("message", {})
+                content = message.get("content", "") or message.get("thinking", "")
         except requests.exceptions.Timeout as exc:
             raise RuntimeError("VLM 请求超时") from exc
         except requests.exceptions.RequestException as exc:
             raise RuntimeError(f"VLM 请求失败: {exc}") from exc
 
-        payload = response.json()
-        message = payload.get("message", {})
-        content = message.get("content", "") or message.get("thinking", "")
         if not content:
             raise RuntimeError("VLM 返回空响应")
 

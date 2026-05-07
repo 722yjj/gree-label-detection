@@ -19,7 +19,10 @@ from pydantic import BaseModel
 
 from label_detection.core import langchain_compat as _langchain_compat  # noqa: F401
 from label_detection.core.config import (
+    LLM_PROVIDER,
     OLLAMA_API_BASE,
+    OPENAI_COMPATIBLE_API_BASE,
+    OPENAI_COMPATIBLE_API_KEY,
     TEXT_LLM_MODEL,
     TEXT_NUM_PREDICT,
     LLM_TIMEOUT,
@@ -29,6 +32,7 @@ from label_detection.core.config import (
     DEFAULT_TARGET_PATH,
     USE_VLM_FOR_GRAPHIC,
     ENABLE_IMAGE_REGION_SPLIT,
+    is_openai_compatible_provider,
 )
 from label_detection.core.paddle_runtime import paddle_cache_cleanup_scope
 from label_detection.extraction.template_source import resolve_template_input
@@ -76,6 +80,7 @@ from label_detection.schema import (
 )
 from label_detection.preprocessing.border import crop_to_border, find_template_crop_rect
 from label_detection.preprocessing.pipeline import preprocess_target
+from label_detection.services.openai_compatible_client import OpenAICompatibleHTTPClient
 from label_detection.services.ollama_client import OllamaHTTPClient
 from label_detection.services.ocr_service import get_ocr_backend_name, get_ocr_with_boxes
 
@@ -132,15 +137,24 @@ class WorkflowOutputOptions:
 
 
 def get_llm():
-    """Lazily initialize the native Ollama client when the workflow runs."""
+    """Lazily initialize the configured native LLM client when the workflow runs."""
     global _llm
     if _llm is None:
-        _llm = OllamaHTTPClient(
-            model_name=TEXT_LLM_MODEL,
-            api_base=OLLAMA_API_BASE,
-            timeout=LLM_TIMEOUT,
-            num_predict=TEXT_NUM_PREDICT,
-        )
+        if is_openai_compatible_provider(LLM_PROVIDER):
+            _llm = OpenAICompatibleHTTPClient(
+                model_name=TEXT_LLM_MODEL,
+                api_base=OPENAI_COMPATIBLE_API_BASE,
+                api_key=OPENAI_COMPATIBLE_API_KEY,
+                timeout=LLM_TIMEOUT,
+                num_predict=TEXT_NUM_PREDICT,
+            )
+        else:
+            _llm = OllamaHTTPClient(
+                model_name=TEXT_LLM_MODEL,
+                api_base=OLLAMA_API_BASE,
+                timeout=LLM_TIMEOUT,
+                num_predict=TEXT_NUM_PREDICT,
+            )
     return _llm
 
 

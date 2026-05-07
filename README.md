@@ -106,7 +106,8 @@ pip install -r requirements.txt
 
 | 组件 | 用途 | 说明 |
 |------|------|------|
-| Ollama + `qwen3.5:9b` | VLM 图形比对、结构化提取 | 需要本地启动 Ollama 服务 |
+| Ollama + `qwen3.5:9b` | VLM 图形比对、结构化提取 | 默认后端，需要本地启动 Ollama 服务 |
+| OpenAI-compatible 服务 / vLLM | VLM 图形比对、结构化提取 | 设置 `LLM_PROVIDER=vllm` 或 `LLM_PROVIDER=openai-compatible` 后使用 |
 | PaddleOCR | 文字识别 | 首次运行会下载模型 |
 | PP-DocLayoutV3 / PaddleX | 布局区域检测 | 首次运行会下载模型 |
 
@@ -115,6 +116,14 @@ pip install -r requirements.txt
 ```bash
 ollama serve
 ollama pull qwen3.5:9b
+```
+
+使用 vLLM / OpenAI-compatible 服务示例：
+
+```bash
+export LLM_PROVIDER=vllm
+export VLLM_API_BASE=http://127.0.0.1:8000/v1
+export VLLM_MODEL=/home/jnu/models/Qwen3.6-27B-int4-AutoRound
 ```
 
 如果 `.venv` 缺失或依赖不完整，先执行 `uv sync --extra desktop`，再回到上面的 `.venv/bin/python ...` 启动方式。

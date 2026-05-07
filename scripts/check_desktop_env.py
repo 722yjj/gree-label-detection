@@ -49,23 +49,37 @@ def _add(
     results.append(CheckResult(name=name, status=status, detail=detail, required=required))
 
 
-def _check_ollama(results: list[CheckResult], strict_services: bool) -> None:
+def _check_llm_service(results: list[CheckResult], strict_services: bool) -> None:
     try:
-        from label_detection.core.config import OLLAMA_API_BASE
+        from label_detection.core.config import (
+            LLM_PROVIDER,
+            OLLAMA_API_BASE,
+            OPENAI_COMPATIBLE_API_BASE,
+            ensure_local_ollama_no_proxy,
+            is_openai_compatible_provider,
+        )
     except Exception as exc:
-        _add(results, "Ollama 配置", False, f"读取配置失败: {exc}", required=strict_services)
+        _add(results, "LLM 配置", False, f"读取配置失败: {exc}", required=strict_services)
         return
 
-    api_base = OLLAMA_API_BASE.rstrip("/") + "/"
-    tags_url = urljoin(api_base, "api/tags")
-    request = Request(tags_url, headers={"Accept": "application/json"})
+    if is_openai_compatible_provider(LLM_PROVIDER):
+        service_name = "OpenAI-compatible 服务"
+        api_base = OPENAI_COMPATIBLE_API_BASE.rstrip("/") + "/"
+        check_url = urljoin(api_base, "models")
+    else:
+        service_name = "Ollama 服务"
+        api_base = OLLAMA_API_BASE.rstrip("/") + "/"
+        check_url = urljoin(api_base, "api/tags")
+
+    ensure_local_ollama_no_proxy(api_base)
+    request = Request(check_url, headers={"Accept": "application/json"})
     try:
         with urlopen(request, timeout=2) as response:
             ok = 200 <= response.status < 300
     except (OSError, URLError) as exc:
         _add(
             results,
-            "Ollama 服务",
+            service_name,
             False,
             f"未连通 {api_base}: {exc}",
             required=strict_services,
@@ -75,7 +89,7 @@ def _check_ollama(results: list[CheckResult], strict_services: bool) -> None:
 
     _add(
         results,
-        "Ollama 服务",
+        service_name,
         ok,
         f"已连通 {api_base}" if ok else f"返回异常状态: {response.status}",
         required=strict_services,
@@ -181,7 +195,7 @@ def run_checks(strict_services: bool = False) -> list[CheckResult]:
     else:
         _add(results, "结果目录", writable, str(results_dir), required=True)
 
-    _check_ollama(results, strict_services=strict_services)
+    _check_llm_service(results, strict_services=strict_services)
     return results
 
 
@@ -202,7 +216,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--strict-services",
         action="store_true",
-        help="把 Ollama 等外部服务不可用也视为失败",
+        help="把 LLM 等外部服务不可用也视为失败",
     )
     return parser.parse_args(argv)
 

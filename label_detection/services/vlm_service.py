@@ -22,7 +22,10 @@ except ImportError:  # pragma: no cover - exercised only in minimal test environ
     cv2 = None
 
 from label_detection.core.config import (
+    LLM_PROVIDER,
     OLLAMA_API_BASE,
+    OPENAI_COMPATIBLE_API_BASE,
+    OPENAI_COMPATIBLE_API_KEY,
     GRAPHIC_VLM_MODEL,
     GRAPHIC_NUM_PREDICT,
     OLLAMA_KEEP_ALIVE,
@@ -31,7 +34,9 @@ from label_detection.core.config import (
     VLM_MAX_RETRIES,
     ensure_local_ollama_no_proxy,
     is_local_ollama,
+    is_openai_compatible_provider,
 )
+from label_detection.services.openai_compatible_client import OpenAICompatibleHTTPClient
 
 
 def _require_cv2():
@@ -95,13 +100,29 @@ Output only JSON in this format:
             timeout: 请求超时时间（秒）
         """
         self.model_name = model_name or GRAPHIC_VLM_MODEL
-        self.api_base = (api_base or OLLAMA_API_BASE).rstrip("/")
+        self.provider = LLM_PROVIDER
+        if is_openai_compatible_provider(self.provider):
+            default_api_base = OPENAI_COMPATIBLE_API_BASE
+        else:
+            default_api_base = OLLAMA_API_BASE
+        self.api_base = (api_base or default_api_base).rstrip("/")
         self.timeout = timeout or VLM_TIMEOUT
-        ensure_local_ollama_no_proxy(self.api_base)
-        self.session = requests.Session()
-        if is_local_ollama(self.api_base):
-            self.session.trust_env = False
-        self._check_model()
+        self.client = None
+        if is_openai_compatible_provider(self.provider):
+            self.client = OpenAICompatibleHTTPClient(
+                model_name=self.model_name,
+                api_base=self.api_base,
+                api_key=OPENAI_COMPATIBLE_API_KEY,
+                timeout=self.timeout,
+                num_predict=GRAPHIC_NUM_PREDICT,
+            )
+            self.session = self.client.session
+        else:
+            ensure_local_ollama_no_proxy(self.api_base)
+            self.session = requests.Session()
+            if is_local_ollama(self.api_base):
+                self.session.trust_env = False
+            self._check_model()
 
     def _check_model(self) -> bool:
         """检查模型是否可用"""
@@ -255,30 +276,40 @@ Output only JSON in this format:
                     }
                 ]
 
-                response = self.session.post(
-                    f"{self.api_base}/api/chat",
-                    json={
-                        "model": self.model_name,
-                        "messages": messages,
-                        "stream": False,
-                        "format": "json",
-                        "think": False,
-                        "keep_alive": OLLAMA_KEEP_ALIVE,
-                        "options": {
-                            "temperature": 0,
-                            "num_predict": GRAPHIC_NUM_PREDICT,
+                if is_openai_compatible_provider(self.provider):
+                    result = self.client.chat(
+                        messages,
+                        json_mode=True,
+                        think=False,
+                        timeout=self.timeout,
+                        num_predict=GRAPHIC_NUM_PREDICT,
+                    )
+                    content = result.content
+                else:
+                    response = self.session.post(
+                        f"{self.api_base}/api/chat",
+                        json={
+                            "model": self.model_name,
+                            "messages": messages,
+                            "stream": False,
+                            "format": "json",
+                            "think": False,
+                            "keep_alive": OLLAMA_KEEP_ALIVE,
+                            "options": {
+                                "temperature": 0,
+                                "num_predict": GRAPHIC_NUM_PREDICT,
+                            },
                         },
-                    },
-                    timeout=self.timeout,
-                )
-                response.raise_for_status()
+                        timeout=self.timeout,
+                    )
+                    response.raise_for_status()
 
-                result = response.json()
-                message = result.get("message", {})
+                    result = response.json()
+                    message = result.get("message", {})
 
-                content = message.get("content", "")
-                if not content:
-                    content = message.get("thinking", "")
+                    content = message.get("content", "")
+                    if not content:
+                        content = message.get("thinking", "")
 
                 if not content:
                     print(f"[VLM] 警告: API 响应为空 (尝试 {attempt+1}/{max_retries})")
@@ -365,9 +396,21 @@ Output only JSON in this format:
         except json.JSONDecodeError:
             pass
 
-        # 关键词兜底推断
         response_lower = response.lower()
+        if "<think" in response_lower or "thinking process" in response_lower:
+            return {
+                "decision": "unknown",
+                "is_match": False,
+                "confidence": 0.0,
+                "needs_review": True,
+                "error_type": "parse_error",
+                "differences": [],
+                "summary": "模型仅返回思考文本，未返回可判定 JSON",
+                "raw_response": response[:500],
+                "parse_error": True,
+            }
 
+        # 关键词兜底推断
         diff_keywords = [
             "不一致", "不同", "缺失", "缺少", "多余", "不匹配",
             "different", "missing", "mismatch", "not match", "inconsistent",
@@ -384,28 +427,30 @@ Output only JSON in this format:
         # 差异关键词优先（"不一致" 同时包含 "一致"，但语义是否定的）
         if has_diff_keyword:
             return {
-                "decision": "mismatch",
+                "decision": "unknown",
                 "is_match": False,
-                "confidence": 0.6,
+                "confidence": 0.0,
                 "needs_review": True,
                 "error_type": None,
                 "differences": ["从模型文本推断存在差异"],
                 "summary": "基于关键词推断不匹配（建议复核）",
                 "raw_response": response[:500],
                 "inferred": True,
+                "tentative_decision": "mismatch",
             }
 
         if has_match_keyword:
             return {
-                "decision": "match",
-                "is_match": True,
-                "confidence": 0.6,
+                "decision": "unknown",
+                "is_match": False,
+                "confidence": 0.0,
                 "needs_review": True,
                 "error_type": None,
                 "differences": [],
                 "summary": "基于关键词推断匹配（建议复核）",
                 "raw_response": response[:500],
                 "inferred": True,
+                "tentative_decision": "match",
             }
 
         # 完全无法解析
