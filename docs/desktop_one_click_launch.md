@@ -67,4 +67,24 @@ uv sync --extra desktop
 - `results/desktop_app` 是否可写
 - Ollama 服务是否可连接
 
-Ollama 默认只作为警告项。这样桌面端仍可先启动，实际检测时如果服务不可用，再由业务流程报错。
+启动脚本会在检查前尝试自动启动本机 Ollama：
+
+```bash
+ollama serve
+```
+
+自动启动只针对 `OLLAMA_API_BASE` 为本机地址的情况，例如 `http://localhost:11434` 或 `http://127.0.0.1:11434`。如果系统桌面环境的 `PATH` 不包含 Ollama，脚本会优先查找常见路径，例如 `~/.local/bin/ollama`。
+
+可用环境变量：
+
+```bash
+OLLAMA_AUTOSTART=0 scripts/start_desktop.sh
+OLLAMA_BIN=/custom/path/ollama scripts/start_desktop.sh
+OLLAMA_START_TIMEOUT=30 scripts/start_desktop.sh
+```
+
+Ollama 启动日志写入：
+
+```text
+results/desktop_app/ollama.log
+```
