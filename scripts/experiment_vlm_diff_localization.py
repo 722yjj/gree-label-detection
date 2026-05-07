@@ -402,12 +402,42 @@ def image_to_base64(image: np.ndarray) -> str:
 
 def _mode_detail_rule(mode: str) -> str:
     if mode == "decision":
-        return 'Each item in "differences" may omit point_1000 and bbox_1000.'
+        return 'Do not include point_1000 or bbox_1000.'
     if mode == "point":
-        return 'For each difference, include "point_1000": [x, y]. Omit bbox_1000.'
+        return 'For each difference, include point_1000 only. Do not include bbox_1000.'
     if mode == "box":
-        return 'For each difference, include "bbox_1000": [x1, y1, x2, y2]. Omit point_1000.'
-    return 'For each difference, include both "point_1000": [x, y] and "bbox_1000": [x1, y1, x2, y2].'
+        return 'For each difference, include bbox_1000 only. Do not include point_1000.'
+    return 'For each difference, include both point_1000 and bbox_1000.'
+
+
+def _difference_schema(mode: str, side_values: str) -> str:
+    base = (
+        '{"type":"text_diff|graphic_diff","side":"' + side_values + '",'
+        '"label":"short label","template_evidence":"what is visible in template",'
+        '"target_evidence":"what is visible in target"'
+    )
+    if mode == "decision":
+        coords = ""
+    elif mode == "point":
+        coords = ',"point_1000":[x,y]'
+    elif mode == "box":
+        coords = ',"bbox_1000":[x1,y1,x2,y2]'
+    else:
+        coords = ',"point_1000":[x,y],"bbox_1000":[x1,y1,x2,y2]'
+    return base + coords + ',"confidence":0.0}'
+
+
+def _task_rules() -> str:
+    return """You are a visual spot-the-difference expert for product labels.
+
+Find every meaningful difference between the template label and the aligned target label.
+There are only two valid difference types:
+1. text_diff: printed text is different, missing, extra, corrupted, or changed. This includes digit changes, unit changes, typos, missing characters, extra characters, model numbers, barcode numbers, dates, voltage, capacity, weight, address text, and field labels.
+2. graphic_diff: non-text visual content is different, missing, extra, or changed. This includes icons, logos, symbols, certification marks, QR codes, barcode graphics, warning marks, shapes, and line-art symbols.
+
+Do not invent other categories.
+Do not stop after finding a graphic difference. Also scan all printed text values and labels.
+Return both text_diff and graphic_diff when both exist."""
 
 
 def build_canvas_prompt(
@@ -419,8 +449,9 @@ def build_canvas_prompt(
     template_panel = canvas_meta["template_panel_px"]
     target_panel = canvas_meta["target_panel_px"]
     detail_rule = _mode_detail_rule(mode)
+    difference_schema = _difference_schema(mode, "template|target|both")
 
-    return f"""You are testing visual difference localization on aligned product labels.
+    return f"""{_task_rules()}
 
 You will see one comparison canvas:
 - Left panel is the template label.
@@ -431,10 +462,6 @@ Canvas geometry:
 - full canvas height: {size["height"]} px
 - template panel pixel box: {template_panel}
 - target aligned panel pixel box: {target_panel}
-
-Task:
-Find real visible content differences between the template and the aligned target.
-Prefer graphic/icon/logo/mark/code differences, but include any clearly visible printed-content difference if it is visually localized.
 
 Do NOT mark these as differences:
 - remaining tiny alignment shifts
@@ -447,13 +474,15 @@ Coordinate rules:
 - If the visible differing evidence is on the right target panel, use side "target".
 - If it is missing from target but visible on the left template panel, use side "template".
 - If both panels need to be referenced, use side "both" and place the point/box on the most diagnostic visible evidence.
+- For text_diff, locate only the changed word, number, character span, or expected missing text location, not the whole row.
+- For graphic_diff, locate only the changed icon, symbol, mark, barcode graphic, or expected missing graphic location, not a broad surrounding area.
 
 Output rules:
 1. Output exactly one JSON object and nothing else.
 2. Do not output thinking, Markdown, comments, or code fences.
 3. Return at most {max_differences} highest-confidence differences.
 4. Use this schema:
-{{"decision":"same|different|unknown","confidence":0.0,"differences":[{{"side":"template|target|both","label":"short label","point_1000":[x,y],"bbox_1000":[x1,y1,x2,y2],"confidence":0.0}}],"summary":"short summary"}}
+{{"decision":"same|different|unknown","confidence":0.0,"differences":[{difference_schema}],"summary":"short summary"}}
 5. If decision is "same", differences must be [].
 6. If uncertain, use decision "unknown" and differences [].
 7. {detail_rule}
@@ -467,8 +496,9 @@ def build_multi_image_prompt(
 ) -> str:
     target_h, target_w = int(target_shape[0]), int(target_shape[1])
     detail_rule = _mode_detail_rule(mode)
+    difference_schema = _difference_schema(mode, "target")
 
-    return f"""You are testing visual difference localization on aligned product labels.
+    return f"""{_task_rules()}
 
 You will see two images:
 - Image 1 is the template label.
@@ -478,10 +508,7 @@ Image 2 geometry:
 - width: {target_w} px
 - height: {target_h} px
 
-Task:
-Find real visible content differences between Image 1 and Image 2.
 Your localization output must mark where the difference appears on Image 2, the aligned target image.
-Prefer graphic/icon/logo/mark/code differences, but include any clearly visible printed-content difference if it is visually localized.
 
 Do NOT mark these as differences:
 - remaining tiny alignment shifts
@@ -493,13 +520,15 @@ Coordinate rules:
 - All coordinates must be normalized 0-1000 relative to Image 2 only, not Image 1 and not a combined canvas.
 - If a graphic or text is missing from Image 2, mark the corresponding expected location on Image 2.
 - Do not output coordinates on Image 1.
+- For text_diff, locate only the changed word, number, character span, or expected missing text location, not the whole row.
+- For graphic_diff, locate only the changed icon, symbol, mark, barcode graphic, or expected missing graphic location, not a broad surrounding area.
 
 Output rules:
 1. Output exactly one JSON object and nothing else.
 2. Do not output thinking, Markdown, comments, or code fences.
 3. Return at most {max_differences} highest-confidence differences.
 4. Use this schema:
-{{"decision":"same|different|unknown","confidence":0.0,"differences":[{{"side":"target","label":"short label","point_1000":[x,y],"bbox_1000":[x1,y1,x2,y2],"confidence":0.0}}],"summary":"short summary"}}
+{{"decision":"same|different|unknown","confidence":0.0,"differences":[{difference_schema}],"summary":"short summary"}}
 5. If decision is "same", differences must be [].
 6. If uncertain, use decision "unknown" and differences [].
 7. {detail_rule}
@@ -625,6 +654,9 @@ def normalize_result(payload: Optional[Dict[str, Any]], canvas_shape: Sequence[i
         side = str(item.get("side") or "both").strip().lower()
         if side not in {"template", "target", "both"}:
             side = "both"
+        diff_type = str(item.get("type") or "unknown").strip().lower()
+        if diff_type not in {"text_diff", "graphic_diff"}:
+            diff_type = "unknown"
         point_px, point_coord_mode = point_to_px(item.get("point_1000"), width, height)
         bbox_px, bbox_coord_mode = box_to_px(item.get("bbox_1000"), width, height)
         try:
@@ -633,8 +665,11 @@ def normalize_result(payload: Optional[Dict[str, Any]], canvas_shape: Sequence[i
             confidence = 0.0
         normalized.append(
             {
+                "type": diff_type,
                 "side": side,
                 "label": str(item.get("label") or "difference"),
+                "template_evidence": str(item.get("template_evidence") or ""),
+                "target_evidence": str(item.get("target_evidence") or ""),
                 "confidence": max(0.0, min(1.0, confidence)),
                 "point_1000": item.get("point_1000"),
                 "point_px": point_px,
@@ -665,10 +700,16 @@ def normalize_result(payload: Optional[Dict[str, Any]], canvas_shape: Sequence[i
 def draw_predictions(canvas: np.ndarray, differences: Sequence[Dict[str, Any]]) -> np.ndarray:
     output = canvas.copy()
     for idx, item in enumerate(differences, start=1):
-        color = (0, 0, 255) if item.get("side") != "template" else (255, 0, 0)
+        if item.get("type") == "text_diff":
+            color = (255, 0, 0)
+        elif item.get("type") == "graphic_diff":
+            color = (0, 0, 255)
+        else:
+            color = (0, 165, 255)
         bbox = item.get("bbox_px")
         point = item.get("point_px")
-        label = f"{idx}:{item.get('side', 'both')}"
+        label_type = str(item.get("type") or "diff").replace("_diff", "")
+        label = f"{idx}:{label_type}"
         if bbox:
             x1, y1, x2, y2 = [int(v) for v in bbox]
             cv2.rectangle(output, (x1, y1), (x2, y2), color, 3)
