@@ -478,10 +478,16 @@ def point_to_px(point: Any, width: int, height: int) -> Tuple[Optional[List[int]
     except (TypeError, ValueError):
         return None, "invalid"
 
-    if (x > 1000.0 or y > 1000.0) and 0.0 <= x <= width and 0.0 <= y <= height:
+    tolerance = max(16.0, min(width, height) * 0.08)
+    if (
+        (x > 1000.0 or y > 1000.0)
+        and -tolerance <= x <= width + tolerance
+        and -tolerance <= y <= height + tolerance
+    ):
         px = int(round(x))
         py = int(round(y))
-        return [min(max(px, 0), width - 1), min(max(py, 0), height - 1)], "pixel"
+        mode = "pixel" if 0 <= px < width and 0 <= py < height else "pixel_clamped"
+        return [min(max(px, 0), width - 1), min(max(py, 0), height - 1)], mode
 
     px = int(round(max(0.0, min(1000.0, x)) / 1000.0 * width))
     py = int(round(max(0.0, min(1000.0, y)) / 1000.0 * height))
@@ -501,15 +507,23 @@ def box_to_px(box: Any, width: int, height: int) -> Tuple[Optional[List[int]], s
 
     x_values = values[0::2]
     y_values = values[1::2]
+    tolerance = max(16.0, min(width, height) * 0.08)
     if (
         max(values) > 1000.0
-        and min(x_values) >= 0.0
-        and min(y_values) >= 0.0
-        and max(x_values) <= width
-        and max(y_values) <= height
+        and min(x_values) >= -tolerance
+        and min(y_values) >= -tolerance
+        and max(x_values) <= width + tolerance
+        and max(y_values) <= height + tolerance
     ):
         x1, y1, x2, y2 = [int(round(value)) for value in values]
-        mode = "pixel"
+        mode = (
+            "pixel"
+            if min(x1, x2) >= 0
+            and min(y1, y2) >= 0
+            and max(x1, x2) < width
+            and max(y1, y2) < height
+            else "pixel_clamped"
+        )
     else:
         p1, mode1 = point_to_px(values[:2], width, height)
         p2, mode2 = point_to_px(values[2:4], width, height)
