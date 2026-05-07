@@ -48,6 +48,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="实验模式：只判断、点定位、框定位，或点+框",
     )
     parser.add_argument(
+        "--input-mode",
+        choices=("canvas", "multi-image"),
+        default="canvas",
+        help="canvas=左右拼接图；multi-image=分别发送模板图和已对齐实拍图，坐标相对实拍图",
+    )
+    parser.add_argument(
         "--output-dir",
         default=str(DEFAULT_OUTPUT_ROOT),
         help="输出根目录，默认 results/vlm_diff_localization",
@@ -73,6 +79,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--timeout", type=int, default=VLM_TIMEOUT, help="请求超时秒数")
     parser.add_argument("--max-tokens", type=int, default=512, help="最大输出 token")
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="允许模型推理。默认关闭以提高 JSON 稳定性；开启后建议增大 --max-tokens",
+    )
     parser.add_argument(
         "--max-differences",
         type=int,
@@ -389,7 +400,17 @@ def image_to_base64(image: np.ndarray) -> str:
     return base64.b64encode(buffer).decode("ascii")
 
 
-def build_prompt(
+def _mode_detail_rule(mode: str) -> str:
+    if mode == "decision":
+        return 'Each item in "differences" may omit point_1000 and bbox_1000.'
+    if mode == "point":
+        return 'For each difference, include "point_1000": [x, y]. Omit bbox_1000.'
+    if mode == "box":
+        return 'For each difference, include "bbox_1000": [x1, y1, x2, y2]. Omit point_1000.'
+    return 'For each difference, include both "point_1000": [x, y] and "bbox_1000": [x1, y1, x2, y2].'
+
+
+def build_canvas_prompt(
     mode: str,
     canvas_meta: Dict[str, Any],
     max_differences: int,
@@ -397,14 +418,7 @@ def build_prompt(
     size = canvas_meta["canvas_size"]
     template_panel = canvas_meta["template_panel_px"]
     target_panel = canvas_meta["target_panel_px"]
-    if mode == "decision":
-        detail_rule = 'Each item in "differences" may omit point_1000 and bbox_1000.'
-    elif mode == "point":
-        detail_rule = 'For each difference, include "point_1000": [x, y]. Omit bbox_1000.'
-    elif mode == "box":
-        detail_rule = 'For each difference, include "bbox_1000": [x1, y1, x2, y2]. Omit point_1000.'
-    else:
-        detail_rule = 'For each difference, include both "point_1000": [x, y] and "bbox_1000": [x1, y1, x2, y2].'
+    detail_rule = _mode_detail_rule(mode)
 
     return f"""You are testing visual difference localization on aligned product labels.
 
@@ -440,6 +454,52 @@ Output rules:
 3. Return at most {max_differences} highest-confidence differences.
 4. Use this schema:
 {{"decision":"same|different|unknown","confidence":0.0,"differences":[{{"side":"template|target|both","label":"short label","point_1000":[x,y],"bbox_1000":[x1,y1,x2,y2],"confidence":0.0}}],"summary":"short summary"}}
+5. If decision is "same", differences must be [].
+6. If uncertain, use decision "unknown" and differences [].
+7. {detail_rule}
+"""
+
+
+def build_multi_image_prompt(
+    mode: str,
+    target_shape: Sequence[int],
+    max_differences: int,
+) -> str:
+    target_h, target_w = int(target_shape[0]), int(target_shape[1])
+    detail_rule = _mode_detail_rule(mode)
+
+    return f"""You are testing visual difference localization on aligned product labels.
+
+You will see two images:
+- Image 1 is the template label.
+- Image 2 is the target label after preprocessing and alignment.
+
+Image 2 geometry:
+- width: {target_w} px
+- height: {target_h} px
+
+Task:
+Find real visible content differences between Image 1 and Image 2.
+Your localization output must mark where the difference appears on Image 2, the aligned target image.
+Prefer graphic/icon/logo/mark/code differences, but include any clearly visible printed-content difference if it is visually localized.
+
+Do NOT mark these as differences:
+- remaining tiny alignment shifts
+- different brightness, blur, compression, shadows, exposure, or color cast
+- global scale/crop changes already handled by the alignment
+- tiny edge artifacts on the outer border
+
+Coordinate rules:
+- All coordinates must be normalized 0-1000 relative to Image 2 only, not Image 1 and not a combined canvas.
+- If a graphic or text is missing from Image 2, mark the corresponding expected location on Image 2.
+- Do not output coordinates on Image 1.
+
+Output rules:
+1. Output exactly one JSON object and nothing else.
+2. Do not output thinking, Markdown, comments, or code fences.
+3. Return at most {max_differences} highest-confidence differences.
+4. Use this schema:
+{{"decision":"same|different|unknown","confidence":0.0,"differences":[{{"side":"target","label":"short label","point_1000":[x,y],"bbox_1000":[x1,y1,x2,y2],"confidence":0.0}}],"summary":"short summary"}}
 5. If decision is "same", differences must be [].
 6. If uncertain, use decision "unknown" and differences [].
 7. {detail_rule}
@@ -639,6 +699,37 @@ def draw_predictions(canvas: np.ndarray, differences: Sequence[Dict[str, Any]]) 
     return output
 
 
+def scale_predictions(
+    differences: Sequence[Dict[str, Any]],
+    scale: float,
+    output_shape: Sequence[int],
+) -> List[Dict[str, Any]]:
+    if scale <= 0:
+        scale = 1.0
+    out_h, out_w = int(output_shape[0]), int(output_shape[1])
+    scaled: List[Dict[str, Any]] = []
+    for item in differences:
+        copied = dict(item)
+        point = item.get("point_px")
+        if point:
+            x, y = [int(round(float(v) / scale)) for v in point[:2]]
+            copied["point_px"] = [
+                min(max(x, 0), out_w - 1),
+                min(max(y, 0), out_h - 1),
+            ]
+        box = item.get("bbox_px")
+        if box:
+            x1, y1, x2, y2 = [int(round(float(v) / scale)) for v in box[:4]]
+            copied["bbox_px"] = [
+                min(max(x1, 0), out_w - 1),
+                min(max(y1, 0), out_h - 1),
+                min(max(x2, 0), out_w - 1),
+                min(max(y2, 0), out_h - 1),
+            ]
+        scaled.append(copied)
+    return scaled
+
+
 def main() -> int:
     args = build_arg_parser().parse_args()
     output_dir = prepare_output_dir(Path(args.output_dir).resolve(), args.run_name)
@@ -669,7 +760,21 @@ def main() -> int:
         canvas, canvas_meta = make_comparison_canvas(template_panel, target_panel)
         imwrite(output_dir / "comparison_canvas.jpg", canvas)
 
-        prompt = build_prompt(args.mode, canvas_meta, args.max_differences)
+        if args.input_mode == "multi-image":
+            prompt = build_multi_image_prompt(
+                args.mode,
+                target_panel.shape[:2],
+                args.max_differences,
+            )
+            model_images = [
+                image_to_base64(template_panel),
+                image_to_base64(target_panel),
+            ]
+            parse_shape = target_panel.shape[:2]
+        else:
+            prompt = build_canvas_prompt(args.mode, canvas_meta, args.max_differences)
+            model_images = [image_to_base64(canvas)]
+            parse_shape = canvas.shape[:2]
         (output_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 
         client = OpenAICompatibleHTTPClient(
@@ -685,11 +790,11 @@ def main() -> int:
                 {
                     "role": "user",
                     "content": prompt,
-                    "images": [image_to_base64(canvas)],
+                    "images": model_images,
                 }
             ],
             json_mode=True,
-            think=False,
+            think=args.enable_thinking,
             timeout=args.timeout,
             num_predict=args.max_tokens,
         )
@@ -708,13 +813,32 @@ def main() -> int:
     raw_response_path = output_dir / "raw_response.txt"
     raw_response_path.write_text(response.content, encoding="utf-8")
     parsed_payload = extract_json_object(response.content)
-    parsed = normalize_result(parsed_payload, canvas.shape[:2])
-    visualization = draw_predictions(canvas, parsed["differences"])
-    imwrite(output_dir / "vlm_predictions.jpg", visualization)
+    parsed = normalize_result(parsed_payload, parse_shape)
+
+    target_prediction_path = None
+    target_aligned_prediction_path = None
+    if args.input_mode == "multi-image":
+        visualization = draw_predictions(target_panel, parsed["differences"])
+        target_prediction_path = output_dir / "target_predictions.jpg"
+        imwrite(target_prediction_path, visualization)
+
+        aligned_differences = scale_predictions(
+            parsed["differences"],
+            canvas_scale,
+            aligned_target.shape[:2],
+        )
+        aligned_visualization = draw_predictions(aligned_target, aligned_differences)
+        target_aligned_prediction_path = output_dir / "target_aligned_predictions.jpg"
+        imwrite(target_aligned_prediction_path, aligned_visualization)
+    else:
+        visualization = draw_predictions(canvas, parsed["differences"])
+        imwrite(output_dir / "vlm_predictions.jpg", visualization)
 
     result = {
         "success": True,
         "mode": args.mode,
+        "input_mode": args.input_mode,
+        "thinking_enabled": args.enable_thinking,
         "model": response.model,
         "api_base": args.api_base,
         "debug_summary": response.debug_summary(),
@@ -733,10 +857,14 @@ def main() -> int:
             "target_preprocessed": str(output_dir / "target_preprocessed.jpg"),
             "target_aligned": str(output_dir / "target_aligned.jpg"),
             "comparison_canvas": str(output_dir / "comparison_canvas.jpg"),
-            "vlm_predictions": str(output_dir / "vlm_predictions.jpg"),
             "prompt": str(output_dir / "prompt.txt"),
         },
     }
+    if args.input_mode == "multi-image":
+        result["artifacts"]["target_predictions"] = str(target_prediction_path)
+        result["artifacts"]["target_aligned_predictions"] = str(target_aligned_prediction_path)
+    else:
+        result["artifacts"]["vlm_predictions"] = str(output_dir / "vlm_predictions.jpg")
     write_json(output_dir / "result.json", result)
 
     latest_dir = Path(args.output_dir).resolve() / "latest"
@@ -754,7 +882,11 @@ def main() -> int:
     print(f"Differences: {len(parsed['differences'])}")
     print(f"Output: {output_dir}")
     print(f"Canvas: {output_dir / 'comparison_canvas.jpg'}")
-    print(f"Predictions: {output_dir / 'vlm_predictions.jpg'}")
+    if args.input_mode == "multi-image":
+        print(f"Target predictions: {target_prediction_path}")
+        print(f"Aligned target predictions: {target_aligned_prediction_path}")
+    else:
+        print(f"Predictions: {output_dir / 'vlm_predictions.jpg'}")
     print(f"Result: {output_dir / 'result.json'}")
     return 0
 
