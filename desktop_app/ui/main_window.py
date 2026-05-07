@@ -147,6 +147,7 @@ class MainWindow(QMainWindow):
         self.status_value = QLabel("就绪")
         self.result_state_value = QLabel("待检测")
         self.verdict_value = QLabel("待检测")
+        self.detection_duration_value = QLabel("-")
         self.text_stats_value = QLabel("-")
         self.graphic_stats_value = QLabel("-")
         self.summary_value = QLabel("请先选择模板和目标图片")
@@ -289,6 +290,7 @@ class MainWindow(QMainWindow):
         metrics_layout = QFormLayout()
         metrics_layout.setVerticalSpacing(8)
         metrics_layout.addRow("结果阶段", self.result_state_value)
+        metrics_layout.addRow("检测耗时", self.detection_duration_value)
         metrics_layout.addRow("文字匹配", self.text_stats_value)
         metrics_layout.addRow("图形比对", self.graphic_stats_value)
         metrics_layout.addRow("摘要说明", self.summary_value)
@@ -691,6 +693,9 @@ class MainWindow(QMainWindow):
     def set_summary_text(self, value: str) -> None:
         self.summary_value.setText(value or "暂无摘要")
 
+    def set_detection_duration_seconds(self, seconds: float | None) -> None:
+        self.detection_duration_value.setText(self._format_detection_duration(seconds))
+
     def set_result_image_path(self, path: str | Path | None) -> None:
         self._result_preview_path = Path(path) if path else None
         self._render_image(
@@ -753,6 +758,7 @@ class MainWindow(QMainWindow):
         self.result_state_value.setText("待检测")
         self.set_verdict("待检测")
         self.set_summary_text("请先确认模板与目标图片，再开始检测。")
+        self.set_detection_duration_seconds(None)
         self.text_stats_value.setText("-")
         self.graphic_stats_value.setText("-")
         self.set_output_dir("")
@@ -762,6 +768,7 @@ class MainWindow(QMainWindow):
         self.result_state_value.setText("检测中")
         self.set_verdict("检测中")
         self.set_summary_text("检测任务正在后台执行，请等待结果返回。")
+        self.detection_duration_value.setText("计时中")
         self.text_stats_value.setText("-")
         self.graphic_stats_value.setText("-")
         self.set_output_dir("")
@@ -771,6 +778,7 @@ class MainWindow(QMainWindow):
         self.result_state_value.setText("检测失败")
         self.set_verdict("失败")
         self.set_summary_text(message)
+        self.set_detection_duration_seconds(None)
         self.text_stats_value.setText("-")
         self.graphic_stats_value.setText("-")
         self.set_output_dir("")
@@ -790,6 +798,12 @@ class MainWindow(QMainWindow):
         )
         self.set_output_dir(str(result.output_dir))
         self.set_result_image_path(result.visualization_path)
+
+    @staticmethod
+    def _format_detection_duration(seconds: float | None) -> str:
+        if seconds is None:
+            return "-"
+        return f"{max(0.0, seconds):.2f} 秒"
 
     def set_history_records(self, records: list[HistoryRecord]) -> None:
         self.history_list.clear()

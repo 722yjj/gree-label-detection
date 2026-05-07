@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -82,6 +83,7 @@ class AppController(QObject):
         self._camera_workflow_state = CAMERA_NO_CAMERA
         self._latest_camera_brightness: CameraFrameBrightness | None = None
         self._last_camera_brightness_level: str | None = None
+        self._detection_started_at: float | None = None
         self._auto_start_camera_preview = auto_start_camera_preview
         self._connect_signals()
         self._connect_scanner_signals()
@@ -476,6 +478,7 @@ class AppController(QObject):
 
         self._thread = thread
         self._worker = worker
+        self._detection_started_at = time.monotonic()
         self._camera_workflow_state = CAMERA_DETECTING
         self._sync_camera_actions()
         self.view.set_busy(True)
@@ -484,9 +487,11 @@ class AppController(QObject):
         thread.start()
 
     def _handle_detection_finished(self, result: DetectionJobResult) -> None:
+        duration_seconds = self._finish_detection_timer()
         self.view.set_busy(False)
         self.view.set_status("检测完成")
         self.view.show_detection_result(result)
+        self.view.set_detection_duration_seconds(duration_seconds)
         record = HistoryRecord(
             created_at=datetime.now().isoformat(timespec="seconds"),
             code=result.code or self.view.code_text(),
@@ -511,9 +516,11 @@ class AppController(QObject):
         self._refresh_detection_ready_state()
 
     def _handle_detection_failed(self, message: str) -> None:
+        duration_seconds = self._finish_detection_timer()
         self.view.set_busy(False)
         self.view.set_status("检测失败")
         self.view.show_failure_result(message)
+        self.view.set_detection_duration_seconds(duration_seconds)
         self.view.show_error(message)
         self._camera_workflow_state = CAMERA_RESULT_READY
         self._sync_camera_actions()
@@ -527,6 +534,14 @@ class AppController(QObject):
 
     def _is_detection_running(self) -> bool:
         return self._thread is not None
+
+    def _finish_detection_timer(self) -> float | None:
+        if self._detection_started_at is None:
+            return None
+
+        duration_seconds = time.monotonic() - self._detection_started_at
+        self._detection_started_at = None
+        return duration_seconds
 
     def _clear_active_camera_preview_worker(self) -> None:
         self._camera_preview_thread = None

@@ -14,6 +14,7 @@ from PySide6.QtGui import QColor, QImage, QPixmap
 from PySide6.QtWidgets import QApplication, QScrollArea
 
 from desktop_app.controllers.app_controller import AppController
+from desktop_app.controllers import app_controller as app_controller_module
 from desktop_app.devices.scanner.mock import MockScannerAdapter
 from desktop_app.models import DetectionJobResult, TemplateRecord
 from desktop_app.ui.main_window import MainWindow, ScaledImageLabel
@@ -513,5 +514,67 @@ def test_main_window_uses_internal_scroll_areas_for_result_and_history(qapp):
         assert isinstance(window.history_scroll_area, QScrollArea)
         assert window.history_scroll_area.widgetResizable() is True
         assert window.history_scroll_area.verticalScrollBar().maximum() > 0
+    finally:
+        window.close()
+
+
+def test_main_window_displays_detection_duration_states(qapp):
+    window = MainWindow()
+    window.show()
+    qapp.processEvents()
+
+    try:
+        window.show_pending_result()
+        assert window.detection_duration_value.text() == "-"
+
+        window.show_running_result()
+        assert window.detection_duration_value.text() == "计时中"
+
+        window.set_detection_duration_seconds(1.234)
+        assert window.detection_duration_value.text() == "1.23 秒"
+    finally:
+        window.close()
+
+
+def test_detection_finished_displays_elapsed_duration(tmp_path, qapp, monkeypatch):
+    window, controller, _repository = build_controller(tmp_path, qapp)
+    target_path = tmp_path / "target.jpg"
+    target_path.write_bytes(b"target")
+
+    try:
+        controller.handle_scanned_code("600004075219")
+        window.set_target_image_path(target_path)
+        controller._detection_started_at = 10.0
+        monkeypatch.setattr(app_controller_module.time, "monotonic", lambda: 12.345)
+
+        controller._handle_detection_finished(
+            DetectionJobResult(
+                success=True,
+                verdict="通过",
+                output_dir=tmp_path,
+                summary_text="ok",
+                target_image_path=target_path,
+                template_path=window.selected_template().source_path,
+                code="600004075219",
+                template_display_name="600004075219",
+            )
+        )
+
+        assert window.detection_duration_value.text() == "2.35 秒"
+    finally:
+        window.close()
+
+
+def test_detection_failed_displays_elapsed_duration(tmp_path, qapp, monkeypatch):
+    window, controller, _repository = build_controller(tmp_path, qapp)
+
+    try:
+        controller._detection_started_at = 20.0
+        monkeypatch.setattr(app_controller_module.time, "monotonic", lambda: 21.5)
+        monkeypatch.setattr(window, "show_error", lambda _message: None)
+
+        controller._handle_detection_failed("服务不可用")
+
+        assert window.detection_duration_value.text() == "1.50 秒"
     finally:
         window.close()
