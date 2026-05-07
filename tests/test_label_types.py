@@ -179,6 +179,18 @@ class TestExtractStandardSpecFromText:
         assert extracted["frequency"] == "50HHz"
         assert extracted["heating_capacity"] == "520kW"
 
+    def test_extracts_incomplete_air_volume_unit_as_ocr_anchor(self):
+        text = """
+        Air
+        Flow
+        Volume
+        850m/
+        """
+
+        extracted = extract_standard_spec_from_text(text)
+
+        assert extracted["air_volume"] == "850m/"
+
     def test_merge_preserves_ocr_anchor_when_llm_autocorrects(self):
         rule_data = {
             "model_number": "GWH118AAD-K6DNA2E/I",
@@ -216,6 +228,18 @@ class TestExtractStandardSpecFromText:
         )
 
         assert merged["voltage"] == "220-240V~"
+
+    def test_merge_preserves_incomplete_air_volume_anchor(self):
+        rule_data = {"air_volume": "850m/"}
+        llm_data = {"air_volume": "850m³/h"}
+
+        merged = merge_standard_sources(
+            rule_data,
+            llm_data,
+            AirConditionerLabel.model_fields.keys(),
+        )
+
+        assert merged["air_volume"] == "850m/"
 
     def test_merge_uses_ocr_when_llm_returns_nulls(self):
         rule_data = {

@@ -53,6 +53,10 @@ class TestTextFieldValuesMatch:
     def test_treats_label_case_change_as_difference(self):
         assert not text_field_values_match("label:weight", "Weight", "weiGht")
 
+    def test_barcode_label_preserves_printed_dot_count(self):
+        assert text_field_values_match("label:barcode", "SerialNo.", "Serial No.")
+        assert not text_field_values_match("label:barcode", "SerialNo.", "Serial No..")
+
     def test_treats_short_ocr_label_aliases_as_match(self):
         assert text_field_values_match(
             "label:voltage",
@@ -245,6 +249,18 @@ class TestExtractFieldLabelsFromOcrBoxes:
 
         assert labels == {
             "air_volume": {"text": "Air Flow Volume", "box_indices": [1, 2, 3]},
+        }
+
+    def test_preserves_extra_barcode_label_dots_from_merged_ocr_boxes(self):
+        boxes = [
+            self._make_box("Serial", x1=1065, y1=710, x2=1230, y2=770),
+            self._make_box("No..", x1=1257, y1=710, x2=1330, y2=773),
+        ]
+
+        labels = extract_field_labels_from_ocr_boxes(boxes, ["barcode"])
+
+        assert labels == {
+            "barcode": {"text": "Serial No..", "box_indices": [0, 1]},
         }
 
     def test_merges_three_word_noise_label(self):

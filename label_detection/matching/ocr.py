@@ -44,7 +44,7 @@ FIELD_LABEL_PATTERNS: Dict[str, str] = {
     "color": r"(?<![A-Za-z])(Color)(?![A-Za-z])",
     "connection_pipes": r"(?<![A-Za-z])(Connection\s*Pipes?)(?![A-Za-z])",
     "refrigerant": r"(?<![A-Za-z])(Refrigerant)(?![A-Za-z])",
-    "barcode": r"(?<![A-Za-z])(Serial\s*No\.?|Serial\s*Number|Barcode)(?![A-Za-z])",
+    "barcode": r"(?<![A-Za-z])(Serial\s*No\.*|Serial\s*Number|Barcode)(?![A-Za-z])",
     "weight": r"(?<![A-Za-z])(Weight)(?![A-Za-z])",
     "frequency": r"(?<![A-Za-z])(Rated\s*Frequency|Frequency)(?![A-Za-z])",
     "voltage": r"(?<![A-Za-z])(Rated\s*Voltage|Voltage)(?![A-Za-z])",
@@ -134,6 +134,19 @@ def normalize_label_text_for_compare(text: object) -> str:
     return re.sub(r"[^0-9A-Za-z]+", "", normalized)
 
 
+def _normalize_barcode_label_text_for_compare(text: object) -> str:
+    """Normalize barcode captions while preserving printed punctuation."""
+    if text is None:
+        return ""
+
+    normalized = unicodedata.normalize("NFKC", str(text)).strip()
+    if not normalized or normalized.lower() == "none":
+        return ""
+
+    normalized = normalized.replace("³", "3")
+    return re.sub(r"\s+", "", normalized)
+
+
 def _label_tokens_for_compare(text: object) -> List[str]:
     """Tokenize label captions and repair common OCR single-letter splits."""
     if text is None:
@@ -160,9 +173,20 @@ def label_values_match(expected: object, actual: object) -> bool:
 
 
 def label_field_values_match(field_name: object, expected: object, actual: object) -> bool:
+    base_field_name = get_base_field_name(field_name)
+    if base_field_name == "barcode":
+        expected_strict_norm = _normalize_barcode_label_text_for_compare(expected)
+        actual_strict_norm = _normalize_barcode_label_text_for_compare(actual)
+        if expected_strict_norm == actual_strict_norm:
+            return True
+        if expected_strict_norm.casefold() == actual_strict_norm.casefold():
+            return False
+
     expected_norm = normalize_label_text_for_compare(expected)
     actual_norm = normalize_label_text_for_compare(actual)
     if expected_norm == actual_norm:
+        if base_field_name == "barcode":
+            return False
         return True
 
     # Keep OCR label comparisons case-sensitive when the text is otherwise the
@@ -172,7 +196,6 @@ def label_field_values_match(field_name: object, expected: object, actual: objec
     if expected_norm.casefold() == actual_norm.casefold():
         return False
 
-    base_field_name = get_base_field_name(field_name)
     alias_norms = {
         normalize_text_for_match(alias)
         for alias in FIELD_LABEL_ALIASES.get(base_field_name, ())

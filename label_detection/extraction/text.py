@@ -53,6 +53,16 @@ def _llm_value_completes_ocr_value(rule_val: object, llm_val: object) -> bool:
     return 0 < len(suffix) <= 4
 
 
+def _llm_completes_standard_anchor(
+    field_name: str,
+    rule_val: object,
+    llm_val: object,
+) -> bool:
+    if field_name == "air_volume":
+        return False
+    return _llm_value_completes_ocr_value(rule_val, llm_val)
+
+
 def _search_label_value(label_pattern: str, value_pattern: str, text: str) -> str | None:
     return _search_group(
         rf"{label_pattern}\s*[:：]?\s*[\r\n ]*({value_pattern})",
@@ -130,6 +140,10 @@ def extract_standard_spec_from_text(ocr_text: object) -> Dict[str, str | None]:
     air_volume = _search_label_value(
         r"Air\s*(?:Flow\s*)?Volume(?:\s+m\s*(?:3|\^3)?\s*/\s*h)?",
         r"[0-9OIl]+(?:[.,][0-9OIl]+)?\s*m\s*(?:3|\^3)?\s*/\s*h",
+        compacted,
+    ) or _search_label_value(
+        r"Air\s*(?:Flow\s*)?Volume(?:\s+m\s*(?:3|\^3)?\s*/\s*h)?",
+        r"[0-9OIl]+(?:[.,][0-9OIl]+)?\s*m\s*(?:(?:3|\^3)?\s*/\s*h?|(?:3|\^3))?",
         compacted,
     )
     weight = _search_label_value(
@@ -348,7 +362,7 @@ def merge_standard_sources(
         llm_val = llm_data.get(field_name)
         if (
             field_name in STANDARD_OCR_ANCHOR_FIELDS
-            and _llm_value_completes_ocr_value(rule_val, llm_val)
+            and _llm_completes_standard_anchor(field_name, rule_val, llm_val)
         ):
             merged[field_name] = llm_val
         elif field_name in STANDARD_OCR_ANCHOR_FIELDS and rule_val not in (None, "", "None"):
