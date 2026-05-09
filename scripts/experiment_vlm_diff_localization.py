@@ -50,8 +50,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--input-mode",
         choices=("canvas", "multi-image"),
-        default="canvas",
-        help="canvas=左右拼接图；multi-image=分别发送模板图和已对齐实拍图，坐标相对实拍图",
+        default="multi-image",
+        help="multi-image=分别发送模板图和已对齐实拍图，坐标相对实拍图；canvas=左右拼接图",
     )
     parser.add_argument(
         "--output-dir",
