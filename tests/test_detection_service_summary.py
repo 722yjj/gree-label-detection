@@ -73,6 +73,7 @@ def test_summarize_result_counts_label_text_difference():
 def test_detection_service_passes_output_mode_to_workflow(tmp_path, monkeypatch):
     from desktop_app.models import DetectionJobRequest, TemplateRecord
 
+    monkeypatch.setenv("DESKTOP_DETECTION_PIPELINE", "unified")
     template_path = tmp_path / "template.png"
     target_path = tmp_path / "target.jpg"
     template_path.write_bytes(b"template")
@@ -126,3 +127,77 @@ def test_detection_service_passes_output_mode_to_workflow(tmp_path, monkeypatch)
     assert captured["target_image_path"] == str(target_path)
     assert captured["output_mode"] == "final"
     assert result.visualization_path == tmp_path / "results" / "visualization_diff.jpg"
+
+
+def test_detection_service_defaults_to_traditional_full_image_diff(tmp_path, monkeypatch):
+    from desktop_app.models import DetectionJobRequest, TemplateRecord
+
+    monkeypatch.setenv("DESKTOP_TRADITIONAL_DIFF_MODEL", "test-model")
+    template_path = tmp_path / "template.png"
+    target_path = tmp_path / "target.jpg"
+    template_path.write_bytes(b"template")
+    target_path.write_bytes(b"target")
+    captured = {}
+
+    def fake_run(
+        template,
+        target,
+        *,
+        output_dir,
+        run_name,
+        output_mode,
+        **kwargs,
+    ):
+        case_dir = tmp_path / "desktop-results" / "600004075219" / run_name
+        case_dir.mkdir(parents=True, exist_ok=True)
+        final_image = case_dir / "final_result.jpg"
+        result_json = case_dir / "result.json"
+        final_image.write_bytes(b"image")
+        result_json.write_text("{}", encoding="utf-8")
+        captured["template"] = template
+        captured["target"] = target
+        captured["output_dir"] = output_dir
+        captured["run_name"] = run_name
+        captured["output_mode"] = output_mode
+        captured["kwargs"] = kwargs
+        return {
+            "success": True,
+            "output_dir": str(case_dir),
+            "final_box_count": 1,
+            "raw_candidate_box_count": 2,
+            "merged_candidate_box_count": 1,
+            "final_boxes": [{"box": [1, 2, 3, 4]}],
+            "vlm_filter_results": [{"vlm_decision": "keep"}],
+            "artifacts": {"final_result": str(final_image)},
+        }
+
+    monkeypatch.setattr(
+        "label_detection.workflows.traditional_full_image_diff.run_traditional_full_image_diff",
+        fake_run,
+    )
+
+    request = DetectionJobRequest(
+        template=TemplateRecord(
+            code="600004075219",
+            variant=None,
+            display_name="600004075219",
+            source_type="image",
+            source_path=template_path,
+        ),
+        target_image_path=target_path,
+        output_mode="final",
+    )
+
+    service = DetectionService(output_root=tmp_path / "desktop-results")
+    result = service.run(request)
+
+    assert captured["template"] == template_path
+    assert captured["target"] == target_path
+    assert captured["output_mode"] == "final"
+    assert result.verdict == "不一致"
+    assert result.graphic_mismatch_count == 1
+    assert result.visualization_path == result.output_dir / "visualization_diff.jpg"
+    assert sorted(path.name for path in result.output_dir.iterdir()) == [
+        "final_result.json",
+        "visualization_diff.jpg",
+    ]
