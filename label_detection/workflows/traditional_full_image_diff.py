@@ -331,11 +331,12 @@ def _box_values(item: Dict[str, Any] | Sequence[int]) -> List[int]:
 def _boxes_near(box_a: Sequence[int], box_b: Sequence[int], gap: int) -> bool:
     ax1, ay1, ax2, ay2 = _box_values(box_a)
     bx1, by1, bx2, by2 = _box_values(box_b)
+    vertical_gap = max(4, int(round(gap * 0.5)))
     return not (
         ax2 + gap < bx1
         or bx2 + gap < ax1
-        or ay2 + gap < by1
-        or by2 + gap < ay1
+        or ay2 + vertical_gap < by1
+        or by2 + vertical_gap < ay1
     )
 
 
@@ -416,11 +417,18 @@ def expand_review_box(
     x1, y1, x2, y2 = [int(v) for v in box]
     box_w = max(1, x2 - x1)
     box_h = max(1, y2 - y1)
-    dynamic_padding = max(int(padding), int(round(max(box_w, box_h) * 0.75)))
+    aspect = box_w / float(box_h)
+    if aspect >= 3.0:
+        pad_x = max(int(padding), int(round(box_h * 0.6)))
+        pad_y = max(int(padding), int(round(box_h * 0.5)))
+    else:
+        dynamic_padding = max(int(padding), int(round(max(box_w, box_h) * 0.75)))
+        pad_x = dynamic_padding
+        pad_y = dynamic_padding
     cx = (x1 + x2) / 2.0
     cy = (y1 + y2) / 2.0
-    review_w = max(box_w + dynamic_padding * 2, int(min_size))
-    review_h = max(box_h + dynamic_padding * 2, int(min_size))
+    review_w = max(box_w + pad_x * 2, int(min_size))
+    review_h = max(box_h + pad_y * 2, int(min_size))
     rx1 = int(round(cx - review_w / 2.0))
     ry1 = int(round(cy - review_h / 2.0))
     rx2 = int(round(cx + review_w / 2.0))
