@@ -1343,22 +1343,22 @@ For this candidate, be conservative:
 - Discard isolated dots, tiny specks, dust, ink blobs, red annotation marks, compression noise, or local edge artifacts, even if visible in only one crop.
 - Do not treat a tiny standalone mark as a real difference unless it changes a readable character, digit, or unit.
 """
-    return f"""You are checking one candidate difference from a product label inspection.
+    return f"""You are checking one candidate region from a product label inspection.
 
-You will see three cropped images:
+You will see two unannotated cropped images:
 - Image 1 is the template review crop.
 - Image 2 is the target review crop.
-- Image 3 is the target review crop with the candidate region marked by a red box.
 
-The candidate box on the comparison image is {list(box)}.
-The larger review crop box on the comparison image is {list(review_box)}.
+No red boxes, labels, or other inspection annotations are drawn on the images.
+The candidate box that triggered this review is {list(box)}.
+The larger crop sent for review is {list(review_box)}.
 This candidate merges {child_count} raw diff component(s).
 Foreground ratios inside the review crops:
 - template: {template_foreground:.4f}
 - target: {target_foreground:.4f}
 {micro_text_note}
 
-Decide whether the red-box candidate region, using its surrounding context, is a real label-content difference.
+Decide whether the real printed label content in this crop differs between template and target.
 
 Keep real differences:
 - text character changes, including case changes or typos
@@ -1375,9 +1375,10 @@ Discard false positives:
 - crop boundary artifacts
 
 Important:
-- If one review crop is blank or nearly blank around the red box and the other review crop contains a visible printed black mark, icon, symbol, or text at that location, output keep.
+- Use only the two unannotated image crops. Do not infer content from candidate IDs or coordinates in this prompt.
+- If one review crop is blank or nearly blank in the candidate area and the other review crop contains a visible printed black mark, icon, symbol, or text there, output keep.
 - Do not discard added or missing printed symbols just because they seem minor, decorative, or hard to interpret.
-- Do not require the red box to contain the complete object. It may only cover the changed pixels; use nearby context inside the review crop.
+- The candidate box may cover only changed pixels, not the complete object. Use nearby context inside the review crop.
 
 Output exactly one JSON object and nothing else:
 {{"decision":"keep|discard|unknown","confidence":0.0,"reason":"short reason"}}
@@ -1395,39 +1396,39 @@ def build_vlm_batch_filter_prompt(
         f"raw components {int(item.get('child_count', 1))}"
         for index, item in enumerate(candidates, start=1)
     )
-    return f"""You are checking several tiny candidate differences from one product label region.
+    return f"""You are checking one grouped candidate region from a product label inspection.
 
-You will see three cropped images:
+You will see two unannotated cropped images:
 - Image 1 is the template review crop.
 - Image 2 is the target review crop.
-- Image 3 is the target review crop with multiple candidate regions marked by red numbered boxes.
 
-The larger review crop box on the comparison image is {list(review_box)}.
-Candidate boxes on the comparison image:
+No red boxes, labels, candidate numbers, or other inspection annotations are drawn on the images.
+The grouped review crop box on the comparison image is {list(review_box)}.
+Raw candidate boxes that triggered this grouped review:
 {candidate_lines}
 Foreground ratios inside the review crops:
 - template: {template_foreground:.4f}
 - target: {target_foreground:.4f}
 
 These candidates came from a sensitive small text detector for numbers/units.
-For each numbered red box, decide whether it marks a real label-content difference.
+Decide whether the real printed label content in this grouped crop differs between template and target.
 
-Keep only candidate IDs that are real content differences:
+Keep the grouped region only for real content differences:
 - changed word, character, number, model, date, barcode value, or unit
 - missing, extra, flattened, or malformed superscript/subscript digit
 - compact unit differences such as m³/h, m3/h, kW, Hz, kg, or dB(A)
 
-Discard candidate IDs that are only:
+Discard the grouped region if the visible differences are only:
 - isolated dots, tiny specks, dust, ink blobs, red annotation marks, compression noise, or local edge artifacts
 - blur, exposure, shadow, antialiasing, line thickness, ink darkness, or alignment residue
 
 Important:
-- Use the surrounding context in the review crop. A red box may cover only changed pixels, not the complete word.
-- If exactly one small part of a unit or word is missing or changed, include only that candidate ID.
-- If no numbered candidate is a real content difference, output discard and an empty kept_candidate_ids list.
+- Use only the two unannotated image crops. Do not infer content from candidate IDs or coordinates in this prompt.
+- Use the surrounding context in the review crop. A raw candidate box may cover only changed pixels, not the complete word.
+- If no real printed content differs, output discard.
 
 Output exactly one JSON object and nothing else:
-{{"decision":"keep|discard|unknown","kept_candidate_ids":[1],"confidence":0.0,"reason":"short reason"}}
+{{"decision":"keep|discard|unknown","confidence":0.0,"reason":"short reason"}}
 """
 
 
@@ -1568,14 +1569,8 @@ def apply_vlm_filter(
 
             template_crop = crop_box(template_image, review_box)
             target_crop = crop_box(target_image, review_box)
-            target_annotated = draw_local_candidate_boxes(
-                target_crop,
-                sub_candidates,
-                review_box,
-            )
             template_crop = upscale_micro_crop(template_crop)
             target_crop = upscale_micro_crop(target_crop)
-            target_annotated = upscale_micro_crop(target_annotated)
             template_foreground = foreground_ratio(template_crop)
             target_foreground = foreground_ratio(target_crop)
             foreground_presence_signal = (
@@ -1596,7 +1591,6 @@ def apply_vlm_filter(
                         "images": [
                             image_to_base64(template_crop),
                             image_to_base64(target_crop),
-                            image_to_base64(target_annotated),
                         ],
                     }
                 ],
@@ -1605,32 +1599,25 @@ def apply_vlm_filter(
                 num_predict=max_tokens,
             )
             valid_ids = [int(candidate.get("candidate_id", 0)) for candidate in sub_candidates]
-            parsed = normalize_vlm_batch_filter_response(
-                extract_json_object(response.content),
-                valid_ids,
-            )
+            parsed = normalize_vlm_filter_response(extract_json_object(response.content))
             record = {
                 **dict(item),
                 "review_box": review_box,
                 "review_box_source": "micro_batch",
                 "vlm_decision": parsed["decision"],
-                "kept_candidate_ids": parsed["kept_candidate_ids"],
+                "kept_candidate_ids": valid_ids if parsed["decision"] == "keep" else [],
                 "vlm_confidence": parsed["confidence"],
                 "vlm_reason": parsed["reason"],
                 "filter_source": "vlm",
+                "vlm_input_mode": "two_image_unmarked_region",
                 "template_foreground_ratio": template_foreground,
                 "target_foreground_ratio": target_foreground,
                 "foreground_presence_signal": foreground_presence_signal,
                 "raw_response": response.content,
             }
             decisions.append(record)
-            kept_ids = set(parsed["kept_candidate_ids"])
-            if kept_ids:
-                kept_candidates = [
-                    dict(candidate)
-                    for candidate in sub_candidates
-                    if int(candidate.get("candidate_id", 0)) in kept_ids
-                ]
+            if parsed["decision"] == "keep":
+                kept_candidates = [dict(candidate) for candidate in sub_candidates]
                 kept_record = {
                     **dict(record),
                     "box": _merge_box_values(
@@ -1654,7 +1641,6 @@ def apply_vlm_filter(
             if debug_dir is not None:
                 imwrite(debug_dir / f"candidate_{index:02d}_template.jpg", template_crop)
                 imwrite(debug_dir / f"candidate_{index:02d}_target.jpg", target_crop)
-                imwrite(debug_dir / f"candidate_{index:02d}_target_marked.jpg", target_annotated)
                 (debug_dir / f"candidate_{index:02d}.json").write_text(
                     json.dumps(record, ensure_ascii=False, indent=2),
                     encoding="utf-8",
@@ -1687,23 +1673,8 @@ def apply_vlm_filter(
         template_crop = crop_box(template_image, review_box)
         target_crop = crop_box(target_image, review_box)
         if item.get("source") == "micro_text_candidate":
-            target_annotated = draw_local_candidate_box(
-                target_crop,
-                box,
-                review_box,
-                label=False,
-            )
-        else:
-            target_annotated = draw_local_candidate_box(
-                target_crop,
-                box,
-                review_box,
-                label=False,
-            )
-        if item.get("source") == "micro_text_candidate":
             template_crop = upscale_micro_crop(template_crop)
             target_crop = upscale_micro_crop(target_crop)
-            target_annotated = upscale_micro_crop(target_annotated)
         template_foreground = foreground_ratio(template_crop)
         target_foreground = foreground_ratio(target_crop)
 
@@ -1728,7 +1699,6 @@ def apply_vlm_filter(
                     "images": [
                         image_to_base64(template_crop),
                         image_to_base64(target_crop),
-                        image_to_base64(target_annotated),
                     ],
                 }
             ],
@@ -1745,6 +1715,7 @@ def apply_vlm_filter(
             "vlm_confidence": parsed["confidence"],
             "vlm_reason": parsed["reason"],
             "filter_source": "vlm",
+            "vlm_input_mode": "two_image_unmarked_region",
             "template_foreground_ratio": template_foreground,
             "target_foreground_ratio": target_foreground,
             "foreground_presence_signal": foreground_presence_signal,
@@ -1757,7 +1728,6 @@ def apply_vlm_filter(
         if debug_dir is not None:
             imwrite(debug_dir / f"candidate_{index:02d}_template.jpg", template_crop)
             imwrite(debug_dir / f"candidate_{index:02d}_target.jpg", target_crop)
-            imwrite(debug_dir / f"candidate_{index:02d}_target_marked.jpg", target_annotated)
             (debug_dir / f"candidate_{index:02d}.json").write_text(
                 json.dumps(record, ensure_ascii=False, indent=2),
                 encoding="utf-8",

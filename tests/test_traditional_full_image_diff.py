@@ -1,6 +1,10 @@
 import numpy as np
 
+import label_detection.workflows.traditional_full_image_diff as traditional_diff
 from label_detection.workflows.traditional_full_image_diff import (
+    apply_vlm_filter,
+    build_vlm_batch_filter_prompt,
+    build_vlm_filter_prompt,
     merge_standard_and_micro_candidates_for_vlm,
     refine_display_boxes,
     scale_boxes,
@@ -108,3 +112,83 @@ def test_scale_boxes_preserves_display_box():
 
     assert scaled[0]["box"] == [20, 40, 60, 80]
     assert scaled[0]["display_box"] == [16, 36, 68, 88]
+
+
+def test_vlm_prompts_use_two_unannotated_images():
+    single_prompt = build_vlm_filter_prompt(
+        [10, 20, 30, 40],
+        [0, 0, 80, 80],
+        0.1,
+        0.2,
+        1,
+    )
+    batch_prompt = build_vlm_batch_filter_prompt(
+        [0, 0, 80, 80],
+        [{"box": [10, 20, 30, 40], "candidate_id": 1}],
+        0.1,
+        0.2,
+    )
+
+    assert "two unannotated cropped images" in single_prompt
+    assert "two unannotated cropped images" in batch_prompt
+    assert "red numbered boxes" not in batch_prompt
+    assert "Image 3" not in single_prompt
+    assert "Image 3" not in batch_prompt
+
+
+def test_apply_vlm_filter_sends_only_unannotated_template_and_target(monkeypatch, tmp_path):
+    calls = []
+
+    class FakeResponse:
+        content = '{"decision":"discard","confidence":0.9,"reason":"same content"}'
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def chat(self, messages, **kwargs):
+            calls.append(messages[0])
+            return FakeResponse()
+
+    monkeypatch.setattr(traditional_diff, "OpenAICompatibleHTTPClient", FakeClient)
+    image = np.full((80, 120, 3), 255, dtype=np.uint8)
+
+    kept, decisions = apply_vlm_filter(
+        [
+            {
+                "box": [20, 20, 35, 35],
+                "review_box": [0, 0, 80, 80],
+                "area": 20,
+                "density": 0.5,
+                "source": "micro_text_candidate_batch",
+                "sub_candidates": [
+                    {
+                        "box": [20, 20, 35, 35],
+                        "candidate_id": 1,
+                        "area": 20,
+                        "density": 0.5,
+                    }
+                ],
+            }
+        ],
+        image,
+        image,
+        model="fake-model",
+        api_base="http://127.0.0.1:8000/v1",
+        api_key="EMPTY",
+        timeout=1,
+        max_tokens=32,
+        crop_padding=8,
+        review_min_size=32,
+        keep_unknown=False,
+        skip_model_check=True,
+        debug_dir=tmp_path,
+    )
+
+    assert kept == []
+    assert decisions[0]["vlm_input_mode"] == "two_image_unmarked_region"
+    assert len(calls) == 1
+    assert len(calls[0]["images"]) == 2
+    assert (tmp_path / "candidate_01_template.jpg").exists()
+    assert (tmp_path / "candidate_01_target.jpg").exists()
+    assert not (tmp_path / "candidate_01_target_marked.jpg").exists()
