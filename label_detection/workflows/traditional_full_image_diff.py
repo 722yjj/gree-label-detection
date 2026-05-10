@@ -449,6 +449,117 @@ def expand_review_box(
     return [rx1, ry1, rx2, ry2]
 
 
+def _contiguous_true_runs(values: np.ndarray) -> List[Tuple[int, int]]:
+    runs: List[Tuple[int, int]] = []
+    start: int | None = None
+    for index, enabled in enumerate(values.astype(bool).tolist()):
+        if enabled and start is None:
+            start = index
+        elif not enabled and start is not None:
+            runs.append((start, index))
+            start = None
+    if start is not None:
+        runs.append((start, int(values.shape[0])))
+    return runs
+
+
+def _run_overlapping_box(
+    runs: Sequence[Tuple[int, int]],
+    start: int,
+    end: int,
+    center: int,
+) -> Tuple[int, int] | None:
+    overlapping = [run for run in runs if not (run[1] < start or end < run[0])]
+    if overlapping:
+        return min(run[0] for run in overlapping), max(run[1] for run in overlapping)
+    for run in runs:
+        if run[0] <= center <= run[1]:
+            return run
+    return None
+
+
+def expand_text_line_review_box(
+    box: Sequence[int],
+    shape: Sequence[int],
+    foreground_context_mask: np.ndarray,
+    *,
+    padding: int,
+    min_size: int,
+    child_count: int,
+) -> List[int] | None:
+    height, width = int(shape[0]), int(shape[1])
+    x1, y1, x2, y2 = [int(v) for v in box]
+    box_w = max(1, x2 - x1)
+    box_h = max(1, y2 - y1)
+    if child_count < 2 and box_w < 32:
+        return None
+    if box_w > max(180, int(round(box_h * 10.0))):
+        return None
+    if box_h > 45 or box_w > int(width * 0.55):
+        return None
+
+    cx = int(round((x1 + x2) / 2.0))
+    cy = int(round((y1 + y2) / 2.0))
+    y_margin = max(18, int(round(box_h * 2.0)))
+    search_y1 = max(0, y1 - y_margin)
+    search_y2 = min(height, y2 + y_margin)
+    if search_y2 <= search_y1:
+        return None
+
+    search_band = foreground_context_mask[search_y1:search_y2, :]
+    row_counts = np.count_nonzero(search_band, axis=1)
+    row_threshold = max(5, int(round(width * 0.008)))
+    row_runs = _contiguous_true_runs(row_counts >= row_threshold)
+    local_cy = min(max(cy - search_y1, 0), search_band.shape[0] - 1)
+    row_run = _run_overlapping_box(
+        row_runs,
+        max(0, y1 - search_y1),
+        min(search_band.shape[0] - 1, y2 - search_y1),
+        local_cy,
+    )
+    if row_run is None:
+        line_y1, line_y2 = y1, y2
+    else:
+        line_y1, line_y2 = search_y1 + row_run[0], search_y1 + row_run[1]
+
+    y_pad = max(int(padding), int(round(box_h * 0.8)))
+    line_y1 = max(0, line_y1 - y_pad)
+    line_y2 = min(height, line_y2 + y_pad)
+    if line_y2 <= line_y1:
+        return None
+
+    line_band = foreground_context_mask[line_y1:line_y2, :]
+    col_counts = np.count_nonzero(line_band, axis=0)
+    col_threshold = max(1, int(round((line_y2 - line_y1) * 0.08)))
+    col_active = (col_counts >= col_threshold).astype(np.uint8)
+    close_width = max(18, min(64, int(round(box_h * 2.4))))
+    kernel = np.ones((1, close_width), dtype=np.uint8)
+    col_active = cv2.morphologyEx(col_active.reshape(1, -1), cv2.MORPH_CLOSE, kernel)[0] > 0
+    col_runs = _contiguous_true_runs(col_active)
+    col_run = _run_overlapping_box(col_runs, x1, x2, cx)
+    if col_run is None:
+        return None
+
+    x_pad = max(int(padding), int(round(box_h * 0.8)))
+    review_x1 = max(0, col_run[0] - x_pad)
+    review_x2 = min(width, col_run[1] + x_pad)
+    review_y1 = line_y1
+    review_y2 = line_y2
+
+    if (review_x2 - review_x1) < box_w or (review_y2 - review_y1) < box_h:
+        return None
+    if (review_x2 - review_x1) < int(min_size):
+        extra = int(min_size) - (review_x2 - review_x1)
+        review_x1 = max(0, review_x1 - extra // 2)
+        review_x2 = min(width, review_x2 + extra - extra // 2)
+    if (review_y2 - review_y1) < int(min_size):
+        extra = int(min_size) - (review_y2 - review_y1)
+        review_y1 = max(0, review_y1 - extra // 2)
+        review_y2 = min(height, review_y2 + extra - extra // 2)
+
+    return [int(review_x1), int(review_y1), int(review_x2), int(review_y2)]
+
+
 def crop_box(image: np.ndarray, box: Sequence[int]) -> np.ndarray:
     x1, y1, x2, y2 = [int(v) for v in box]
     if x2 <= x1 or y2 <= y1:
@@ -579,15 +690,31 @@ def apply_vlm_filter(
     decisions: List[Dict[str, Any]] = []
     if debug_dir is not None:
         debug_dir.mkdir(parents=True, exist_ok=True)
+    foreground_context_mask = cv2.bitwise_or(
+        foreground_mask(template_image),
+        foreground_mask(target_image),
+    )
 
     for index, item in enumerate(boxes, start=1):
         box = item.get("box") or [0, 0, 0, 0]
-        review_box = expand_review_box(
+        review_source = "local"
+        review_box = expand_text_line_review_box(
             box,
             target_image.shape[:2],
+            foreground_context_mask,
             padding=crop_padding,
             min_size=review_min_size,
+            child_count=int(item.get("child_count", 1)),
         )
+        if review_box is not None:
+            review_source = "text_line"
+        else:
+            review_box = expand_review_box(
+                box,
+                target_image.shape[:2],
+                padding=crop_padding,
+                min_size=review_min_size,
+            )
         template_crop = crop_box(template_image, review_box)
         target_crop = crop_box(target_image, review_box)
         target_annotated = draw_local_candidate_box(target_crop, box, review_box)
@@ -626,6 +753,7 @@ def apply_vlm_filter(
         record = {
             **dict(item),
             "review_box": review_box,
+            "review_box_source": review_source,
             "vlm_decision": parsed["decision"],
             "vlm_confidence": parsed["confidence"],
             "vlm_reason": parsed["reason"],
