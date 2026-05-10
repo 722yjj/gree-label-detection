@@ -141,6 +141,10 @@ class DetectionService:
             max_tokens=int(
                 os.getenv("DESKTOP_TRADITIONAL_DIFF_MAX_TOKENS", str(GRAPHIC_NUM_PREDICT))
             ),
+            small_text_candidates=_env_bool(
+                "DESKTOP_TRADITIONAL_DIFF_SMALL_TEXT_CANDIDATES",
+                True,
+            ),
             crop_padding=int(os.getenv("DESKTOP_TRADITIONAL_DIFF_CROP_PADDING", "32")),
             review_min_size=int(os.getenv("DESKTOP_TRADITIONAL_DIFF_REVIEW_MIN_SIZE", "128")),
             keep_unknown=_env_bool("DESKTOP_TRADITIONAL_DIFF_KEEP_UNKNOWN", False),

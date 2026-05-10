@@ -104,6 +104,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-boxes", type=int, default=50, help="最多保留差异框")
     parser.add_argument(
+        "--disable-small-text-candidates",
+        action="store_true",
+        help="禁用数值/单位文字行附近的小面积高密度补充候选",
+    )
+    parser.add_argument(
         "--candidate-merge-gap",
         type=int,
         default=18,
@@ -233,6 +238,131 @@ def extract_boxes(
         )
     boxes.sort(key=lambda item: int(item["area"]), reverse=True)
     return boxes[:max_boxes]
+
+
+def _box_intersection_area(box_a: Sequence[int], box_b: Sequence[int]) -> int:
+    ax1, ay1, ax2, ay2 = _box_values(box_a)
+    bx1, by1, bx2, by2 = _box_values(box_b)
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0
+    return int((ix2 - ix1) * (iy2 - iy1))
+
+
+def extract_small_text_candidates(
+    diff_mask: np.ndarray,
+    existing_boxes: Sequence[Dict[str, Any]],
+    foreground_context_mask: np.ndarray,
+    *,
+    ignore_edge_margin: int,
+    normal_min_area: int,
+    max_candidates: int = 8,
+) -> List[Dict[str, Any]]:
+    """Find tiny dense diffs likely to be value/unit text changes."""
+    height, width = diff_mask.shape[:2]
+    count, _, stats, centroids = cv2.connectedComponentsWithStats(diff_mask, 8)
+    boxes: List[Dict[str, Any]] = []
+    for idx in range(1, count):
+        x, y, w, h, area = [int(v) for v in stats[idx]]
+        if ignore_edge_margin > 0 and (
+            x <= ignore_edge_margin
+            or y <= ignore_edge_margin
+            or x + w >= width - ignore_edge_margin
+            or y + h >= height - ignore_edge_margin
+        ):
+            continue
+        if area < 8 or area >= normal_min_area:
+            continue
+        if w < 2 or h < 2 or w > 24 or h > 24:
+            continue
+        density = area / max(1.0, float(w * h))
+        if density < 0.45:
+            continue
+        cx, cy = centroids[idx]
+        if cy < height * 0.25 or cy > height * 0.72:
+            continue
+        if cx < width * 0.35:
+            continue
+
+        box = [x, y, x + w, y + h]
+        if any(_box_intersection_area(box, existing.get("box", [])) > 0 for existing in existing_boxes):
+            continue
+        review_box = expand_text_line_review_box(
+            box,
+            diff_mask.shape[:2],
+            foreground_context_mask,
+            padding=24,
+            min_size=96,
+            child_count=2,
+        )
+        if review_box is None:
+            continue
+        review_w = review_box[2] - review_box[0]
+        review_h = review_box[3] - review_box[1]
+        if review_w < 80 or review_h < 40:
+            continue
+        if any(
+            review_box[0] <= float(existing.get("centroid", [0, 0])[0]) <= review_box[2]
+            and review_box[1] <= float(existing.get("centroid", [0, 0])[1]) <= review_box[3]
+            for existing in existing_boxes
+        ):
+            continue
+
+        boxes.append(
+            {
+                "box": box,
+                "area": area,
+                "density": float(density),
+                "centroid": [float(cx), float(cy)],
+                "source": "micro_text_candidate",
+                "force_text_line_review": True,
+            }
+        )
+
+    boxes.sort(key=lambda item: (int(item["area"]), float(item["density"])), reverse=True)
+    return boxes[:max_candidates]
+
+
+def suppress_duplicate_micro_text_boxes(
+    boxes: Sequence[Dict[str, Any]],
+    standard_boxes: Sequence[Dict[str, Any]],
+    foreground_context_mask: np.ndarray,
+    shape: Sequence[int],
+    *,
+    padding: int,
+    min_size: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    kept: List[Dict[str, Any]] = []
+    suppressed: List[Dict[str, Any]] = []
+    for item in boxes:
+        if item.get("source") != "micro_text_candidate":
+            kept.append(item)
+            continue
+        review_box = expand_text_line_review_box(
+            item.get("box", [0, 0, 0, 0]),
+            shape,
+            foreground_context_mask,
+            padding=padding,
+            min_size=min_size,
+            child_count=2,
+        )
+        duplicate = False
+        if review_box is not None:
+            duplicate = any(
+                review_box[0] <= float(existing.get("centroid", [0, 0])[0]) <= review_box[2]
+                and review_box[1] <= float(existing.get("centroid", [0, 0])[1]) <= review_box[3]
+                for existing in standard_boxes
+            )
+        if duplicate:
+            copied = dict(item)
+            copied["suppressed_reason"] = "same text-line already has a standard candidate"
+            suppressed.append(copied)
+        else:
+            kept.append(item)
+    return kept, suppressed
 
 
 def draw_boxes(image: np.ndarray, boxes: Sequence[Dict[str, Any]]) -> np.ndarray:
@@ -392,6 +522,14 @@ def merge_candidate_boxes(
                 "centroid": [float(cx), float(cy)],
                 "child_count": len(group),
                 "child_boxes": [dict(item) for item in group],
+                "source": (
+                    "micro_text_candidate"
+                    if any(item.get("source") == "micro_text_candidate" for item in group)
+                    else None
+                ),
+                "force_text_line_review": any(
+                    bool(item.get("force_text_line_review")) for item in group
+                ),
             }
         )
 
@@ -567,7 +705,13 @@ def crop_box(image: np.ndarray, box: Sequence[int]) -> np.ndarray:
     return image[y1:y2, x1:x2].copy()
 
 
-def draw_local_candidate_box(crop: np.ndarray, candidate_box: Sequence[int], review_box: Sequence[int]) -> np.ndarray:
+def draw_local_candidate_box(
+    crop: np.ndarray,
+    candidate_box: Sequence[int],
+    review_box: Sequence[int],
+    *,
+    label: bool = True,
+) -> np.ndarray:
     output = crop.copy()
     x1, y1, x2, y2 = _box_values(candidate_box)
     rx1, ry1, _, _ = _box_values(review_box)
@@ -577,15 +721,16 @@ def draw_local_candidate_box(crop: np.ndarray, candidate_box: Sequence[int], rev
         for idx, v in enumerate(local_box)
     ]
     cv2.rectangle(output, (lx1, ly1), (lx2, ly2), (0, 0, 255), 2)
-    cv2.putText(
-        output,
-        "candidate",
-        (lx1, max(18, ly1 - 6)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (0, 0, 255),
-        2,
-    )
+    if label:
+        cv2.putText(
+            output,
+            "candidate",
+            (lx1, max(18, ly1 - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 0, 255),
+            2,
+        )
     return output
 
 
@@ -595,7 +740,17 @@ def build_vlm_filter_prompt(
     template_foreground: float,
     target_foreground: float,
     child_count: int,
+    candidate_source: str | None = None,
 ) -> str:
+    micro_text_note = ""
+    if candidate_source == "micro_text_candidate":
+        micro_text_note = """
+This candidate came from a sensitive small text detector for numbers/units.
+For this candidate, be conservative:
+- Keep only if the surrounding word, number, unit, or superscript/subscript is actually changed.
+- Discard isolated dots, tiny specks, dust, ink blobs, red annotation marks, compression noise, or local edge artifacts, even if visible in only one crop.
+- Do not treat a tiny standalone mark as a real difference unless it changes a readable character, digit, or unit.
+"""
     return f"""You are checking one candidate difference from a product label inspection.
 
 You will see three cropped images:
@@ -609,6 +764,7 @@ This candidate merges {child_count} raw diff component(s).
 Foreground ratios inside the review crops:
 - template: {template_foreground:.4f}
 - target: {target_foreground:.4f}
+{micro_text_note}
 
 Decide whether the red-box candidate region, using its surrounding context, is a real label-content difference.
 
@@ -704,7 +860,11 @@ def apply_vlm_filter(
             foreground_context_mask,
             padding=crop_padding,
             min_size=review_min_size,
-            child_count=int(item.get("child_count", 1)),
+            child_count=(
+                2
+                if item.get("force_text_line_review")
+                else int(item.get("child_count", 1))
+            ),
         )
         if review_box is not None:
             review_source = "text_line"
@@ -717,7 +877,15 @@ def apply_vlm_filter(
             )
         template_crop = crop_box(template_image, review_box)
         target_crop = crop_box(target_image, review_box)
-        target_annotated = draw_local_candidate_box(target_crop, box, review_box)
+        if item.get("source") == "micro_text_candidate":
+            target_annotated = draw_local_candidate_box(
+                target_crop,
+                review_box,
+                review_box,
+                label=False,
+            )
+        else:
+            target_annotated = draw_local_candidate_box(target_crop, box, review_box)
         template_foreground = foreground_ratio(template_crop)
         target_foreground = foreground_ratio(target_crop)
 
@@ -732,6 +900,7 @@ def apply_vlm_filter(
             template_foreground,
             target_foreground,
             int(item.get("child_count", 1)),
+            str(item.get("source") or ""),
         )
         response = client.chat(
             [
@@ -829,7 +998,7 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         tolerance=args.diff_tolerance,
         merge_radius=args.merge_radius,
     )
-    raw_boxes = extract_boxes(
+    standard_raw_boxes = extract_boxes(
         diff_mask,
         min_area=args.min_area,
         min_side=args.min_side,
@@ -837,9 +1006,40 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         ignore_edge_margin=args.ignore_edge_margin,
         max_boxes=args.max_boxes,
     )
+    small_text_boxes: List[Dict[str, Any]] = []
+    small_missing = np.zeros_like(diff_mask)
+    small_extra = np.zeros_like(diff_mask)
+    small_diff_mask = np.zeros_like(diff_mask)
+    if not args.disable_small_text_candidates:
+        small_missing, small_extra, small_diff_mask = tolerant_diff(
+            template_mask,
+            target_mask,
+            tolerance=min(1, int(args.diff_tolerance)),
+            merge_radius=min(3, int(args.merge_radius)),
+        )
+        small_text_boxes = extract_small_text_candidates(
+            small_diff_mask,
+            standard_raw_boxes,
+            cv2.bitwise_or(template_mask, target_mask),
+            ignore_edge_margin=args.ignore_edge_margin,
+            normal_min_area=args.min_area,
+        )
+    raw_boxes = sorted(
+        [*standard_raw_boxes, *small_text_boxes],
+        key=lambda item: int(item.get("area", 0)),
+        reverse=True,
+    )[: args.max_boxes]
     merged_boxes = merge_candidate_boxes(
         raw_boxes,
         gap=args.candidate_merge_gap,
+    )
+    merged_boxes, suppressed_micro_text_boxes = suppress_duplicate_micro_text_boxes(
+        merged_boxes,
+        standard_raw_boxes,
+        cv2.bitwise_or(template_mask, target_mask),
+        target_panel.shape[:2],
+        padding=args.crop_padding,
+        min_size=args.review_min_size,
     )
 
     overlay = make_overlay(target_panel, missing, extra)
@@ -879,6 +1079,7 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
             "missing_from_target_mask": output_dir / "missing_from_target_mask.png",
             "extra_in_target_mask": output_dir / "extra_in_target_mask.png",
             "diff_mask": output_dir / "diff_mask.png",
+            "small_text_diff_mask": output_dir / "small_text_diff_mask.png",
             "diff_overlay": output_dir / "diff_overlay.jpg",
             "target_diff_boxes_scaled": output_dir / "target_diff_boxes_scaled.jpg",
             "comparison_panel": output_dir / "comparison_panel.jpg",
@@ -888,6 +1089,7 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         imwrite(debug_paths["missing_from_target_mask"], missing)
         imwrite(debug_paths["extra_in_target_mask"], extra)
         imwrite(debug_paths["diff_mask"], diff_mask)
+        imwrite(debug_paths["small_text_diff_mask"], small_diff_mask)
         imwrite(debug_paths["diff_overlay"], overlay)
         imwrite(debug_paths["target_diff_boxes_scaled"], boxed)
         imwrite(
@@ -928,6 +1130,7 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
             "min_density": args.min_density,
             "ignore_edge_margin": args.ignore_edge_margin,
             "max_boxes": args.max_boxes,
+            "small_text_candidates": not args.disable_small_text_candidates,
             "candidate_merge_gap": args.candidate_merge_gap,
             "skip_feature_align": args.skip_feature_align,
             "skip_ecc": args.skip_ecc,
@@ -947,6 +1150,9 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
             "extra_in_target": int(np.count_nonzero(extra)),
             "diff": int(np.count_nonzero(diff_mask)),
         },
+        "standard_raw_candidate_box_count": len(standard_raw_boxes),
+        "small_text_candidate_box_count": len(small_text_boxes),
+        "suppressed_micro_text_candidate_box_count": len(suppressed_micro_text_boxes),
         "raw_candidate_box_count": len(raw_boxes),
         "merged_candidate_box_count": len(merged_boxes),
         "candidate_box_count": len(merged_boxes if args.vlm_filter else raw_boxes),
@@ -1004,6 +1210,7 @@ def run_traditional_full_image_diff(
     min_density: float = 0.02,
     ignore_edge_margin: int = 8,
     max_boxes: int = 50,
+    small_text_candidates: bool = True,
     candidate_merge_gap: int = 18,
     vlm_filter: bool = True,
     model: Optional[str] = None,
@@ -1038,6 +1245,7 @@ def run_traditional_full_image_diff(
         min_density=min_density,
         ignore_edge_margin=ignore_edge_margin,
         max_boxes=max_boxes,
+        disable_small_text_candidates=not small_text_candidates,
         candidate_merge_gap=candidate_merge_gap,
         vlm_filter=vlm_filter,
         model=model or OPENAI_COMPATIBLE_MODEL,
