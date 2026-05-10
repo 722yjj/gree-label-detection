@@ -6,6 +6,7 @@ from label_detection.workflows.traditional_full_image_diff import (
     build_vlm_batch_filter_prompt,
     build_vlm_filter_prompt,
     merge_standard_and_micro_candidates_for_vlm,
+    refine_display_box,
     refine_display_boxes,
     scale_boxes,
 )
@@ -100,6 +101,25 @@ def test_refine_display_boxes_expands_and_merges_word_fragment_boxes():
     assert refined[0]["display_box"][0] <= 52
     assert refined[0]["display_box"][2] >= 121
     assert refined[0]["merged_final_box_count"] == 2
+
+
+def test_refine_display_box_leaves_plain_graphic_box_unchanged():
+    mask = np.zeros((120, 240), dtype=np.uint8)
+    mask[45:75, 40:180] = 255
+
+    refined = refine_display_box(
+        {
+            "box": [80, 50, 110, 70],
+            "area": 120,
+            "density": 0.2,
+            "centroid": [95.0, 60.0],
+            "child_count": 1,
+        },
+        mask,
+        mask.shape,
+    )
+
+    assert refined == [80, 50, 110, 70]
 
 
 def test_scale_boxes_preserves_display_box():

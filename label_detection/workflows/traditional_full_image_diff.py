@@ -1078,6 +1078,14 @@ def refine_display_box(
     box_h = max(1, y2 - y1)
     source = str(item.get("source") or "")
     child_count = int(item.get("child_count", 1))
+    is_text_like = (
+        source.startswith("micro_text")
+        or source == "candidate_group"
+        or bool(item.get("force_text_line_review"))
+        or child_count > 1
+    )
+    if not is_text_like:
+        return box
 
     text_line_box = expand_text_line_review_box(
         box,
