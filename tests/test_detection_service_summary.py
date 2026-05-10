@@ -201,3 +201,48 @@ def test_detection_service_defaults_to_traditional_full_image_diff(tmp_path, mon
         "final_result.json",
         "visualization_diff.jpg",
     ]
+
+
+def test_traditional_diff_model_resolves_single_vllm_served_name(monkeypatch):
+    import desktop_app.services.detection_service as detection_service
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"data": [{"id": "qwen3.6-27b-int4"}]}
+
+    monkeypatch.setattr(
+        detection_service,
+        "GRAPHIC_VLM_MODEL",
+        "/home/jnu/models/Qwen3.6-27B-int4-AutoRound",
+    )
+    monkeypatch.delenv("DESKTOP_TRADITIONAL_DIFF_MODEL", raising=False)
+    monkeypatch.setattr(
+        detection_service.requests,
+        "get",
+        lambda *args, **kwargs: FakeResponse(),
+    )
+
+    assert (
+        detection_service._resolve_traditional_diff_model(
+            "http://127.0.0.1:8000/v1",
+            "EMPTY",
+        )
+        == "qwen3.6-27b-int4"
+    )
+
+
+def test_traditional_diff_model_keeps_explicit_desktop_model(monkeypatch):
+    import desktop_app.services.detection_service as detection_service
+
+    monkeypatch.setenv("DESKTOP_TRADITIONAL_DIFF_MODEL", "manual-model")
+
+    assert (
+        detection_service._resolve_traditional_diff_model(
+            "http://127.0.0.1:8000/v1",
+            "EMPTY",
+        )
+        == "manual-model"
+    )

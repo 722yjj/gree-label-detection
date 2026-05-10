@@ -30,34 +30,40 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
+def _list_openai_compatible_models(api_base: str, api_key: str) -> list[str]:
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    response = requests.get(
+        f"{api_base.rstrip('/')}/models",
+        headers=headers,
+        timeout=2,
+    )
+    response.raise_for_status()
+    return [
+        str(item.get("id") or "").strip()
+        for item in response.json().get("data", [])
+        if str(item.get("id") or "").strip()
+    ]
+
+
 def _resolve_traditional_diff_model(api_base: str, api_key: str) -> str:
     explicit_model = os.getenv("DESKTOP_TRADITIONAL_DIFF_MODEL")
     if explicit_model:
         return explicit_model.strip()
-    if os.getenv("GRAPHIC_VLM_MODEL") or os.getenv("OPENAI_COMPATIBLE_MODEL") or os.getenv("VLLM_MODEL"):
-        return GRAPHIC_VLM_MODEL
 
+    configured_model = GRAPHIC_VLM_MODEL
     try:
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        response = requests.get(
-            f"{api_base.rstrip('/')}/models",
-            headers=headers,
-            timeout=2,
-        )
-        response.raise_for_status()
-        names = [
-            str(item.get("id") or "").strip()
-            for item in response.json().get("data", [])
-            if str(item.get("id") or "").strip()
-        ]
+        names = _list_openai_compatible_models(api_base, api_key)
         if len(names) == 1:
-            return names[0]
+            if configured_model.startswith("/") or configured_model not in names:
+                return names[0]
+        if configured_model in names:
+            return configured_model
     except requests.RequestException:
         pass
 
-    return GRAPHIC_VLM_MODEL
+    return configured_model
 
 
 class DetectionService:
