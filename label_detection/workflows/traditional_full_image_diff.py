@@ -288,7 +288,7 @@ def extract_small_text_candidates(
     """Find tiny dense diffs likely to be value/unit text changes."""
     height, width = diff_mask.shape[:2]
     count, _, stats, centroids = cv2.connectedComponentsWithStats(diff_mask, 8)
-    components: List[Dict[str, Any]] = []
+    boxes: List[Dict[str, Any]] = []
     for idx in range(1, count):
         x, y, w, h, area = [int(v) for v in stats[idx]]
         if ignore_edge_margin > 0 and (
@@ -344,46 +344,6 @@ def extract_small_text_candidates(
         ):
             continue
 
-        components.append(
-            {
-                "box": box,
-                "area": area,
-                "density": float(density),
-                "centroid": [float(cx), float(cy)],
-                "source": "micro_text_candidate",
-                "force_text_line_review": True,
-                "review_box": review_box,
-            }
-        )
-
-    groups: List[List[Dict[str, Any]]] = []
-    for component in sorted(components, key=lambda item: (item["review_box"][1], item["review_box"][0])):
-        review_box = component["review_box"]
-        match_index: int | None = None
-        for group_index, group in enumerate(groups):
-            group_review = _merge_box_values([item["review_box"] for item in group])
-            intersection = _box_intersection_area(review_box, group_review)
-            smaller_area = min(
-                max(1, (review_box[2] - review_box[0]) * (review_box[3] - review_box[1])),
-                max(1, (group_review[2] - group_review[0]) * (group_review[3] - group_review[1])),
-            )
-            if intersection / smaller_area >= 0.35:
-                match_index = group_index
-                break
-        if match_index is None:
-            groups.append([component])
-        else:
-            groups[match_index].append(component)
-
-    boxes: List[Dict[str, Any]] = []
-    for group in groups:
-        component_boxes = [item["box"] for item in group]
-        box = _merge_box_values(component_boxes)
-        review_box = _merge_box_values([item["review_box"] for item in group])
-        area = int(sum(int(item.get("area", 0)) for item in group))
-        density = area / max(1.0, float((box[2] - box[0]) * (box[3] - box[1])))
-        cx = sum(float(item["centroid"][0]) * int(item["area"]) for item in group) / max(1, area)
-        cy = sum(float(item["centroid"][1]) * int(item["area"]) for item in group) / max(1, area)
         boxes.append(
             {
                 "box": box,
@@ -393,12 +353,10 @@ def extract_small_text_candidates(
                 "source": "micro_text_candidate",
                 "force_text_line_review": True,
                 "review_box": review_box,
-                "child_count": len(group),
-                "child_boxes": [dict(item) for item in group],
             }
         )
 
-    boxes.sort(key=lambda item: (int(item["area"]), int(item.get("child_count", 1))), reverse=True)
+    boxes.sort(key=lambda item: (int(item["area"]), float(item["density"])), reverse=True)
     return boxes[:max_candidates]
 
 
@@ -413,12 +371,32 @@ def suppress_duplicate_micro_text_boxes(
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     kept: List[Dict[str, Any]] = []
     suppressed: List[Dict[str, Any]] = []
+    standard_review_boxes: List[Tuple[Dict[str, Any], List[int] | None]] = []
+    for existing in standard_boxes:
+        existing_box = existing.get("box") or [0, 0, 0, 0]
+        standard_review_boxes.append(
+            (
+                dict(existing),
+                expand_text_line_review_box(
+                    existing_box,
+                    shape,
+                    foreground_context_mask,
+                    padding=padding,
+                    min_size=min_size,
+                    child_count=int(existing.get("child_count", 1)),
+                ),
+            )
+        )
     for item in boxes:
         if item.get("source") != "micro_text_candidate":
             kept.append(item)
             continue
+        item_box = item.get("box", [0, 0, 0, 0])
+        item_centroid = item.get("centroid", [0, 0])
+        item_cx = float(item_centroid[0])
+        item_cy = float(item_centroid[1])
         review_box = expand_text_line_review_box(
-            item.get("box", [0, 0, 0, 0]),
+            item_box,
             shape,
             foreground_context_mask,
             padding=padding,
@@ -431,6 +409,19 @@ def suppress_duplicate_micro_text_boxes(
             duplicate = any(
                 review_box[0] <= float(existing.get("centroid", [0, 0])[0]) <= review_box[2]
                 and review_box[1] <= float(existing.get("centroid", [0, 0])[1]) <= review_box[3]
+                for existing in standard_boxes
+            )
+        if not duplicate:
+            duplicate = any(
+                standard_review is not None
+                and standard_review[0] <= item_cx <= standard_review[2]
+                and standard_review[1] <= item_cy <= standard_review[3]
+                for _, standard_review in standard_review_boxes
+            )
+        if not duplicate:
+            duplicate = any(
+                _vertical_overlap_ratio(item_box, existing.get("box", [0, 0, 0, 0])) >= 0.45
+                and _horizontal_gap(item_box, existing.get("box", [0, 0, 0, 0])) <= max(32, padding * 3)
                 for existing in standard_boxes
             )
         if duplicate:
@@ -670,31 +661,33 @@ def group_micro_candidates_for_vlm(
         return []
 
     height, width = int(image_shape[0]), int(image_shape[1])
-    max_group_width = max(160, int(width * 0.70))
-    max_group_height = max(110, int(height * 0.35))
+    max_group_width = max(120, int(width * 0.28))
+    max_group_height = max(48, int(height * 0.16))
+    max_row_center_delta = max(18, int(height * 0.05))
     groups: List[List[Dict[str, Any]]] = []
 
     def sort_key(item: Dict[str, Any]) -> Tuple[float, float]:
-        review_box = item.get("review_box") or item.get("box", [0, 0, 0, 0])
-        x1, y1, x2, y2 = _box_values(review_box)
+        x1, y1, x2, y2 = _box_values(item.get("box", [0, 0, 0, 0]))
         return ((y1 + y2) / 2.0, float(x1))
 
     for item in sorted(micro_boxes, key=sort_key):
-        item_review = item.get("review_box") or item.get("box", [0, 0, 0, 0])
+        item_box = item.get("box", [0, 0, 0, 0])
+        _, iy1, _, iy2 = _box_values(item_box)
+        item_center_y = (iy1 + iy2) / 2.0
         best_index: int | None = None
         best_gap: int | None = None
         for group_index, group in enumerate(groups):
-            group_review = _merge_box_values(
-                [member.get("review_box") or member.get("box", [0, 0, 0, 0]) for member in group]
-            )
-            merged_review = _merge_box_values([group_review, item_review])
-            merged_width = merged_review[2] - merged_review[0]
-            merged_height = merged_review[3] - merged_review[1]
+            group_box = _merge_box_values([member.get("box", [0, 0, 0, 0]) for member in group])
+            _, gy1, _, gy2 = _box_values(group_box)
+            group_center_y = (gy1 + gy2) / 2.0
+            merged_box = _merge_box_values([group_box, item_box])
+            merged_width = merged_box[2] - merged_box[0]
+            merged_height = merged_box[3] - merged_box[1]
             if merged_width > max_group_width or merged_height > max_group_height:
                 continue
-            if _vertical_overlap_ratio(item_review, group_review) < 0.25:
+            if abs(item_center_y - group_center_y) > max_row_center_delta and _vertical_overlap_ratio(item_box, group_box) < 0.20:
                 continue
-            gap = _horizontal_gap(item_review, group_review)
+            gap = _horizontal_gap(item_box, group_box)
             if gap > max_horizontal_gap:
                 continue
             if best_gap is None or gap < best_gap:
@@ -895,7 +888,7 @@ def draw_local_candidate_box(
     candidate_box: Sequence[int],
     review_box: Sequence[int],
     *,
-    label: bool = True,
+    label: bool = False,
 ) -> np.ndarray:
     output = crop.copy()
     x1, y1, x2, y2 = _box_values(candidate_box)
@@ -1327,7 +1320,12 @@ def apply_vlm_filter(
                 label=False,
             )
         else:
-            target_annotated = draw_local_candidate_box(target_crop, box, review_box)
+            target_annotated = draw_local_candidate_box(
+                target_crop,
+                box,
+                review_box,
+                label=False,
+            )
         if item.get("source") == "micro_text_candidate":
             template_crop = upscale_micro_crop(template_crop)
             target_crop = upscale_micro_crop(target_crop)
@@ -1479,12 +1477,8 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         standard_raw_boxes,
         gap=args.candidate_merge_gap,
     )
-    micro_merged_boxes = merge_candidate_boxes(
+    micro_review_candidates, suppressed_micro_text_boxes = suppress_duplicate_micro_text_boxes(
         small_text_boxes,
-        gap=args.candidate_merge_gap,
-    )
-    micro_merged_boxes, suppressed_micro_text_boxes = suppress_duplicate_micro_text_boxes(
-        micro_merged_boxes,
         standard_raw_boxes,
         cv2.bitwise_or(template_mask, target_mask),
         target_panel.shape[:2],
@@ -1492,7 +1486,7 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         min_size=args.review_min_size,
     )
     micro_review_boxes = group_micro_candidates_for_vlm(
-        micro_merged_boxes,
+        micro_review_candidates,
         image_shape=target_panel.shape[:2],
     )
     merged_boxes = sorted(
