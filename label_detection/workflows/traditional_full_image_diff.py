@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -252,6 +253,29 @@ def _box_intersection_area(box_a: Sequence[int], box_b: Sequence[int]) -> int:
     return int((ix2 - ix1) * (iy2 - iy1))
 
 
+def _box_area(box: Sequence[int]) -> int:
+    x1, y1, x2, y2 = _box_values(box)
+    return max(0, x2 - x1) * max(0, y2 - y1)
+
+
+def _vertical_overlap_ratio(box_a: Sequence[int], box_b: Sequence[int]) -> float:
+    ax1, ay1, ax2, ay2 = _box_values(box_a)
+    bx1, by1, bx2, by2 = _box_values(box_b)
+    overlap = max(0, min(ay2, by2) - max(ay1, by1))
+    smaller_height = max(1, min(ay2 - ay1, by2 - by1))
+    return overlap / float(smaller_height)
+
+
+def _horizontal_gap(box_a: Sequence[int], box_b: Sequence[int]) -> int:
+    ax1, _, ax2, _ = _box_values(box_a)
+    bx1, _, bx2, _ = _box_values(box_b)
+    if ax2 < bx1:
+        return bx1 - ax2
+    if bx2 < ax1:
+        return ax1 - bx2
+    return 0
+
+
 def extract_small_text_candidates(
     diff_mask: np.ndarray,
     existing_boxes: Sequence[Dict[str, Any]],
@@ -264,7 +288,7 @@ def extract_small_text_candidates(
     """Find tiny dense diffs likely to be value/unit text changes."""
     height, width = diff_mask.shape[:2]
     count, _, stats, centroids = cv2.connectedComponentsWithStats(diff_mask, 8)
-    boxes: List[Dict[str, Any]] = []
+    components: List[Dict[str, Any]] = []
     for idx in range(1, count):
         x, y, w, h, area = [int(v) for v in stats[idx]]
         if ignore_edge_margin > 0 and (
@@ -302,6 +326,15 @@ def extract_small_text_candidates(
             continue
         review_w = review_box[2] - review_box[0]
         review_h = review_box[3] - review_box[1]
+        if review_w > int(width * 0.45):
+            review_box = expand_review_box(
+                box,
+                diff_mask.shape[:2],
+                padding=24,
+                min_size=96,
+            )
+            review_w = review_box[2] - review_box[0]
+            review_h = review_box[3] - review_box[1]
         if review_w < 80 or review_h < 40:
             continue
         if any(
@@ -311,6 +344,46 @@ def extract_small_text_candidates(
         ):
             continue
 
+        components.append(
+            {
+                "box": box,
+                "area": area,
+                "density": float(density),
+                "centroid": [float(cx), float(cy)],
+                "source": "micro_text_candidate",
+                "force_text_line_review": True,
+                "review_box": review_box,
+            }
+        )
+
+    groups: List[List[Dict[str, Any]]] = []
+    for component in sorted(components, key=lambda item: (item["review_box"][1], item["review_box"][0])):
+        review_box = component["review_box"]
+        match_index: int | None = None
+        for group_index, group in enumerate(groups):
+            group_review = _merge_box_values([item["review_box"] for item in group])
+            intersection = _box_intersection_area(review_box, group_review)
+            smaller_area = min(
+                max(1, (review_box[2] - review_box[0]) * (review_box[3] - review_box[1])),
+                max(1, (group_review[2] - group_review[0]) * (group_review[3] - group_review[1])),
+            )
+            if intersection / smaller_area >= 0.35:
+                match_index = group_index
+                break
+        if match_index is None:
+            groups.append([component])
+        else:
+            groups[match_index].append(component)
+
+    boxes: List[Dict[str, Any]] = []
+    for group in groups:
+        component_boxes = [item["box"] for item in group]
+        box = _merge_box_values(component_boxes)
+        review_box = _merge_box_values([item["review_box"] for item in group])
+        area = int(sum(int(item.get("area", 0)) for item in group))
+        density = area / max(1.0, float((box[2] - box[0]) * (box[3] - box[1])))
+        cx = sum(float(item["centroid"][0]) * int(item["area"]) for item in group) / max(1, area)
+        cy = sum(float(item["centroid"][1]) * int(item["area"]) for item in group) / max(1, area)
         boxes.append(
             {
                 "box": box,
@@ -319,10 +392,13 @@ def extract_small_text_candidates(
                 "centroid": [float(cx), float(cy)],
                 "source": "micro_text_candidate",
                 "force_text_line_review": True,
+                "review_box": review_box,
+                "child_count": len(group),
+                "child_boxes": [dict(item) for item in group],
             }
         )
 
-    boxes.sort(key=lambda item: (int(item["area"]), float(item["density"])), reverse=True)
+    boxes.sort(key=lambda item: (int(item["area"]), int(item.get("child_count", 1))), reverse=True)
     return boxes[:max_candidates]
 
 
@@ -349,6 +425,7 @@ def suppress_duplicate_micro_text_boxes(
             min_size=min_size,
             child_count=2,
         )
+        review_box = item.get("review_box") or review_box
         duplicate = False
         if review_box is not None:
             duplicate = any(
@@ -514,27 +591,121 @@ def merge_candidate_boxes(
         else:
             cx = (x1 + x2) / 2.0
             cy = (y1 + y2) / 2.0
-        merged.append(
-            {
-                "box": box,
-                "area": area,
-                "density": float(density),
-                "centroid": [float(cx), float(cy)],
-                "child_count": len(group),
-                "child_boxes": [dict(item) for item in group],
-                "source": (
-                    "micro_text_candidate"
-                    if any(item.get("source") == "micro_text_candidate" for item in group)
-                    else None
-                ),
-                "force_text_line_review": any(
-                    bool(item.get("force_text_line_review")) for item in group
-                ),
-            }
+        source = (
+            "micro_text_candidate"
+            if any(item.get("source") == "micro_text_candidate" for item in group)
+            else None
         )
+        child_count = sum(int(item.get("child_count", 1)) for item in group)
+        record = {
+            "box": box,
+            "area": area,
+            "density": float(density),
+            "centroid": [float(cx), float(cy)],
+            "child_count": child_count,
+            "child_boxes": [dict(item) for item in group],
+            "source": source,
+            "force_text_line_review": any(
+                bool(item.get("force_text_line_review")) for item in group
+            ),
+        }
+        review_boxes = [item["review_box"] for item in group if item.get("review_box")]
+        if source == "micro_text_candidate" and review_boxes:
+            record["review_box"] = _merge_box_values(review_boxes)
+        merged.append(record)
 
     merged.sort(key=lambda item: int(item["area"]), reverse=True)
     return merged
+
+
+def _make_micro_review_group(group: Sequence[Dict[str, Any]], group_id: int) -> Dict[str, Any]:
+    group_boxes = [item.get("box", [0, 0, 0, 0]) for item in group]
+    review_boxes = [
+        item.get("review_box") or item.get("box", [0, 0, 0, 0])
+        for item in group
+    ]
+    box = _merge_box_values(group_boxes)
+    review_box = _merge_box_values(review_boxes)
+    area = int(sum(int(item.get("area", 0)) for item in group))
+    child_count = sum(int(item.get("child_count", 1)) for item in group)
+    if area > 0:
+        cx = sum(float(item.get("centroid", [0, 0])[0]) * int(item.get("area", 0)) for item in group) / area
+        cy = sum(float(item.get("centroid", [0, 0])[1]) * int(item.get("area", 0)) for item in group) / area
+    else:
+        x1, y1, x2, y2 = box
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+
+    sub_candidates: List[Dict[str, Any]] = []
+    for candidate_id, item in enumerate(group, start=1):
+        sub_candidate = dict(item)
+        sub_candidate["candidate_id"] = candidate_id
+        sub_candidate["parent_micro_review_group"] = group_id
+        sub_candidates.append(sub_candidate)
+
+    return {
+        "box": box,
+        "area": area,
+        "density": area / max(1.0, float(_box_area(box))),
+        "centroid": [float(cx), float(cy)],
+        "child_count": child_count,
+        "child_boxes": [dict(item) for item in group],
+        "source": "micro_text_candidate_batch" if len(group) > 1 else "micro_text_candidate",
+        "force_text_line_review": True,
+        "review_box": review_box,
+        "sub_candidates": sub_candidates,
+        "micro_review_group_id": group_id,
+    }
+
+
+def group_micro_candidates_for_vlm(
+    boxes: Sequence[Dict[str, Any]],
+    *,
+    image_shape: Sequence[int],
+    max_horizontal_gap: int = 140,
+) -> List[Dict[str, Any]]:
+    """Pack nearby micro text candidates into one VLM request while keeping sub-boxes."""
+    micro_boxes = [dict(item) for item in boxes if item.get("source") == "micro_text_candidate"]
+    if not micro_boxes:
+        return []
+
+    height, width = int(image_shape[0]), int(image_shape[1])
+    max_group_width = max(160, int(width * 0.70))
+    max_group_height = max(110, int(height * 0.35))
+    groups: List[List[Dict[str, Any]]] = []
+
+    def sort_key(item: Dict[str, Any]) -> Tuple[float, float]:
+        review_box = item.get("review_box") or item.get("box", [0, 0, 0, 0])
+        x1, y1, x2, y2 = _box_values(review_box)
+        return ((y1 + y2) / 2.0, float(x1))
+
+    for item in sorted(micro_boxes, key=sort_key):
+        item_review = item.get("review_box") or item.get("box", [0, 0, 0, 0])
+        best_index: int | None = None
+        best_gap: int | None = None
+        for group_index, group in enumerate(groups):
+            group_review = _merge_box_values(
+                [member.get("review_box") or member.get("box", [0, 0, 0, 0]) for member in group]
+            )
+            merged_review = _merge_box_values([group_review, item_review])
+            merged_width = merged_review[2] - merged_review[0]
+            merged_height = merged_review[3] - merged_review[1]
+            if merged_width > max_group_width or merged_height > max_group_height:
+                continue
+            if _vertical_overlap_ratio(item_review, group_review) < 0.25:
+                continue
+            gap = _horizontal_gap(item_review, group_review)
+            if gap > max_horizontal_gap:
+                continue
+            if best_gap is None or gap < best_gap:
+                best_index = group_index
+                best_gap = gap
+        if best_index is None:
+            groups.append([item])
+        else:
+            groups[best_index].append(item)
+
+    return [_make_micro_review_group(group, group_id=index) for index, group in enumerate(groups, start=1)]
 
 
 def image_to_base64(image: np.ndarray) -> str:
@@ -705,6 +876,20 @@ def crop_box(image: np.ndarray, box: Sequence[int]) -> np.ndarray:
     return image[y1:y2, x1:x2].copy()
 
 
+def upscale_micro_crop(image: np.ndarray) -> np.ndarray:
+    height, width = image.shape[:2]
+    if max(height, width) >= 420 and height >= 180:
+        return image
+    scale_for_width = int(np.ceil(420 / max(1, max(height, width))))
+    scale_for_height = int(np.ceil(220 / max(1, height)))
+    scale = min(4, max(2, scale_for_width, scale_for_height))
+    return cv2.resize(
+        image,
+        (int(width * scale), int(height * scale)),
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+
 def draw_local_candidate_box(
     crop: np.ndarray,
     candidate_box: Sequence[int],
@@ -734,6 +919,45 @@ def draw_local_candidate_box(
     return output
 
 
+def draw_local_candidate_boxes(
+    crop: np.ndarray,
+    candidates: Sequence[Dict[str, Any]],
+    review_box: Sequence[int],
+) -> np.ndarray:
+    output = crop.copy()
+    rx1, ry1, _, _ = _box_values(review_box)
+    for fallback_id, candidate in enumerate(candidates, start=1):
+        candidate_id = int(candidate.get("candidate_id", fallback_id))
+        x1, y1, x2, y2 = _box_values(candidate.get("box", [0, 0, 0, 0]))
+        local_box = [x1 - rx1, y1 - ry1, x2 - rx1, y2 - ry1]
+        lx1, ly1, lx2, ly2 = [
+            min(max(int(v), 0), output.shape[1 if idx % 2 == 0 else 0] - 1)
+            for idx, v in enumerate(local_box)
+        ]
+        cv2.rectangle(output, (lx1, ly1), (lx2, ly2), (0, 0, 255), 2)
+        label = str(candidate_id)
+        label_origin = (lx1, max(16, ly1 - 5))
+        cv2.putText(
+            output,
+            label,
+            label_origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            4,
+        )
+        cv2.putText(
+            output,
+            label,
+            label_origin,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 0, 255),
+            2,
+        )
+    return output
+
+
 def build_vlm_filter_prompt(
     box: Sequence[int],
     review_box: Sequence[int],
@@ -748,6 +972,7 @@ def build_vlm_filter_prompt(
 This candidate came from a sensitive small text detector for numbers/units.
 For this candidate, be conservative:
 - Keep only if the surrounding word, number, unit, or superscript/subscript is actually changed.
+- Pay special attention to compact units such as m³/h, m3/h, kW, Hz, kg, and dB(A). A changed, missing, extra, flattened, or malformed superscript/subscript digit is a real content difference.
 - Discard isolated dots, tiny specks, dust, ink blobs, red annotation marks, compression noise, or local edge artifacts, even if visible in only one crop.
 - Do not treat a tiny standalone mark as a real difference unless it changes a readable character, digit, or unit.
 """
@@ -792,6 +1017,53 @@ Output exactly one JSON object and nothing else:
 """
 
 
+def build_vlm_batch_filter_prompt(
+    review_box: Sequence[int],
+    candidates: Sequence[Dict[str, Any]],
+    template_foreground: float,
+    target_foreground: float,
+) -> str:
+    candidate_lines = "\n".join(
+        f"- candidate {int(item.get('candidate_id', index))}: box {list(item.get('box', []))}, "
+        f"raw components {int(item.get('child_count', 1))}"
+        for index, item in enumerate(candidates, start=1)
+    )
+    return f"""You are checking several tiny candidate differences from one product label region.
+
+You will see three cropped images:
+- Image 1 is the template review crop.
+- Image 2 is the target review crop.
+- Image 3 is the target review crop with multiple candidate regions marked by red numbered boxes.
+
+The larger review crop box on the comparison image is {list(review_box)}.
+Candidate boxes on the comparison image:
+{candidate_lines}
+Foreground ratios inside the review crops:
+- template: {template_foreground:.4f}
+- target: {target_foreground:.4f}
+
+These candidates came from a sensitive small text detector for numbers/units.
+For each numbered red box, decide whether it marks a real label-content difference.
+
+Keep only candidate IDs that are real content differences:
+- changed word, character, number, model, date, barcode value, or unit
+- missing, extra, flattened, or malformed superscript/subscript digit
+- compact unit differences such as m³/h, m3/h, kW, Hz, kg, or dB(A)
+
+Discard candidate IDs that are only:
+- isolated dots, tiny specks, dust, ink blobs, red annotation marks, compression noise, or local edge artifacts
+- blur, exposure, shadow, antialiasing, line thickness, ink darkness, or alignment residue
+
+Important:
+- Use the surrounding context in the review crop. A red box may cover only changed pixels, not the complete word.
+- If exactly one small part of a unit or word is missing or changed, include only that candidate ID.
+- If no numbered candidate is a real content difference, output discard and an empty kept_candidate_ids list.
+
+Output exactly one JSON object and nothing else:
+{{"decision":"keep|discard|unknown","kept_candidate_ids":[1],"confidence":0.0,"reason":"short reason"}}
+"""
+
+
 def normalize_vlm_filter_response(payload: Dict[str, Any] | None) -> Dict[str, Any]:
     if payload is None:
         return {
@@ -811,6 +1083,61 @@ def normalize_vlm_filter_response(payload: Dict[str, Any] | None) -> Dict[str, A
         "confidence": max(0.0, min(1.0, confidence)),
         "reason": str(payload.get("reason") or ""),
     }
+
+
+def _candidate_ids_from_value(value: Any, valid_ids: Sequence[int]) -> List[int]:
+    valid_set = {int(item) for item in valid_ids}
+    if value is None:
+        return []
+    if isinstance(value, (int, float)):
+        values = [int(value)]
+    elif isinstance(value, str):
+        values = [int(match) for match in re.findall(r"\d+", value)]
+    elif isinstance(value, dict):
+        values = []
+        for key, item_value in value.items():
+            if isinstance(item_value, bool) and item_value:
+                values.extend(_candidate_ids_from_value(key, valid_ids))
+            else:
+                values.extend(_candidate_ids_from_value(item_value, valid_ids))
+    elif isinstance(value, (list, tuple, set)):
+        values = []
+        for item in value:
+            values.extend(_candidate_ids_from_value(item, valid_ids))
+    else:
+        return []
+    deduped: List[int] = []
+    for item in values:
+        if item in valid_set and item not in deduped:
+            deduped.append(item)
+    return deduped
+
+
+def normalize_vlm_batch_filter_response(
+    payload: Dict[str, Any] | None,
+    valid_ids: Sequence[int],
+) -> Dict[str, Any]:
+    normalized = normalize_vlm_filter_response(payload)
+    if payload is None:
+        return {**normalized, "kept_candidate_ids": []}
+    id_keys = (
+        "kept_candidate_ids",
+        "keep_candidate_ids",
+        "changed_candidate_ids",
+        "candidate_ids",
+        "kept_ids",
+        "changed_ids",
+    )
+    kept_ids: List[int] = []
+    for key in id_keys:
+        kept_ids = _candidate_ids_from_value(payload.get(key), valid_ids)
+        if kept_ids:
+            break
+    if kept_ids and normalized["decision"] == "discard":
+        normalized["decision"] = "keep"
+    if normalized["decision"] == "discard":
+        kept_ids = []
+    return {**normalized, "kept_candidate_ids": kept_ids}
 
 
 def foreground_ratio(image: np.ndarray) -> float:
@@ -853,6 +1180,120 @@ def apply_vlm_filter(
 
     for index, item in enumerate(boxes, start=1):
         box = item.get("box") or [0, 0, 0, 0]
+        if item.get("source") == "micro_text_candidate_batch":
+            review_box = item.get("review_box") or expand_review_box(
+                box,
+                target_image.shape[:2],
+                padding=crop_padding,
+                min_size=review_min_size,
+            )
+            sub_candidates = [
+                dict(candidate)
+                for candidate in item.get("sub_candidates", [])
+                if candidate.get("box") is not None
+            ]
+            if not sub_candidates:
+                sub_candidates = [
+                    {**dict(item), "candidate_id": 1, "source": "micro_text_candidate"}
+                ]
+            for candidate_id, candidate in enumerate(sub_candidates, start=1):
+                candidate.setdefault("candidate_id", candidate_id)
+
+            template_crop = crop_box(template_image, review_box)
+            target_crop = crop_box(target_image, review_box)
+            target_annotated = draw_local_candidate_boxes(
+                target_crop,
+                sub_candidates,
+                review_box,
+            )
+            template_crop = upscale_micro_crop(template_crop)
+            target_crop = upscale_micro_crop(target_crop)
+            target_annotated = upscale_micro_crop(target_annotated)
+            template_foreground = foreground_ratio(template_crop)
+            target_foreground = foreground_ratio(target_crop)
+            foreground_presence_signal = (
+                min(template_foreground, target_foreground) < 0.01
+                and max(template_foreground, target_foreground) >= 0.03
+            )
+            prompt = build_vlm_batch_filter_prompt(
+                review_box,
+                sub_candidates,
+                template_foreground,
+                target_foreground,
+            )
+            response = client.chat(
+                [
+                    {
+                        "role": "user",
+                        "content": prompt,
+                        "images": [
+                            image_to_base64(template_crop),
+                            image_to_base64(target_crop),
+                            image_to_base64(target_annotated),
+                        ],
+                    }
+                ],
+                json_mode=True,
+                timeout=timeout,
+                num_predict=max_tokens,
+            )
+            valid_ids = [int(candidate.get("candidate_id", 0)) for candidate in sub_candidates]
+            parsed = normalize_vlm_batch_filter_response(
+                extract_json_object(response.content),
+                valid_ids,
+            )
+            record = {
+                **dict(item),
+                "review_box": review_box,
+                "review_box_source": "micro_batch",
+                "vlm_decision": parsed["decision"],
+                "kept_candidate_ids": parsed["kept_candidate_ids"],
+                "vlm_confidence": parsed["confidence"],
+                "vlm_reason": parsed["reason"],
+                "filter_source": "vlm",
+                "template_foreground_ratio": template_foreground,
+                "target_foreground_ratio": target_foreground,
+                "foreground_presence_signal": foreground_presence_signal,
+                "raw_response": response.content,
+            }
+            decisions.append(record)
+            kept_ids = set(parsed["kept_candidate_ids"])
+            if kept_ids:
+                for candidate in sub_candidates:
+                    if int(candidate.get("candidate_id", 0)) not in kept_ids:
+                        continue
+                    kept_record = {
+                        **dict(candidate),
+                        "review_box": review_box,
+                        "review_box_source": "micro_batch",
+                        "vlm_decision": "keep",
+                        "vlm_confidence": parsed["confidence"],
+                        "vlm_reason": parsed["reason"],
+                        "filter_source": "vlm",
+                        "parent_micro_review_group": item.get("micro_review_group_id"),
+                        "parent_micro_review_box": review_box,
+                        "template_foreground_ratio": template_foreground,
+                        "target_foreground_ratio": target_foreground,
+                        "foreground_presence_signal": foreground_presence_signal,
+                    }
+                    kept.append(kept_record)
+            elif parsed["decision"] == "keep" or (
+                keep_unknown and parsed["decision"] == "unknown"
+            ):
+                fallback_record = dict(record)
+                fallback_record["batch_id_fallback"] = True
+                kept.append(fallback_record)
+
+            if debug_dir is not None:
+                imwrite(debug_dir / f"candidate_{index:02d}_template.jpg", template_crop)
+                imwrite(debug_dir / f"candidate_{index:02d}_target.jpg", target_crop)
+                imwrite(debug_dir / f"candidate_{index:02d}_target_marked.jpg", target_annotated)
+                (debug_dir / f"candidate_{index:02d}.json").write_text(
+                    json.dumps(record, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            continue
+
         review_source = "local"
         review_box = expand_text_line_review_box(
             box,
@@ -866,6 +1307,7 @@ def apply_vlm_filter(
                 else int(item.get("child_count", 1))
             ),
         )
+        review_box = item.get("review_box") or review_box
         if review_box is not None:
             review_source = "text_line"
         else:
@@ -880,12 +1322,16 @@ def apply_vlm_filter(
         if item.get("source") == "micro_text_candidate":
             target_annotated = draw_local_candidate_box(
                 target_crop,
-                review_box,
+                box,
                 review_box,
                 label=False,
             )
         else:
             target_annotated = draw_local_candidate_box(target_crop, box, review_box)
+        if item.get("source") == "micro_text_candidate":
+            template_crop = upscale_micro_crop(template_crop)
+            target_crop = upscale_micro_crop(target_crop)
+            target_annotated = upscale_micro_crop(target_annotated)
         template_foreground = foreground_ratio(template_crop)
         target_foreground = foreground_ratio(target_crop)
 
@@ -1029,18 +1475,31 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         key=lambda item: int(item.get("area", 0)),
         reverse=True,
     )[: args.max_boxes]
-    merged_boxes = merge_candidate_boxes(
-        raw_boxes,
+    standard_merged_boxes = merge_candidate_boxes(
+        standard_raw_boxes,
         gap=args.candidate_merge_gap,
     )
-    merged_boxes, suppressed_micro_text_boxes = suppress_duplicate_micro_text_boxes(
-        merged_boxes,
+    micro_merged_boxes = merge_candidate_boxes(
+        small_text_boxes,
+        gap=args.candidate_merge_gap,
+    )
+    micro_merged_boxes, suppressed_micro_text_boxes = suppress_duplicate_micro_text_boxes(
+        micro_merged_boxes,
         standard_raw_boxes,
         cv2.bitwise_or(template_mask, target_mask),
         target_panel.shape[:2],
         padding=args.crop_padding,
         min_size=args.review_min_size,
     )
+    micro_review_boxes = group_micro_candidates_for_vlm(
+        micro_merged_boxes,
+        image_shape=target_panel.shape[:2],
+    )
+    merged_boxes = sorted(
+        [*standard_merged_boxes, *micro_review_boxes],
+        key=lambda item: int(item.get("area", 0)),
+        reverse=True,
+    )[: args.max_boxes]
 
     overlay = make_overlay(target_panel, missing, extra)
     boxed = draw_boxes(target_panel, merged_boxes if args.vlm_filter else raw_boxes)
@@ -1153,9 +1612,11 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         "standard_raw_candidate_box_count": len(standard_raw_boxes),
         "small_text_candidate_box_count": len(small_text_boxes),
         "suppressed_micro_text_candidate_box_count": len(suppressed_micro_text_boxes),
+        "micro_text_review_group_count": len(micro_review_boxes),
         "raw_candidate_box_count": len(raw_boxes),
         "merged_candidate_box_count": len(merged_boxes),
         "candidate_box_count": len(merged_boxes if args.vlm_filter else raw_boxes),
+        "vlm_request_count": len(vlm_decisions),
         "final_box_count": len(final_boxes_scaled),
         "diff_box_count": len(final_boxes_scaled),
         "raw_candidate_boxes_scaled": raw_boxes,
