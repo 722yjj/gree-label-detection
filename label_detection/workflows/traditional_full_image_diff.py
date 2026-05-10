@@ -258,6 +258,33 @@ def _box_area(box: Sequence[int]) -> int:
     return max(0, x2 - x1) * max(0, y2 - y1)
 
 
+def _clip_box(box: Sequence[int], shape: Sequence[int]) -> List[int]:
+    height, width = int(shape[0]), int(shape[1])
+    x1, y1, x2, y2 = _box_values(box)
+    x1 = min(max(x1, 0), max(0, width - 1))
+    y1 = min(max(y1, 0), max(0, height - 1))
+    x2 = min(max(x2, x1 + 1), width)
+    y2 = min(max(y2, y1 + 1), height)
+    return [x1, y1, x2, y2]
+
+
+def _box_center(box: Sequence[int]) -> Tuple[float, float]:
+    x1, y1, x2, y2 = _box_values(box)
+    return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+
+def _box_overlap_ratio(box_a: Sequence[int], box_b: Sequence[int]) -> float:
+    smaller_area = min(_box_area(box_a), _box_area(box_b))
+    if smaller_area <= 0:
+        return 0.0
+    return _box_intersection_area(box_a, box_b) / float(smaller_area)
+
+
+def _point_inside_box(point: Tuple[float, float], box: Sequence[int]) -> bool:
+    x1, y1, x2, y2 = _box_values(box)
+    return x1 <= point[0] <= x2 and y1 <= point[1] <= y2
+
+
 def _vertical_overlap_ratio(box_a: Sequence[int], box_b: Sequence[int]) -> float:
     ax1, ay1, ax2, ay2 = _box_values(box_a)
     bx1, by1, bx2, by2 = _box_values(box_b)
@@ -433,10 +460,18 @@ def suppress_duplicate_micro_text_boxes(
     return kept, suppressed
 
 
-def draw_boxes(image: np.ndarray, boxes: Sequence[Dict[str, Any]]) -> np.ndarray:
+def draw_boxes(
+    image: np.ndarray,
+    boxes: Sequence[Dict[str, Any]],
+    *,
+    box_key: str = "box",
+) -> np.ndarray:
     output = image.copy()
     for index, item in enumerate(boxes, start=1):
-        x1, y1, x2, y2 = [int(v) for v in item["box"]]
+        box = item.get(box_key) or item.get("box")
+        if box is None:
+            continue
+        x1, y1, x2, y2 = [int(v) for v in box]
         cv2.rectangle(output, (x1, y1), (x2, y2), (0, 0, 255), 3)
         cv2.putText(
             output,
@@ -502,6 +537,7 @@ def scale_boxes(
     *,
     scale: float,
     shape: Sequence[int],
+    box_keys: Sequence[str] = ("box",),
 ) -> List[Dict[str, Any]]:
     if scale <= 0:
         scale = 1.0
@@ -509,13 +545,16 @@ def scale_boxes(
     scaled = []
     for item in boxes:
         copied = dict(item)
-        x1, y1, x2, y2 = [int(round(float(v) / scale)) for v in item["box"]]
-        copied["box"] = [
-            min(max(x1, 0), width - 1),
-            min(max(y1, 0), height - 1),
-            min(max(x2, 0), width - 1),
-            min(max(y2, 0), height - 1),
-        ]
+        for key in box_keys:
+            if item.get(key) is None:
+                continue
+            x1, y1, x2, y2 = [int(round(float(v) / scale)) for v in item[key]]
+            copied[key] = [
+                min(max(x1, 0), width - 1),
+                min(max(y1, 0), height - 1),
+                min(max(x2, x1 + 1), width),
+                min(max(y2, y1 + 1), height),
+            ]
         scaled.append(copied)
     return scaled
 
@@ -701,6 +740,172 @@ def group_micro_candidates_for_vlm(
     return [_make_micro_review_group(group, group_id=index) for index, group in enumerate(groups, start=1)]
 
 
+def _review_box_for_vlm_candidate(
+    item: Dict[str, Any],
+    shape: Sequence[int],
+    foreground_context_mask: np.ndarray,
+    *,
+    padding: int,
+    min_size: int,
+) -> List[int]:
+    box = item.get("box") or [0, 0, 0, 0]
+    review_box = item.get("review_box")
+    if review_box is not None:
+        return _clip_box(review_box, shape)
+    text_line_box = expand_text_line_review_box(
+        box,
+        shape,
+        foreground_context_mask,
+        padding=padding,
+        min_size=min_size,
+        child_count=(
+            2
+            if item.get("force_text_line_review")
+            else int(item.get("child_count", 1))
+        ),
+    )
+    if text_line_box is not None:
+        return _clip_box(text_line_box, shape)
+    return expand_review_box(
+        box,
+        shape,
+        padding=padding,
+        min_size=min_size,
+    )
+
+
+def _micro_sub_candidates(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    sub_candidates = [
+        dict(candidate)
+        for candidate in item.get("sub_candidates", [])
+        if candidate.get("box") is not None
+    ]
+    if sub_candidates:
+        return sub_candidates
+    return [dict(item)]
+
+
+def _same_text_line_candidate(
+    candidate_box: Sequence[int],
+    standard_box: Sequence[int],
+    *,
+    max_gap: int,
+) -> bool:
+    if _box_overlap_ratio(candidate_box, standard_box) > 0:
+        return True
+    if _vertical_overlap_ratio(candidate_box, standard_box) < 0.35:
+        return False
+    return _horizontal_gap(candidate_box, standard_box) <= max_gap
+
+
+def _should_absorb_micro_candidate(
+    standard: Dict[str, Any],
+    micro: Dict[str, Any],
+    *,
+    max_gap: int,
+) -> bool:
+    standard_box = standard.get("box", [0, 0, 0, 0])
+    micro_box = micro.get("box", [0, 0, 0, 0])
+    standard_review = standard.get("review_box")
+    micro_review = micro.get("review_box")
+    if standard_review is not None:
+        micro_center = _box_center(micro_box)
+        if _point_inside_box(micro_center, standard_review):
+            return True
+    if micro_review is not None:
+        standard_center = _box_center(standard_box)
+        if _point_inside_box(standard_center, micro_review):
+            return True
+    if standard_review is not None and micro_review is not None:
+        if _box_overlap_ratio(standard_review, micro_review) >= 0.35:
+            return True
+    return _same_text_line_candidate(
+        micro_box,
+        standard_box,
+        max_gap=max_gap,
+    )
+
+
+def merge_standard_and_micro_candidates_for_vlm(
+    standard_boxes: Sequence[Dict[str, Any]],
+    micro_boxes: Sequence[Dict[str, Any]],
+    foreground_context_mask: np.ndarray,
+    shape: Sequence[int],
+    *,
+    padding: int,
+    min_size: int,
+    merge_gap: int,
+) -> List[Dict[str, Any]]:
+    """Absorb same-line micro candidates into standard candidates before VLM review."""
+    prepared_standard: List[Dict[str, Any]] = []
+    for item in standard_boxes:
+        copied = dict(item)
+        copied["review_box"] = _review_box_for_vlm_candidate(
+            copied,
+            shape,
+            foreground_context_mask,
+            padding=padding,
+            min_size=min_size,
+        )
+        prepared_standard.append(copied)
+
+    unabsorbed_micro: List[Dict[str, Any]] = []
+    max_gap = max(32, int(merge_gap) * 3)
+    for micro in micro_boxes:
+        copied_micro = dict(micro)
+        copied_micro["review_box"] = _review_box_for_vlm_candidate(
+            copied_micro,
+            shape,
+            foreground_context_mask,
+            padding=padding,
+            min_size=min_size,
+        )
+        matches = [
+            index
+            for index, standard in enumerate(prepared_standard)
+            if _should_absorb_micro_candidate(standard, copied_micro, max_gap=max_gap)
+        ]
+        if not matches:
+            unabsorbed_micro.append(copied_micro)
+            continue
+
+        standard = prepared_standard[matches[0]]
+        absorbed = list(standard.get("absorbed_micro_candidates") or [])
+        absorbed.append(copied_micro)
+        standard["absorbed_micro_candidates"] = absorbed
+        standard["absorbed_micro_candidate_count"] = len(absorbed)
+        standard["vlm_group_source"] = "standard_with_micro"
+        standard["source"] = standard.get("source") or "candidate_group"
+        standard["review_box"] = _merge_box_values(
+            [standard.get("review_box", standard.get("box", [0, 0, 0, 0])), copied_micro["review_box"]]
+        )
+
+        union_boxes = [standard.get("box", [0, 0, 0, 0])]
+        for candidate in _micro_sub_candidates(copied_micro):
+            candidate_box = candidate.get("box", [0, 0, 0, 0])
+            if _same_text_line_candidate(
+                candidate_box,
+                standard.get("box", [0, 0, 0, 0]),
+                max_gap=max_gap,
+            ):
+                union_boxes.append(candidate_box)
+        if len(union_boxes) > 1:
+            standard["box"] = _merge_box_values(union_boxes)
+            standard["absorbed_micro_boxes_in_output"] = len(union_boxes) - 1
+
+        child_boxes = list(standard.get("child_boxes") or [])
+        child_boxes.extend(_micro_sub_candidates(copied_micro))
+        standard["child_boxes"] = child_boxes
+        standard["child_count"] = max(
+            int(standard.get("child_count", 1)),
+            len(child_boxes),
+        )
+
+    merged = [*prepared_standard, *unabsorbed_micro]
+    merged.sort(key=lambda item: int(item.get("area", 0)), reverse=True)
+    return merged
+
+
 def image_to_base64(image: np.ndarray) -> str:
     ok, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 95])
     if not ok:
@@ -860,6 +1065,175 @@ def expand_text_line_review_box(
         review_y2 = min(height, review_y2 + extra - extra // 2)
 
     return [int(review_x1), int(review_y1), int(review_x2), int(review_y2)]
+
+
+def refine_display_box(
+    item: Dict[str, Any],
+    foreground_context_mask: np.ndarray,
+    shape: Sequence[int],
+) -> List[int]:
+    box = _clip_box(item.get("box", [0, 0, 0, 0]), shape)
+    x1, y1, x2, y2 = box
+    box_w = max(1, x2 - x1)
+    box_h = max(1, y2 - y1)
+    source = str(item.get("source") or "")
+    child_count = int(item.get("child_count", 1))
+
+    text_line_box = expand_text_line_review_box(
+        box,
+        shape,
+        foreground_context_mask,
+        padding=max(8, min(24, box_h)),
+        min_size=max(1, min(96, box_w + 32)),
+        child_count=2 if source.startswith("micro_text") or child_count > 1 else child_count,
+    )
+    if text_line_box is not None:
+        review_box = text_line_box
+    else:
+        review_box = expand_review_box(
+            box,
+            shape,
+            padding=max(8, min(24, max(box_w, box_h) // 2)),
+            min_size=max(32, min(96, max(box_w, box_h) + 24)),
+        )
+
+    rx1, ry1, rx2, ry2 = _clip_box(review_box, shape)
+    crop = foreground_context_mask[ry1:ry2, rx1:rx2]
+    if crop.size == 0 or np.count_nonzero(crop) == 0:
+        return box
+
+    local_x1 = max(0, x1 - rx1)
+    local_y1 = max(0, y1 - ry1)
+    local_x2 = min(crop.shape[1], x2 - rx1)
+    local_y2 = min(crop.shape[0], y2 - ry1)
+    if local_x2 <= local_x1 or local_y2 <= local_y1:
+        return box
+
+    col_counts = np.count_nonzero(crop, axis=0)
+    row_counts = np.count_nonzero(crop, axis=1)
+    row_threshold = max(1, int(round(crop.shape[1] * 0.015)))
+    col_threshold = max(1, int(round(crop.shape[0] * 0.08)))
+    row_runs = _contiguous_true_runs(row_counts >= row_threshold)
+    col_active = (col_counts >= col_threshold).astype(np.uint8)
+    close_width = max(8, min(40, int(round(max(8, box_h) * 1.8))))
+    col_active = cv2.morphologyEx(col_active.reshape(1, -1), cv2.MORPH_CLOSE, np.ones((1, close_width), dtype=np.uint8))[0] > 0
+    col_runs = _contiguous_true_runs(col_active)
+
+    row_run = _run_overlapping_box(
+        row_runs,
+        local_y1,
+        local_y2,
+        int(round((local_y1 + local_y2) / 2.0)),
+    )
+    col_run = _run_overlapping_box(
+        col_runs,
+        local_x1,
+        local_x2,
+        int(round((local_x1 + local_x2) / 2.0)),
+    )
+    if row_run is None or col_run is None:
+        return box
+
+    display = [
+        rx1 + col_run[0],
+        ry1 + row_run[0],
+        rx1 + col_run[1],
+        ry1 + row_run[1],
+    ]
+
+    max_width = max(box_w + 80, int(round(box_w * 3.5)))
+    max_height = max(box_h + 48, int(round(box_h * 3.0)))
+    if (display[2] - display[0]) > max_width or (display[3] - display[1]) > max_height:
+        display = [
+            max(0, x1 - max(4, box_w // 4)),
+            max(0, y1 - max(4, box_h // 3)),
+            min(int(shape[1]), x2 + max(4, box_w // 4)),
+            min(int(shape[0]), y2 + max(4, box_h // 3)),
+        ]
+
+    return _clip_box(display, shape)
+
+
+def refine_display_boxes(
+    boxes: Sequence[Dict[str, Any]],
+    foreground_context_mask: np.ndarray,
+    shape: Sequence[int],
+) -> List[Dict[str, Any]]:
+    refined: List[Dict[str, Any]] = []
+    for item in boxes:
+        copied = dict(item)
+        copied["display_box"] = refine_display_box(copied, foreground_context_mask, shape)
+        refined.append(copied)
+    return merge_overlapping_display_boxes(refined, shape)
+
+
+def _should_merge_display_boxes(box_a: Sequence[int], box_b: Sequence[int]) -> bool:
+    if _box_overlap_ratio(box_a, box_b) >= 0.15:
+        return True
+    return (
+        _vertical_overlap_ratio(box_a, box_b) >= 0.55
+        and _horizontal_gap(box_a, box_b) <= 18
+    )
+
+
+def _merge_display_group(group: Sequence[Dict[str, Any]], shape: Sequence[int]) -> Dict[str, Any]:
+    display_box = _clip_box(
+        _merge_box_values([item.get("display_box") or item.get("box", [0, 0, 0, 0]) for item in group]),
+        shape,
+    )
+    box = _clip_box(
+        _merge_box_values([item.get("box", [0, 0, 0, 0]) for item in group]),
+        shape,
+    )
+    area = int(sum(int(item.get("area", 0)) for item in group))
+    merged = dict(max(group, key=lambda item: int(item.get("area", 0))))
+    merged["box"] = box
+    merged["display_box"] = display_box
+    merged["area"] = area
+    merged["density"] = area / max(1.0, float(_box_area(box)))
+    merged["merged_final_box_count"] = len(group)
+    merged["merged_final_boxes"] = [dict(item) for item in group]
+    merged["child_boxes"] = [
+        child
+        for item in group
+        for child in list(item.get("child_boxes") or [dict(item)])
+    ]
+    merged["child_count"] = len(merged["child_boxes"])
+    return merged
+
+
+def merge_overlapping_display_boxes(
+    boxes: Sequence[Dict[str, Any]],
+    shape: Sequence[int],
+) -> List[Dict[str, Any]]:
+    groups: List[List[Dict[str, Any]]] = []
+    for item in boxes:
+        item_box = item.get("display_box") or item.get("box", [0, 0, 0, 0])
+        matching_indexes = [
+            index
+            for index, group in enumerate(groups)
+            if any(
+                _should_merge_display_boxes(
+                    item_box,
+                    member.get("display_box") or member.get("box", [0, 0, 0, 0]),
+                )
+                for member in group
+            )
+        ]
+        if not matching_indexes:
+            groups.append([item])
+            continue
+        first = matching_indexes[0]
+        groups[first].append(item)
+        for index in reversed(matching_indexes[1:]):
+            groups[first].extend(groups.pop(index))
+
+    merged = [
+        _merge_display_group(group, shape) if len(group) > 1 else dict(group[0])
+        for group in groups
+    ]
+    merged.sort(key=lambda item: int(item.get("area", 0)), reverse=True)
+    return merged
 
 
 def crop_box(image: np.ndarray, box: Sequence[int]) -> np.ndarray:
@@ -1252,24 +1626,24 @@ def apply_vlm_filter(
             decisions.append(record)
             kept_ids = set(parsed["kept_candidate_ids"])
             if kept_ids:
-                for candidate in sub_candidates:
-                    if int(candidate.get("candidate_id", 0)) not in kept_ids:
-                        continue
-                    kept_record = {
-                        **dict(candidate),
-                        "review_box": review_box,
-                        "review_box_source": "micro_batch",
-                        "vlm_decision": "keep",
-                        "vlm_confidence": parsed["confidence"],
-                        "vlm_reason": parsed["reason"],
-                        "filter_source": "vlm",
-                        "parent_micro_review_group": item.get("micro_review_group_id"),
-                        "parent_micro_review_box": review_box,
-                        "template_foreground_ratio": template_foreground,
-                        "target_foreground_ratio": target_foreground,
-                        "foreground_presence_signal": foreground_presence_signal,
-                    }
-                    kept.append(kept_record)
+                kept_candidates = [
+                    dict(candidate)
+                    for candidate in sub_candidates
+                    if int(candidate.get("candidate_id", 0)) in kept_ids
+                ]
+                kept_record = {
+                    **dict(record),
+                    "box": _merge_box_values(
+                        [candidate.get("box", [0, 0, 0, 0]) for candidate in kept_candidates]
+                    ),
+                    "source": "micro_text_candidate_batch",
+                    "child_boxes": kept_candidates,
+                    "child_count": len(kept_candidates),
+                    "vlm_decision": "keep",
+                    "parent_micro_review_box": review_box,
+                    "micro_batch_output": True,
+                }
+                kept.append(kept_record)
             elif parsed["decision"] == "keep" or (
                 keep_unknown and parsed["decision"] == "unknown"
             ):
@@ -1473,6 +1847,7 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         key=lambda item: int(item.get("area", 0)),
         reverse=True,
     )[: args.max_boxes]
+    foreground_context_mask = cv2.bitwise_or(template_mask, target_mask)
     standard_merged_boxes = merge_candidate_boxes(
         standard_raw_boxes,
         gap=args.candidate_merge_gap,
@@ -1480,7 +1855,7 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
     micro_review_candidates, suppressed_micro_text_boxes = suppress_duplicate_micro_text_boxes(
         small_text_boxes,
         standard_raw_boxes,
-        cv2.bitwise_or(template_mask, target_mask),
+        foreground_context_mask,
         target_panel.shape[:2],
         padding=args.crop_padding,
         min_size=args.review_min_size,
@@ -1489,10 +1864,14 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         micro_review_candidates,
         image_shape=target_panel.shape[:2],
     )
-    merged_boxes = sorted(
-        [*standard_merged_boxes, *micro_review_boxes],
-        key=lambda item: int(item.get("area", 0)),
-        reverse=True,
+    merged_boxes = merge_standard_and_micro_candidates_for_vlm(
+        standard_merged_boxes,
+        micro_review_boxes,
+        foreground_context_mask,
+        target_panel.shape[:2],
+        padding=args.crop_padding,
+        min_size=args.review_min_size,
+        merge_gap=args.candidate_merge_gap,
     )[: args.max_boxes]
 
     overlay = make_overlay(target_panel, missing, extra)
@@ -1516,10 +1895,20 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
             skip_model_check=args.skip_model_check,
             debug_dir=debug_dir,
         )
-    aligned_boxes = scale_boxes(final_boxes_scaled, scale=panel_scale, shape=aligned_target.shape[:2])
+    final_boxes_scaled = refine_display_boxes(
+        final_boxes_scaled,
+        foreground_context_mask,
+        target_panel.shape[:2],
+    )
+    aligned_boxes = scale_boxes(
+        final_boxes_scaled,
+        scale=panel_scale,
+        shape=aligned_target.shape[:2],
+        box_keys=("box", "display_box"),
+    )
     raw_candidate_boxes_final = scale_boxes(raw_boxes, scale=panel_scale, shape=aligned_target.shape[:2])
     merged_candidate_boxes_final = scale_boxes(merged_boxes, scale=panel_scale, shape=aligned_target.shape[:2])
-    final_result = draw_boxes(aligned_target, aligned_boxes)
+    final_result = draw_boxes(aligned_target, aligned_boxes, box_key="display_box")
 
     final_result_path = output_dir / "final_result.jpg"
     imwrite(final_result_path, final_result)
