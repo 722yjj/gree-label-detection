@@ -122,6 +122,72 @@ def test_refine_display_box_leaves_plain_graphic_box_unchanged():
     assert refined == [80, 50, 110, 70]
 
 
+def test_refine_display_box_expands_standard_text_line_review_candidate():
+    mask = np.zeros((120, 240), dtype=np.uint8)
+    mask[45:65, 50:150] = 255
+
+    refined = refine_display_box(
+        {
+            "box": [95, 48, 108, 62],
+            "area": 120,
+            "density": 0.6,
+            "centroid": [101.5, 55.0],
+            "child_count": 1,
+            "review_box_source": "text_line",
+        },
+        mask,
+        mask.shape,
+    )
+
+    assert refined[0] <= 52
+    assert refined[2] >= 149
+
+
+def test_refine_display_box_uses_pdf_text_region_gate_for_graphics():
+    mask = np.zeros((140, 260), dtype=np.uint8)
+    mask[45:65, 40:180] = 255
+    text_regions = [{"text": "Model", "box": [10, 10, 90, 30]}]
+
+    refined = refine_display_box(
+        {
+            "box": [80, 50, 110, 70],
+            "area": 120,
+            "density": 0.2,
+            "centroid": [95.0, 60.0],
+            "child_count": 2,
+            "review_box_source": "text_line",
+        },
+        mask,
+        mask.shape,
+        text_regions=text_regions,
+    )
+
+    assert refined == [80, 50, 110, 70]
+
+
+def test_refine_display_box_snaps_to_matching_pdf_text_line():
+    mask = np.zeros((140, 260), dtype=np.uint8)
+    mask[45:65, 40:180] = 255
+    text_regions = [{"text": "Rated Voltage", "box": [38, 42, 182, 68]}]
+
+    refined = refine_display_box(
+        {
+            "box": [94, 49, 108, 61],
+            "area": 120,
+            "density": 0.6,
+            "centroid": [101.0, 55.0],
+            "child_count": 1,
+            "review_box_source": "text_line",
+        },
+        mask,
+        mask.shape,
+        text_regions=text_regions,
+    )
+
+    assert refined[0] <= 42
+    assert refined[2] >= 178
+
+
 def test_scale_boxes_preserves_display_box():
     scaled = scale_boxes(
         [{"box": [10, 20, 30, 40], "display_box": [8, 18, 34, 44]}],

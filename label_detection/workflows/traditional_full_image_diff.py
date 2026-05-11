@@ -27,6 +27,11 @@ from label_detection.core.config import (  # noqa: E402
     PROJECT_ROOT as REPO_ROOT,
     VLM_TIMEOUT,
 )
+from label_detection.extraction.pdf import (  # noqa: E402
+    _load_fitz,
+    _select_page_crop_rect,
+)
+from label_detection.preprocessing.border import find_template_crop_rect  # noqa: E402
 from label_detection.services.openai_compatible_client import OpenAICompatibleHTTPClient  # noqa: E402
 from scripts.experiment_vlm_diff_localization import (  # noqa: E402
     align_target_to_template,
@@ -303,6 +308,206 @@ def _horizontal_gap(box_a: Sequence[int], box_b: Sequence[int]) -> int:
     return 0
 
 
+def _rendered_pdf_box_to_template_box(
+    box: Sequence[float],
+    *,
+    render_crop_box: Sequence[int],
+    scale_x: float,
+    scale_y: float,
+    shape: Sequence[int],
+) -> List[int]:
+    rx1, ry1, _, _ = _box_values(render_crop_box)
+    x1, y1, x2, y2 = [float(value) for value in box]
+    return _clip_box(
+        [
+            int(round((x1 - rx1) * scale_x)),
+            int(round((y1 - ry1) * scale_y)),
+            int(round((x2 - rx1) * scale_x)),
+            int(round((y2 - ry1) * scale_y)),
+        ],
+        shape,
+    )
+
+
+def extract_pdf_text_line_regions(
+    template_path: str | Path,
+    template_image: np.ndarray,
+    *,
+    output_dir: Path | None = None,
+    dpi: int = 300,
+) -> List[Dict[str, Any]]:
+    """Extract reusable line-level text boxes from the template PDF text layer."""
+    pdf_path = Path(template_path)
+    if pdf_path.suffix.lower() != ".pdf" or not pdf_path.exists():
+        return []
+
+    try:
+        fitz = _load_fitz()
+    except ModuleNotFoundError:
+        return []
+
+    zoom = float(dpi) / 72.0
+    regions: List[Dict[str, Any]] = []
+    try:
+        with fitz.open(pdf_path) as doc:
+            if len(doc) == 0:
+                return []
+            page = doc[0]
+            crop_rect_tuple, crop_strategy = _select_page_crop_rect(page)
+            if crop_rect_tuple is None:
+                return []
+            crop_rect = fitz.Rect(*crop_rect_tuple)
+            pix = page.get_pixmap(clip=crop_rect, dpi=dpi)
+            rendered = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                pix.height,
+                pix.width,
+                pix.n,
+            )
+            if pix.n == 4:
+                rendered = cv2.cvtColor(rendered, cv2.COLOR_RGBA2BGR)
+            else:
+                rendered = cv2.cvtColor(rendered, cv2.COLOR_RGB2BGR)
+
+            crop_candidate = find_template_crop_rect(
+                rendered,
+                str(output_dir) if output_dir is not None else tempfile.gettempdir(),
+                "template_pdf_text_regions",
+            )
+            if crop_candidate is None:
+                render_crop_box = [0, 0, rendered.shape[1], rendered.shape[0]]
+            else:
+                x, y, width, height = [int(value) for value in crop_candidate["rect"]]
+                padding = 3 if crop_candidate["strategy"] == "border" else -6
+                render_crop_box = _clip_box(
+                    [
+                        x - padding,
+                        y - padding,
+                        x + width + padding,
+                        y + height + padding,
+                    ],
+                    rendered.shape[:2],
+                )
+
+            rx1, ry1, rx2, ry2 = render_crop_box
+            rendered_crop_width = max(1, rx2 - rx1)
+            rendered_crop_height = max(1, ry2 - ry1)
+            scale_x = template_image.shape[1] / float(rendered_crop_width)
+            scale_y = template_image.shape[0] / float(rendered_crop_height)
+
+            text_dict = page.get_text("dict", clip=crop_rect)
+            for block in text_dict.get("blocks", []):
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines", []):
+                    spans = [
+                        span
+                        for span in line.get("spans", [])
+                        if str(span.get("text", "")).strip()
+                    ]
+                    if not spans:
+                        continue
+                    text = "".join(str(span.get("text", "")) for span in spans).strip()
+                    page_box = [
+                        min(float(span["bbox"][0]) for span in spans),
+                        min(float(span["bbox"][1]) for span in spans),
+                        max(float(span["bbox"][2]) for span in spans),
+                        max(float(span["bbox"][3]) for span in spans),
+                    ]
+                    rendered_box = [
+                        int(round((page_box[0] - crop_rect.x0) * zoom)),
+                        int(round((page_box[1] - crop_rect.y0) * zoom)),
+                        int(round((page_box[2] - crop_rect.x0) * zoom)),
+                        int(round((page_box[3] - crop_rect.y0) * zoom)),
+                    ]
+                    template_box = _rendered_pdf_box_to_template_box(
+                        rendered_box,
+                        render_crop_box=render_crop_box,
+                        scale_x=scale_x,
+                        scale_y=scale_y,
+                        shape=template_image.shape[:2],
+                    )
+                    if _box_area(template_box) <= 0:
+                        continue
+                    regions.append(
+                        {
+                            "text": text,
+                            "box": template_box,
+                            "page_box": page_box,
+                            "rendered_box": rendered_box,
+                            "source": "pdf_text_line",
+                            "crop_strategy": crop_strategy,
+                        }
+                    )
+    except Exception:
+        return []
+
+    regions.sort(key=lambda item: (item["box"][1], item["box"][0]))
+    return regions
+
+
+def scale_pdf_text_regions(
+    regions: Sequence[Dict[str, Any]],
+    *,
+    scale: float,
+    shape: Sequence[int],
+) -> List[Dict[str, Any]]:
+    scaled: List[Dict[str, Any]] = []
+    for item in regions:
+        box = item.get("box")
+        if box is None:
+            continue
+        scaled_item = dict(item)
+        scaled_item["box"] = _clip_box(
+            [
+                int(round(float(box[0]) * scale)),
+                int(round(float(box[1]) * scale)),
+                int(round(float(box[2]) * scale)),
+                int(round(float(box[3]) * scale)),
+            ],
+            shape,
+        )
+        scaled.append(scaled_item)
+    return scaled
+
+
+def candidate_text_line_region(
+    item: Dict[str, Any],
+    text_regions: Sequence[Dict[str, Any]] | None,
+    shape: Sequence[int],
+) -> Dict[str, Any] | None:
+    if not text_regions:
+        return None
+    box = _clip_box(item.get("box", [0, 0, 0, 0]), shape)
+    centroid = item.get("centroid")
+    if centroid is not None and len(centroid) >= 2:
+        point = (float(centroid[0]), float(centroid[1]))
+    else:
+        point = _box_center(box)
+
+    best_region: Dict[str, Any] | None = None
+    best_score = -1.0
+    box_h = max(1, box[3] - box[1])
+    for region in text_regions:
+        region_box = region.get("box")
+        if region_box is None:
+            continue
+        region_box = _clip_box(region_box, shape)
+        if _point_inside_box(point, region_box):
+            score = 10.0 + _box_overlap_ratio(box, region_box)
+        else:
+            overlap = _box_overlap_ratio(box, region_box)
+            if overlap < 0.20 and _vertical_overlap_ratio(box, region_box) < 0.55:
+                continue
+            gap = _horizontal_gap(box, region_box)
+            if gap > max(24, box_h * 2):
+                continue
+            score = overlap + max(0.0, 1.0 - gap / float(max(24, box_h * 2)))
+        if score > best_score:
+            best_score = score
+            best_region = region
+    return best_region
+
+
 def extract_small_text_candidates(
     diff_mask: np.ndarray,
     existing_boxes: Sequence[Dict[str, Any]],
@@ -481,6 +686,30 @@ def draw_boxes(
             0.7,
             (0, 0, 255),
             2,
+        )
+    return output
+
+
+def draw_template_text_regions(
+    image: np.ndarray,
+    regions: Sequence[Dict[str, Any]],
+) -> np.ndarray:
+    output = image.copy()
+    for index, item in enumerate(regions, start=1):
+        box = item.get("box")
+        if box is None:
+            continue
+        x1, y1, x2, y2 = _clip_box(box, image.shape[:2])
+        cv2.rectangle(output, (x1, y1), (x2, y2), (0, 180, 0), 2)
+        cv2.putText(
+            output,
+            f"T{index}",
+            (x1, max(16, y1 - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 150, 0),
+            1,
+            cv2.LINE_AA,
         )
     return output
 
@@ -1071,6 +1300,7 @@ def refine_display_box(
     item: Dict[str, Any],
     foreground_context_mask: np.ndarray,
     shape: Sequence[int],
+    text_regions: Sequence[Dict[str, Any]] | None = None,
 ) -> List[int]:
     box = _clip_box(item.get("box", [0, 0, 0, 0]), shape)
     x1, y1, x2, y2 = box
@@ -1078,23 +1308,46 @@ def refine_display_box(
     box_h = max(1, y2 - y1)
     source = str(item.get("source") or "")
     child_count = int(item.get("child_count", 1))
+    matched_text_region = candidate_text_line_region(item, text_regions, shape)
     is_text_like = (
         source.startswith("micro_text")
         or source == "candidate_group"
         or bool(item.get("force_text_line_review"))
+        or item.get("review_box_source") == "text_line"
         or child_count > 1
+        or matched_text_region is not None
     )
     if not is_text_like:
         return box
 
-    text_line_box = expand_text_line_review_box(
-        box,
-        shape,
-        foreground_context_mask,
-        padding=max(8, min(24, box_h)),
-        min_size=max(1, min(96, box_w + 32)),
-        child_count=2 if source.startswith("micro_text") or child_count > 1 else child_count,
-    )
+    if text_regions and matched_text_region is None:
+        return box
+
+    text_line_box = None
+    if matched_text_region is not None:
+        line_box = _clip_box(matched_text_region.get("box", box), shape)
+        y_pad = max(2, min(8, box_h // 4))
+        text_line_box = _clip_box(
+            [line_box[0], line_box[1] - y_pad, line_box[2], line_box[3] + y_pad],
+            shape,
+        )
+    else:
+        text_line_box = expand_text_line_review_box(
+            box,
+            shape,
+            foreground_context_mask,
+            padding=max(8, min(24, box_h)),
+            min_size=max(1, min(96, box_w + 32)),
+            child_count=(
+                2
+                if (
+                    source.startswith("micro_text")
+                    or child_count > 1
+                    or item.get("review_box_source") == "text_line"
+                )
+                else child_count
+            ),
+        )
     if text_line_box is not None:
         review_box = text_line_box
     else:
@@ -1151,6 +1404,13 @@ def refine_display_box(
 
     max_width = max(box_w + 80, int(round(box_w * 3.5)))
     max_height = max(box_h + 48, int(round(box_h * 3.0)))
+    if matched_text_region is not None:
+        region_box = _clip_box(matched_text_region.get("box", box), shape)
+        max_width = max(max_width, (region_box[2] - region_box[0]) + 8)
+        max_height = max(max_height, (region_box[3] - region_box[1]) + 8)
+    elif item.get("review_box_source") == "text_line":
+        max_width = max(max_width, box_w + 160, int(round(box_w * 8.0)))
+        max_height = max(max_height, box_h + 64, int(round(box_h * 4.0)))
     if (display[2] - display[0]) > max_width or (display[3] - display[1]) > max_height:
         display = [
             max(0, x1 - max(4, box_w // 4)),
@@ -1166,11 +1426,23 @@ def refine_display_boxes(
     boxes: Sequence[Dict[str, Any]],
     foreground_context_mask: np.ndarray,
     shape: Sequence[int],
+    text_regions: Sequence[Dict[str, Any]] | None = None,
 ) -> List[Dict[str, Any]]:
     refined: List[Dict[str, Any]] = []
     for item in boxes:
         copied = dict(item)
-        copied["display_box"] = refine_display_box(copied, foreground_context_mask, shape)
+        matched_region = candidate_text_line_region(copied, text_regions, shape)
+        if matched_region is not None:
+            copied["matched_template_text_line"] = {
+                "text": matched_region.get("text"),
+                "box": matched_region.get("box"),
+            }
+        copied["display_box"] = refine_display_box(
+            copied,
+            foreground_context_mask,
+            shape,
+            text_regions=text_regions,
+        )
         refined.append(copied)
     return merge_overlapping_display_boxes(refined, shape)
 
@@ -1770,6 +2042,12 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         imwrite(output_dir / "template_preprocessed.jpg", template_img)
         imwrite(output_dir / "target_preprocessed.jpg", target_img)
 
+    template_text_regions = extract_pdf_text_line_regions(
+        args.template,
+        template_img,
+        output_dir=preprocess_root if args.save_debug else None,
+    )
+
     aligned_target, alignment = align_target_to_template(
         template_img,
         target_img,
@@ -1784,6 +2062,11 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         template_img,
         aligned_target,
         args.panel_width,
+    )
+    template_text_regions_panel = scale_pdf_text_regions(
+        template_text_regions,
+        scale=panel_scale,
+        shape=template_panel.shape[:2],
     )
 
     template_mask = foreground_mask(template_panel)
@@ -1877,6 +2160,7 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         final_boxes_scaled,
         foreground_context_mask,
         target_panel.shape[:2],
+        text_regions=template_text_regions_panel,
     )
     aligned_boxes = scale_boxes(
         final_boxes_scaled,
@@ -1903,6 +2187,7 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
             "diff_overlay": output_dir / "diff_overlay.jpg",
             "target_diff_boxes_scaled": output_dir / "target_diff_boxes_scaled.jpg",
             "comparison_panel": output_dir / "comparison_panel.jpg",
+            "template_pdf_text_lines": output_dir / "template_pdf_text_lines.jpg",
         }
         imwrite(debug_paths["template_foreground_mask"], template_mask)
         imwrite(debug_paths["target_foreground_mask"], target_mask)
@@ -1912,6 +2197,10 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
         imwrite(debug_paths["small_text_diff_mask"], small_diff_mask)
         imwrite(debug_paths["diff_overlay"], overlay)
         imwrite(debug_paths["target_diff_boxes_scaled"], boxed)
+        imwrite(
+            debug_paths["template_pdf_text_lines"],
+            draw_template_text_regions(template_panel, template_text_regions_panel),
+        )
         imwrite(
             debug_paths["comparison_panel"],
             make_panel(
@@ -1971,6 +2260,8 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
             "diff": int(np.count_nonzero(diff_mask)),
         },
         "standard_raw_candidate_box_count": len(standard_raw_boxes),
+        "template_text_line_region_count": len(template_text_regions_panel),
+        "template_text_line_regions": template_text_regions_panel,
         "small_text_candidate_box_count": len(small_text_boxes),
         "suppressed_micro_text_candidate_box_count": len(suppressed_micro_text_boxes),
         "micro_text_review_group_count": len(micro_review_boxes),
