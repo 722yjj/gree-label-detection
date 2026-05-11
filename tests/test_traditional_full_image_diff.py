@@ -9,6 +9,8 @@ from label_detection.workflows.traditional_full_image_diff import (
     refine_display_box,
     refine_display_boxes,
     scale_boxes,
+    suppress_graphic_reason_for_text_line_candidate,
+    text_line_review_box_from_region,
 )
 
 
@@ -186,6 +188,51 @@ def test_refine_display_box_snaps_to_matching_pdf_text_line():
 
     assert refined[0] <= 42
     assert refined[2] >= 178
+
+
+def test_text_line_review_box_from_region_stays_near_pdf_line():
+    review_box = text_line_review_box_from_region(
+        {
+            "box": [760, 523, 853, 557],
+            "centroid": [813.0, 544.0],
+        },
+        {"text": "600004075219", "box": [647, 536, 857, 565]},
+        (586, 900),
+        padding=32,
+    )
+
+    assert review_box[0] >= 615
+    assert review_box[1] >= 512
+    assert review_box[2] <= 890
+    assert review_box[3] <= 583
+
+
+def test_graphic_reason_is_suppressed_for_pdf_text_line_candidate():
+    parsed = suppress_graphic_reason_for_text_line_candidate(
+        {
+            "decision": "keep",
+            "confidence": 1.0,
+            "reason": "The target image contains a black circle with a white arrow symbol.",
+        },
+        {"text": "600004075219", "box": [647, 536, 857, 565]},
+    )
+
+    assert parsed["decision"] == "discard"
+    assert parsed["original_decision"] == "keep"
+    assert parsed["suppressed_reason"] == "graphic_reason_for_pdf_text_line_candidate"
+
+
+def test_text_reason_is_not_suppressed_for_pdf_text_line_candidate():
+    parsed = suppress_graphic_reason_for_text_line_candidate(
+        {
+            "decision": "keep",
+            "confidence": 1.0,
+            "reason": "The barcode value number is different between template and target.",
+        },
+        {"text": "600004075219", "box": [647, 536, 857, 565]},
+    )
+
+    assert parsed["decision"] == "keep"
 
 
 def test_scale_boxes_preserves_display_box():

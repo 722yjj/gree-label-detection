@@ -508,6 +508,92 @@ def candidate_text_line_region(
     return best_region
 
 
+def text_line_review_box_from_region(
+    item: Dict[str, Any],
+    text_region: Dict[str, Any],
+    shape: Sequence[int],
+    *,
+    padding: int,
+) -> List[int]:
+    line_box = _clip_box(text_region.get("box", item.get("box", [0, 0, 0, 0])), shape)
+    item_box = _clip_box(item.get("box", line_box), shape)
+    line_h = max(1, line_box[3] - line_box[1])
+    x_pad = max(10, min(32, int(padding)))
+    y_pad = max(6, min(18, int(round(line_h * 0.35))))
+    return _clip_box(
+        [
+            min(line_box[0], item_box[0]) - x_pad,
+            min(line_box[1], item_box[1]) - y_pad,
+            max(line_box[2], item_box[2]) + x_pad,
+            max(line_box[3], item_box[3]) + y_pad,
+        ],
+        shape,
+    )
+
+
+def _reason_mentions_graphic_difference(reason: str) -> bool:
+    normalized = reason.lower()
+    graphic_terms = (
+        "icon",
+        "symbol",
+        "logo",
+        "graphic",
+        "circle",
+        "arrow",
+        "triangle",
+        "flame",
+        "monitor",
+        "hand",
+        "barcode graphic",
+        "qr",
+    )
+    return any(term in normalized for term in graphic_terms)
+
+
+def _reason_mentions_text_difference(reason: str) -> bool:
+    normalized = reason.lower()
+    text_terms = (
+        "text",
+        "character",
+        "word",
+        "letter",
+        "number",
+        "digit",
+        "value",
+        "model",
+        "date",
+        "voltage",
+        "frequency",
+        "capacity",
+        "weight",
+        "unit",
+        "superscript",
+        "subscript",
+        "barcode value",
+        "kg",
+        "hz",
+        "kw",
+        "db",
+    )
+    return any(term in normalized for term in text_terms)
+
+
+def suppress_graphic_reason_for_text_line_candidate(
+    parsed: Dict[str, Any],
+    matched_text_region: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    if matched_text_region is None or parsed.get("decision") != "keep":
+        return parsed
+    reason = str(parsed.get("reason") or "")
+    if _reason_mentions_graphic_difference(reason) and not _reason_mentions_text_difference(reason):
+        suppressed = dict(parsed)
+        suppressed["original_decision"] = parsed.get("decision")
+        suppressed["decision"] = "discard"
+        suppressed["suppressed_reason"] = "graphic_reason_for_pdf_text_line_candidate"
+        return suppressed
+    return parsed
+
+
 def extract_small_text_candidates(
     diff_mask: np.ndarray,
     existing_boxes: Sequence[Dict[str, Any]],
@@ -1808,6 +1894,7 @@ def apply_vlm_filter(
     keep_unknown: bool,
     skip_model_check: bool,
     debug_dir: Path | None,
+    text_regions: Sequence[Dict[str, Any]] | None = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     client = OpenAICompatibleHTTPClient(
         model_name=model,
@@ -1828,13 +1915,28 @@ def apply_vlm_filter(
 
     for index, item in enumerate(boxes, start=1):
         box = item.get("box") or [0, 0, 0, 0]
+        matched_text_region = candidate_text_line_region(
+            item,
+            text_regions,
+            target_image.shape[:2],
+        )
         if item.get("source") == "micro_text_candidate_batch":
-            review_box = item.get("review_box") or expand_review_box(
-                box,
-                target_image.shape[:2],
-                padding=crop_padding,
-                min_size=review_min_size,
-            )
+            if matched_text_region is not None:
+                review_box = text_line_review_box_from_region(
+                    item,
+                    matched_text_region,
+                    target_image.shape[:2],
+                    padding=crop_padding,
+                )
+                review_source = "pdf_text_line"
+            else:
+                review_box = item.get("review_box") or expand_review_box(
+                    box,
+                    target_image.shape[:2],
+                    padding=crop_padding,
+                    min_size=review_min_size,
+                )
+                review_source = "micro_batch"
             sub_candidates = [
                 dict(candidate)
                 for candidate in item.get("sub_candidates", [])
@@ -1880,14 +1982,28 @@ def apply_vlm_filter(
             )
             valid_ids = [int(candidate.get("candidate_id", 0)) for candidate in sub_candidates]
             parsed = normalize_vlm_filter_response(extract_json_object(response.content))
+            parsed = suppress_graphic_reason_for_text_line_candidate(
+                parsed,
+                matched_text_region,
+            )
             record = {
                 **dict(item),
                 "review_box": review_box,
-                "review_box_source": "micro_batch",
+                "review_box_source": review_source,
                 "vlm_decision": parsed["decision"],
                 "kept_candidate_ids": valid_ids if parsed["decision"] == "keep" else [],
                 "vlm_confidence": parsed["confidence"],
                 "vlm_reason": parsed["reason"],
+                "matched_template_text_line": (
+                    {
+                        "text": matched_text_region.get("text"),
+                        "box": matched_text_region.get("box"),
+                    }
+                    if matched_text_region is not None
+                    else None
+                ),
+                "vlm_original_decision": parsed.get("original_decision"),
+                "vlm_suppressed_reason": parsed.get("suppressed_reason"),
                 "filter_source": "vlm",
                 "vlm_input_mode": "two_image_unmarked_region",
                 "template_foreground_ratio": template_foreground,
@@ -1928,28 +2044,37 @@ def apply_vlm_filter(
             continue
 
         review_source = "local"
-        review_box = expand_text_line_review_box(
-            box,
-            target_image.shape[:2],
-            foreground_context_mask,
-            padding=crop_padding,
-            min_size=review_min_size,
-            child_count=(
-                2
-                if item.get("force_text_line_review")
-                else int(item.get("child_count", 1))
-            ),
-        )
-        review_box = item.get("review_box") or review_box
-        if review_box is not None:
-            review_source = "text_line"
-        else:
-            review_box = expand_review_box(
-                box,
+        if matched_text_region is not None:
+            review_box = text_line_review_box_from_region(
+                item,
+                matched_text_region,
                 target_image.shape[:2],
                 padding=crop_padding,
-                min_size=review_min_size,
             )
+            review_source = "pdf_text_line"
+        else:
+            review_box = expand_text_line_review_box(
+                box,
+                target_image.shape[:2],
+                foreground_context_mask,
+                padding=crop_padding,
+                min_size=review_min_size,
+                child_count=(
+                    2
+                    if item.get("force_text_line_review")
+                    else int(item.get("child_count", 1))
+                ),
+            )
+            review_box = item.get("review_box") or review_box
+            if review_box is not None:
+                review_source = "text_line"
+            else:
+                review_box = expand_review_box(
+                    box,
+                    target_image.shape[:2],
+                    padding=crop_padding,
+                    min_size=review_min_size,
+                )
         template_crop = crop_box(template_image, review_box)
         target_crop = crop_box(target_image, review_box)
         if item.get("source") == "micro_text_candidate":
@@ -1987,6 +2112,10 @@ def apply_vlm_filter(
             num_predict=max_tokens,
         )
         parsed = normalize_vlm_filter_response(extract_json_object(response.content))
+        parsed = suppress_graphic_reason_for_text_line_candidate(
+            parsed,
+            matched_text_region,
+        )
         record = {
             **dict(item),
             "review_box": review_box,
@@ -1994,6 +2123,16 @@ def apply_vlm_filter(
             "vlm_decision": parsed["decision"],
             "vlm_confidence": parsed["confidence"],
             "vlm_reason": parsed["reason"],
+            "matched_template_text_line": (
+                {
+                    "text": matched_text_region.get("text"),
+                    "box": matched_text_region.get("box"),
+                }
+                if matched_text_region is not None
+                else None
+            ),
+            "vlm_original_decision": parsed.get("original_decision"),
+            "vlm_suppressed_reason": parsed.get("suppressed_reason"),
             "filter_source": "vlm",
             "vlm_input_mode": "two_image_unmarked_region",
             "template_foreground_ratio": template_foreground,
@@ -2155,6 +2294,7 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
             keep_unknown=args.keep_unknown,
             skip_model_check=args.skip_model_check,
             debug_dir=debug_dir,
+            text_regions=template_text_regions_panel,
         )
     final_boxes_scaled = refine_display_boxes(
         final_boxes_scaled,
