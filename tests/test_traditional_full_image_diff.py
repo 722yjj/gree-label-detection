@@ -5,6 +5,7 @@ from label_detection.workflows.traditional_full_image_diff import (
     apply_vlm_filter,
     build_vlm_batch_filter_prompt,
     build_vlm_filter_prompt,
+    candidate_text_line_region,
     merge_standard_and_micro_candidates_for_vlm,
     refine_display_box,
     refine_display_boxes,
@@ -188,6 +189,36 @@ def test_refine_display_box_snaps_to_matching_pdf_text_line():
 
     assert refined[0] <= 42
     assert refined[2] >= 178
+
+
+def test_candidate_text_line_region_keeps_matching_text_candidate():
+    region = candidate_text_line_region(
+        {
+            "box": [760, 523, 853, 557],
+            "centroid": [813.0, 544.0],
+        },
+        [{"text": "600004078454", "box": [647, 536, 857, 565]}],
+        (586, 900),
+    )
+
+    assert region is not None
+    assert region["text"] == "600004078454"
+
+
+def test_candidate_text_line_region_rejects_distant_same_row_graphic():
+    region = candidate_text_line_region(
+        {
+            "box": [662, 327, 728, 422],
+            "area": 5820,
+            "density": 0.928,
+            "centroid": [693.0, 373.3],
+            "child_count": 1,
+        },
+        [{"text": "37dB(A)", "box": [404, 324, 517, 359]}],
+        (586, 900),
+    )
+
+    assert region is None
 
 
 def test_text_line_review_box_from_region_stays_near_pdf_line():

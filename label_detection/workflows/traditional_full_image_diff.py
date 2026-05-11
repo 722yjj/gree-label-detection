@@ -486,7 +486,6 @@ def candidate_text_line_region(
 
     best_region: Dict[str, Any] | None = None
     best_score = -1.0
-    box_h = max(1, box[3] - box[1])
     for region in text_regions:
         region_box = region.get("box")
         if region_box is None:
@@ -496,12 +495,16 @@ def candidate_text_line_region(
             score = 10.0 + _box_overlap_ratio(box, region_box)
         else:
             overlap = _box_overlap_ratio(box, region_box)
-            if overlap < 0.20 and _vertical_overlap_ratio(box, region_box) < 0.55:
-                continue
-            gap = _horizontal_gap(box, region_box)
-            if gap > max(24, box_h * 2):
-                continue
-            score = overlap + max(0.0, 1.0 - gap / float(max(24, box_h * 2)))
+            if overlap >= 0.20:
+                score = overlap
+            else:
+                vertical_overlap = _vertical_overlap_ratio(box, region_box)
+                gap = _horizontal_gap(box, region_box)
+                region_h = max(1, region_box[3] - region_box[1])
+                edge_gap_limit = max(6, min(14, int(round(region_h * 0.35))))
+                if vertical_overlap < 0.70 or gap > edge_gap_limit:
+                    continue
+                score = 0.1 + max(0.0, 1.0 - gap / float(edge_gap_limit + 1))
         if score > best_score:
             best_score = score
             best_region = region
