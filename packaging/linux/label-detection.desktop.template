@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Name=标签检测
-Comment=启动标签检测桌面端
-Exec=@PROJECT_ROOT@/scripts/start_desktop.sh
+Comment=启动标签检测桌面端并使用本机 vLLM 服务
+Exec=env LLM_PROVIDER=vllm @PROJECT_ROOT@/scripts/start_desktop.sh
 Path=@PROJECT_ROOT@
 Terminal=true
 Categories=Utility;

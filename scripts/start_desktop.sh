@@ -11,6 +11,16 @@ LLM_PROVIDER_VALUE="${LLM_PROVIDER:-ollama}"
 OLLAMA_API_BASE_VALUE="${OLLAMA_API_BASE:-http://localhost:11434}"
 OLLAMA_AUTOSTART_VALUE="${OLLAMA_AUTOSTART:-1}"
 OLLAMA_START_TIMEOUT_VALUE="${OLLAMA_START_TIMEOUT:-20}"
+VLLM_START_SCRIPT="${VLLM_START_SCRIPT:-${PROJECT_ROOT}/scripts/start_vllm.sh}"
+VLLM_AUTOSTART_VALUE="${VLLM_AUTOSTART:-1}"
+VLLM_STATE_DIR="${VLLM_STATE_DIR:-${PROJECT_ROOT}/results/vllm}"
+VLLM_PID_FILE="${VLLM_PID_FILE:-${VLLM_STATE_DIR}/server.pid}"
+VLLM_DESKTOP_SESSION_FILE="${VLLM_DESKTOP_SESSION_FILE:-${VLLM_STATE_DIR}/desktop-session.token}"
+VLLM_DESKTOP_WATCHDOG_PID_FILE="${VLLM_DESKTOP_WATCHDOG_PID_FILE:-${VLLM_STATE_DIR}/desktop-watchdog.pid}"
+VLLM_DESKTOP_SHUTDOWN_DELAY_VALUE="${VLLM_DESKTOP_SHUTDOWN_DELAY:-1800}"
+VLLM_WAS_MANAGED=0
+VLLM_MANAGED_MODEL_PATH="${VLLM_MANAGED_MODEL_PATH:-}"
+VLLM_MANAGED_MODEL_NAME="${VLLM_MANAGED_MODEL_NAME:-}"
 
 usage() {
   cat <<'EOF'
@@ -21,11 +31,99 @@ Options:
   --strict-services   Treat LLM/service connectivity warnings as failures.
 
 Environment:
-  LLM_PROVIDER=ollama       Use Ollama by default; set vllm/openai-compatible to skip Ollama autostart.
-  OLLAMA_AUTOSTART=0       Disable automatic local Ollama startup.
-  OLLAMA_BIN=/path/ollama  Override the Ollama executable path.
-  OLLAMA_START_TIMEOUT=20  Seconds to wait for Ollama startup.
+  LLM_PROVIDER=ollama        Use Ollama by default for direct script runs.
+  LLM_PROVIDER=vllm          Use project vLLM; desktop launcher sets this by default.
+  VLLM_AUTOSTART=0           Disable automatic vLLM startup.
+  VLLM_START_SCRIPT=path     Override the vLLM startup script.
+  VLLM_DESKTOP_SHUTDOWN_DELAY=1800  Seconds to wait after desktop exit before stopping vLLM.
+  OLLAMA_AUTOSTART=0         Disable automatic local Ollama startup.
+  OLLAMA_BIN=/path/ollama   Override the Ollama executable path.
+  OLLAMA_START_TIMEOUT=20   Seconds to wait for Ollama startup.
 EOF
+}
+
+generate_session_token() {
+  local token_source
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+    return 0
+  fi
+  token_source="$("${PYTHON}" - <<'PY'
+import secrets
+print(secrets.token_hex(16))
+PY
+)"
+  printf '%s\n' "${token_source}"
+}
+
+clear_previous_vllm_watchdog() {
+  local watchdog_pid
+
+  if [[ ! -f "${VLLM_DESKTOP_WATCHDOG_PID_FILE}" ]]; then
+    return 0
+  fi
+
+  watchdog_pid="$(tr -d '[:space:]' <"${VLLM_DESKTOP_WATCHDOG_PID_FILE}")"
+  if is_vllm_watchdog_pid "${watchdog_pid}" && kill -0 "${watchdog_pid}" 2>/dev/null; then
+    echo "停止旧的 vLLM delayed-stop watchdog: PID ${watchdog_pid}" | tee -a "${LOG_FILE}"
+    kill "${watchdog_pid}" 2>/dev/null || true
+    for ((i = 0; i < 10; i++)); do
+      if ! kill -0 "${watchdog_pid}" 2>/dev/null; then
+        break
+      fi
+      sleep 1
+    done
+  else
+    echo "移除过期的 vLLM delayed-stop watchdog 记录: ${watchdog_pid:-empty}" | tee -a "${LOG_FILE}"
+  fi
+
+  rm -f "${VLLM_DESKTOP_WATCHDOG_PID_FILE}"
+}
+
+watchdog_cmdline() {
+  local pid="$1"
+
+  if [[ -r "/proc/${pid}/cmdline" ]]; then
+    tr '\0' ' ' <"/proc/${pid}/cmdline"
+    return 0
+  fi
+
+  ps -p "${pid}" -o args= 2>/dev/null || true
+}
+
+is_vllm_watchdog_pid() {
+  local pid="$1" cmdline
+
+  if [[ ! "${pid}" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+
+  cmdline="$(watchdog_cmdline "${pid}")"
+  [[ "${cmdline}" == *"${VLLM_START_SCRIPT}"*"delayed-stop"* ]]
+}
+
+is_project_managed_vllm_pid() {
+  local pid cmdline
+
+  if [[ ! -f "${VLLM_PID_FILE}" ]]; then
+    return 1
+  fi
+
+  pid="$(tr -d '[:space:]' <"${VLLM_PID_FILE}")"
+  if [[ ! "${pid}" =~ ^[0-9]+$ ]] || ! kill -0 "${pid}" 2>/dev/null; then
+    return 1
+  fi
+
+  cmdline="$(watchdog_cmdline "${pid}")"
+  [[ -n "${cmdline}" ]] || return 1
+  [[ -n "${VLLM_BIN}" ]] || return 1
+  [[ "${cmdline}" == *"${VLLM_BIN}"* ]] || return 1
+  [[ "${cmdline}" == *"serve"* ]] || return 1
+  [[ -n "${VLLM_MANAGED_MODEL_PATH}" ]] || return 1
+  [[ -n "${VLLM_MANAGED_MODEL_NAME}" ]] || return 1
+  [[ "${cmdline}" == *"${VLLM_MANAGED_MODEL_PATH}"* ]] || return 1
+  [[ "${cmdline}" == *"${VLLM_MANAGED_MODEL_NAME}"* ]] || return 1
+  return 0
 }
 
 is_local_ollama_endpoint() {
@@ -133,6 +231,92 @@ start_ollama_if_needed() {
   echo "Ollama 自动启动后仍未连通，详情见: ${OLLAMA_LOG_FILE}" | tee -a "${LOG_FILE}"
 }
 
+vllm_autostart_enabled() {
+  [[ ! "${VLLM_AUTOSTART_VALUE}" =~ ^(0|false|False|FALSE|no|No|NO|off|Off|OFF)$ ]]
+}
+
+load_vllm_env() {
+  local vllm_env
+  if ! vllm_env="$("${VLLM_START_SCRIPT}" --print-env)"; then
+    echo "读取 vLLM 环境变量失败: ${VLLM_START_SCRIPT} --print-env" | tee -a "${LOG_FILE}"
+    return 1
+  fi
+  eval "${vllm_env}"
+  LLM_PROVIDER_VALUE="${LLM_PROVIDER:-${LLM_PROVIDER_VALUE}}"
+}
+
+start_vllm_if_needed() {
+  case "${LLM_PROVIDER_VALUE}" in
+    vllm)
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  if [[ ! -x "${VLLM_START_SCRIPT}" ]]; then
+    echo "缺少 vLLM 启动脚本: ${VLLM_START_SCRIPT}" | tee -a "${LOG_FILE}"
+    return 1
+  fi
+
+  load_vllm_env
+  VLLM_MANAGED_MODEL_PATH="${VLLM_MODEL_PATH:-${VLLM_MANAGED_MODEL_PATH}}"
+  VLLM_MANAGED_MODEL_NAME="${VLLM_SERVED_MODEL_NAME:-${VLLM_MANAGED_MODEL_NAME}}"
+
+  if [[ "${CHECK_ONLY}" == "1" ]]; then
+    echo "检查 vLLM 环境: ${VLLM_START_SCRIPT} check" | tee -a "${LOG_FILE}"
+    "${VLLM_START_SCRIPT}" check 2>&1 | tee -a "${LOG_FILE}"
+    return 0
+  fi
+
+  if ! vllm_autostart_enabled; then
+    echo "跳过 vLLM 自动启动: VLLM_AUTOSTART=${VLLM_AUTOSTART_VALUE}" | tee -a "${LOG_FILE}"
+    return 0
+  fi
+
+  echo "确保 vLLM 服务已启动: ${VLLM_START_SCRIPT}" | tee -a "${LOG_FILE}"
+  "${VLLM_START_SCRIPT}" 2>&1 | tee -a "${LOG_FILE}"
+  if is_project_managed_vllm_pid; then
+    VLLM_WAS_MANAGED=1
+  else
+    VLLM_WAS_MANAGED=0
+  fi
+}
+
+schedule_vllm_delayed_stop() {
+  local desktop_token watchdog_pid
+
+  if [[ "${LLM_PROVIDER_VALUE}" != "vllm" || "${CHECK_ONLY}" == "1" || "${VLLM_WAS_MANAGED}" != "1" ]]; then
+    return 0
+  fi
+
+  if [[ ! "${VLLM_DESKTOP_SHUTDOWN_DELAY_VALUE}" =~ ^[0-9]+$ ]]; then
+    echo "Invalid VLLM_DESKTOP_SHUTDOWN_DELAY: ${VLLM_DESKTOP_SHUTDOWN_DELAY_VALUE}" | tee -a "${LOG_FILE}"
+    return 1
+  fi
+
+  mkdir -p "${VLLM_STATE_DIR}"
+  desktop_token="$(generate_session_token)"
+  printf '%s\n' "${desktop_token}" >"${VLLM_DESKTOP_SESSION_FILE}"
+
+  clear_previous_vllm_watchdog
+
+  echo "启动 vLLM 延迟关闭 watchdog..." | tee -a "${LOG_FILE}"
+  nohup env \
+    VLLM_STATE_DIR="${VLLM_STATE_DIR}" \
+    VLLM_DESKTOP_SESSION_FILE="${VLLM_DESKTOP_SESSION_FILE}" \
+    VLLM_DESKTOP_WATCHDOG_PID_FILE="${VLLM_DESKTOP_WATCHDOG_PID_FILE}" \
+    VLLM_MANAGED_MODEL_PATH="${VLLM_MANAGED_MODEL_PATH}" \
+    VLLM_MANAGED_MODEL_NAME="${VLLM_MANAGED_MODEL_NAME}" \
+    VLLM_DESKTOP_PID="$$" \
+    VLLM_DESKTOP_SESSION_TOKEN="${desktop_token}" \
+    VLLM_DESKTOP_SHUTDOWN_DELAY="${VLLM_DESKTOP_SHUTDOWN_DELAY_VALUE}" \
+    "${VLLM_START_SCRIPT}" delayed-stop >>"${LOG_FILE}" 2>&1 </dev/null &
+  watchdog_pid="$!"
+  disown || true
+  echo "vLLM delayed-stop watchdog PID: ${watchdog_pid}" | tee -a "${LOG_FILE}"
+}
+
 CHECK_ONLY=0
 STRICT_SERVICES=0
 for arg in "$@"; do
@@ -169,6 +353,12 @@ if [[ ! -x "${PYTHON}" ]]; then
 fi
 
 echo "准备启动标签检测桌面端..." | tee "${LOG_FILE}"
+start_vllm_if_needed
+if [[ "${LLM_PROVIDER_VALUE}" == "vllm" ]]; then
+  if is_project_managed_vllm_pid; then
+    VLLM_WAS_MANAGED=1
+  fi
+fi
 start_ollama_if_needed
 
 CHECK_ARGS=()
@@ -188,4 +378,5 @@ if [[ "${CHECK_ONLY}" == "1" ]]; then
 fi
 
 echo "启动标签检测桌面端..." | tee -a "${LOG_FILE}"
+schedule_vllm_delayed_stop
 exec "${PYTHON}" -m desktop_app.main

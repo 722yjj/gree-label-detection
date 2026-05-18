@@ -121,10 +121,22 @@ ollama pull qwen3.5:9b
 使用 vLLM / OpenAI-compatible 服务示例：
 
 ```bash
+scripts/start_vllm.sh
+
 export LLM_PROVIDER=vllm
 export VLLM_API_BASE=http://127.0.0.1:8000/v1
-export VLLM_MODEL=/home/jnu/models/Qwen3.6-27B-int4-AutoRound
+export VLLM_MODEL_PATH=/home/jnu/models/Qwen3.6-27B-int4-AutoRound
+export VLLM_SERVED_MODEL_NAME=qwen3.6-27b-int4
+export VLLM_MODEL=qwen3.6-27b-int4
 ```
+
+当前服务器上的一键脚本默认使用独立环境 `/home/jnu/venvs/vllm`，加载
+`/home/jnu/models/Qwen3.6-27B-int4-AutoRound`，并以 OpenAI-compatible 接口
+`http://127.0.0.1:8000/v1` 对外提供模型 `qwen3.6-27b-int4`。启动前可先执行
+`scripts/start_vllm.sh check` 只检查环境、CUDA、模型文件和端口状态；停止脚本启动的服务可执行
+`scripts/start_vllm.sh stop`。
+
+更多命令和默认配置见 `docs/vllm_startup.md`。
 
 如果 `.venv` 缺失或依赖不完整，先执行 `uv sync --extra desktop`，再回到上面的 `.venv/bin/python ...` 启动方式。
 
