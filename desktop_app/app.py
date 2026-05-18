@@ -7,6 +7,7 @@ from label_detection.core.config import PROJECT_ROOT
 from desktop_app.controllers.app_controller import AppController
 from desktop_app.devices.camera.factory import build_camera_adapter
 from desktop_app.devices.scanner.base import ScannerAdapter
+from desktop_app.devices.scanner.keyboard_wedge_adapter import KeyboardWedgeScannerAdapter
 from desktop_app.repositories.history_repository import HistoryRepository
 from desktop_app.repositories.template_repository import TemplateRepository
 from desktop_app.services.detection_service import DetectionService
@@ -18,6 +19,7 @@ def build_main_window(scanner_adapter: ScannerAdapter | None = None) -> MainWind
     """Create the main window and wire the first controller stack."""
 
     window = MainWindow()
+    scanner_adapter = scanner_adapter or KeyboardWedgeScannerAdapter(window)
     controller = AppController(
         view=window,
         template_repository=TemplateRepository(),

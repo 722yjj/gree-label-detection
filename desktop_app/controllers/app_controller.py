@@ -111,6 +111,10 @@ class AppController(QObject):
             return
 
         self.scanner_adapter.code_scanned.connect(self.handle_scanned_code)
+        if hasattr(self.scanner_adapter, "scan_buffer_changed"):
+            self.scanner_adapter.scan_buffer_changed.connect(
+                self._handle_scanner_buffer_changed
+            )
         self.scanner_adapter.availability_changed.connect(
             self._handle_scanner_availability_changed
         )
@@ -133,6 +137,14 @@ class AppController(QObject):
             self.scanner_adapter.code_scanned.disconnect(self.handle_scanned_code)
         except (RuntimeError, TypeError):
             pass
+
+        if hasattr(self.scanner_adapter, "scan_buffer_changed"):
+            try:
+                self.scanner_adapter.scan_buffer_changed.disconnect(
+                    self._handle_scanner_buffer_changed
+                )
+            except (RuntimeError, TypeError):
+                pass
 
         try:
             self.scanner_adapter.availability_changed.disconnect(
@@ -157,6 +169,12 @@ class AppController(QObject):
 
     def handle_scanned_code(self, code: str, source: str = "scanner") -> None:
         self._handle_code_lookup(code, source=source)
+
+    def _handle_scanner_buffer_changed(self, raw_code: str) -> None:
+        if self._is_detection_running():
+            return
+
+        self.view.set_code_text(KeyboardWedgeScannerInput.normalize(raw_code))
 
     def _handle_code_lookup(self, raw_code: str, source: str) -> None:
         if self._is_detection_running():

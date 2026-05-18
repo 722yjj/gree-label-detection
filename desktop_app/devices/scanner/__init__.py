@@ -6,6 +6,9 @@ __all__ = ["KeyboardWedgeScannerInput"]
 
 try:
     from desktop_app.devices.scanner.base import ScannerAdapter
+    from desktop_app.devices.scanner.keyboard_wedge_adapter import (
+        KeyboardWedgeScannerAdapter,
+    )
     from desktop_app.devices.scanner.mock import MockScannerAdapter
     from desktop_app.devices.scanner.mv_orh import MVORHScannerAdapter
 except ModuleNotFoundError as exc:
@@ -15,6 +18,7 @@ else:
     __all__.extend(
         [
             "ScannerAdapter",
+            "KeyboardWedgeScannerAdapter",
             "MockScannerAdapter",
             "MVORHScannerAdapter",
         ]

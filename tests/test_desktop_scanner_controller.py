@@ -10,11 +10,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtGui import QColor, QImage, QPixmap
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QColor, QImage, QKeyEvent, QPixmap
 from PySide6.QtWidgets import QApplication, QScrollArea
 
 from desktop_app.controllers.app_controller import AppController
 from desktop_app.controllers import app_controller as app_controller_module
+from desktop_app.devices.scanner.keyboard_wedge_adapter import KeyboardWedgeScannerAdapter
 from desktop_app.devices.scanner.mock import MockScannerAdapter
 from desktop_app.models import DetectionJobResult, TemplateRecord
 from desktop_app.ui.main_window import MainWindow, ScaledImageLabel
@@ -115,6 +117,60 @@ def wait_until(qapp: QApplication, predicate, timeout: float = 2.0) -> None:
     assert predicate()
 
 
+class DirectKeyboardWedgeScannerAdapter(KeyboardWedgeScannerAdapter):
+    """Exercise keyboard-wedge event handling without a process-global filter."""
+
+    def start(self) -> None:
+        self._application = QApplication.instance()
+        self._started = True
+        self._available = True
+        self.availability_changed.emit(True, "键盘扫码模式已启用")
+
+    def stop(self) -> None:
+        self._application = None
+        self._buffer.clear()
+        self._started = False
+        self._available = False
+        self.availability_changed.emit(False, "键盘扫码模式已停止")
+
+
+def send_keyboard_scan(
+    adapter: KeyboardWedgeScannerAdapter,
+    qapp: QApplication,
+    target,
+    value: str,
+    *,
+    enter_count: int = 1,
+) -> None:
+    for character in value:
+        if character == "\t":
+            event = QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_Tab,
+                Qt.KeyboardModifier.NoModifier,
+                "\t",
+            )
+        else:
+            event = QKeyEvent(
+                QEvent.Type.KeyPress,
+                0,
+                Qt.KeyboardModifier.NoModifier,
+                character,
+            )
+        adapter.eventFilter(target, event)
+        qapp.processEvents()
+
+    for _ in range(enter_count):
+        event = QKeyEvent(
+            QEvent.Type.KeyPress,
+            Qt.Key.Key_Return,
+            Qt.KeyboardModifier.NoModifier,
+            "\r",
+        )
+        adapter.eventFilter(target, event)
+        qapp.processEvents()
+
+
 def build_controller(
     tmp_path: Path,
     qapp: QApplication,
@@ -183,6 +239,117 @@ def test_mock_scanner_adapter_signal_drives_controller(tmp_path, qapp):
         assert window.code_text() == "600004075219"
         assert window.selected_template() is not None
     finally:
+        adapter.stop()
+        window.close()
+
+
+def test_keyboard_wedge_adapter_captures_scan_without_code_input_focus(tmp_path, qapp):
+    adapter = DirectKeyboardWedgeScannerAdapter()
+    window, _controller, repository = build_controller(
+        tmp_path,
+        qapp,
+        scanner_adapter=adapter,
+    )
+    adapter._active_window = window
+
+    try:
+        window.template_list.setFocus()
+        window.activateWindow()
+        qapp.processEvents()
+
+        send_keyboard_scan(adapter, qapp, window.template_list, "600004075219")
+
+        assert repository.refresh_calls == 1
+        assert window.code_text() == "600004075219"
+        assert window.selected_template() is not None
+        assert window.code_input.hasSelectedText() is True
+    finally:
+        adapter.stop()
+        window.close()
+
+
+def test_keyboard_wedge_adapter_replaces_existing_code_instead_of_appending(
+    tmp_path,
+    qapp,
+):
+    adapter = DirectKeyboardWedgeScannerAdapter()
+    window, _controller, repository = build_controller(
+        tmp_path,
+        qapp,
+        scanner_adapter=adapter,
+    )
+    adapter._active_window = window
+
+    try:
+        window.set_code_text("OLD-CODE")
+        window.template_list.setFocus()
+        window.activateWindow()
+        qapp.processEvents()
+
+        send_keyboard_scan(adapter, qapp, window.template_list, "600004075219")
+
+        assert repository.refresh_calls == 1
+        assert window.code_text() == "600004075219"
+        assert "OLD-CODE" not in window.code_text()
+    finally:
+        adapter.stop()
+        window.close()
+
+
+def test_keyboard_wedge_adapter_normalizes_scan_affixes(tmp_path, qapp):
+    adapter = DirectKeyboardWedgeScannerAdapter()
+    window, _controller, repository = build_controller(
+        tmp_path,
+        qapp,
+        scanner_adapter=adapter,
+    )
+    adapter._active_window = window
+
+    try:
+        window.template_list.setFocus()
+        window.activateWindow()
+        qapp.processEvents()
+
+        send_keyboard_scan(
+            adapter,
+            qapp,
+            window.template_list,
+            "\t 600004075219 \n",
+            enter_count=2,
+        )
+
+        assert repository.refresh_calls == 1
+        assert window.code_text() == "600004075219"
+        assert window.selected_template() is not None
+    finally:
+        adapter.stop()
+        window.close()
+
+
+def test_keyboard_wedge_scan_is_ignored_while_detection_is_running(tmp_path, qapp):
+    adapter = DirectKeyboardWedgeScannerAdapter()
+    window, controller, repository = build_controller(
+        tmp_path,
+        qapp,
+        scanner_adapter=adapter,
+    )
+    adapter._active_window = window
+
+    try:
+        window.set_code_text("600004075219")
+        controller._thread = object()
+        window.template_list.setFocus()
+        window.activateWindow()
+        qapp.processEvents()
+
+        send_keyboard_scan(adapter, qapp, window.template_list, "999999999999")
+
+        assert repository.refresh_calls == 0
+        assert window.code_text() == "600004075219"
+        assert window.status_value.text() == "检测进行中，已忽略扫码输入"
+    finally:
+        controller._thread = None
+        adapter.stop()
         window.close()
 
 
