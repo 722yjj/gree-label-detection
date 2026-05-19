@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, QSettings, QThread, Signal
 
 from desktop_app.devices.camera.base import CameraAdapter
 from desktop_app.devices.scanner.base import ScannerAdapter
@@ -18,8 +18,10 @@ from desktop_app.services.detection_service import DetectionService
 from desktop_app.services.preview_service import PreviewService
 from desktop_app.ui.main_window import MainWindow
 from desktop_app.workers.camera_preview_worker import (
+    CAMERA_ROTATION_DEGREES,
     CameraFrameBrightness,
     CameraPreviewWorker,
+    normalize_camera_rotation_degrees,
 )
 from desktop_app.workers.detection_worker import DetectionWorker
 
@@ -31,6 +33,9 @@ CAMERA_CAPTURING = "CAPTURING"
 CAMERA_CAPTURED = "CAPTURED"
 CAMERA_DETECTING = "DETECTING"
 CAMERA_RESULT_READY = "RESULT_READY"
+CAMERA_ROTATION_SETTINGS_KEY = "camera/rotation_degrees"
+SETTINGS_APPLICATION = "gree-label-detection"
+SETTINGS_ORGANIZATION = "gree"
 
 
 def _camera_brightness_label(
@@ -56,6 +61,7 @@ class AppController(QObject):
 
     _save_preview_frame_requested = Signal(object)
     _stop_preview_requested = Signal()
+    _camera_rotation_changed = Signal(int)
 
     def __init__(
         self,
@@ -67,6 +73,7 @@ class AppController(QObject):
         preview_service: PreviewService | None = None,
         history_repository: HistoryRepository | None = None,
         auto_start_camera_preview: bool = True,
+        settings: QSettings | None = None,
     ) -> None:
         super().__init__(view)
         self.view = view
@@ -85,10 +92,16 @@ class AppController(QObject):
         self._last_camera_brightness_level: str | None = None
         self._detection_started_at: float | None = None
         self._auto_start_camera_preview = auto_start_camera_preview
+        self.settings = settings or QSettings(
+            SETTINGS_ORGANIZATION,
+            SETTINGS_APPLICATION,
+        )
+        self._camera_rotation_degrees = self._load_camera_rotation_degrees()
         self._connect_signals()
         self._connect_scanner_signals()
         self._load_history_records()
         self.view.set_camera_backend_name(self.camera_adapter.name)
+        self.view.set_camera_rotation_degrees(self._camera_rotation_degrees)
         self.view.show_pending_result()
         self._sync_camera_actions()
         self._refresh_detection_ready_state()
@@ -101,6 +114,7 @@ class AppController(QObject):
         self.view.simulate_scan_requested.connect(self.handle_scan_from_input)
         self.view.browse_target_requested.connect(self.browse_target_image)
         self.view.capture_camera_requested.connect(self.capture_camera_image)
+        self.view.camera_rotation_requested.connect(self.rotate_camera_clockwise)
         self.view.next_target_requested.connect(self.prepare_next_target)
         self.view.run_detection_requested.connect(self.run_detection)
         self.view.template_selection_changed.connect(self.refresh_template_preview)
@@ -266,6 +280,14 @@ class AppController(QObject):
         self._sync_camera_actions()
         self._save_preview_frame_requested.emit(code or None)
 
+    def rotate_camera_clockwise(self) -> None:
+        active_degrees = self._camera_rotation_degrees
+        current_index = CAMERA_ROTATION_DEGREES.index(active_degrees)
+        next_degrees = CAMERA_ROTATION_DEGREES[
+            (current_index + 1) % len(CAMERA_ROTATION_DEGREES)
+        ]
+        self._set_camera_rotation_degrees(next_degrees)
+
     def _handle_camera_photo_saved(self, captured: object) -> None:
         captured_path = Path(captured)
         self.view.set_target_image_path(captured_path)
@@ -327,7 +349,10 @@ class AppController(QObject):
         self.view.set_status("正在检查相机")
 
         thread = QThread(self.view)
-        worker = CameraPreviewWorker(self.camera_adapter)
+        worker = CameraPreviewWorker(
+            self.camera_adapter,
+            rotation_degrees=self._camera_rotation_degrees,
+        )
         worker.moveToThread(thread)
 
         thread.started.connect(worker.start)
@@ -341,6 +366,7 @@ class AppController(QObject):
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._clear_active_camera_preview_worker)
         self._save_preview_frame_requested.connect(worker.save_current_frame)
+        self._camera_rotation_changed.connect(worker.set_rotation_degrees)
         self._stop_preview_requested.connect(worker.stop_preview)
 
         self._camera_preview_thread = thread
@@ -576,6 +602,19 @@ class AppController(QObject):
         if self._camera_preview_worker is None:
             return
         self._stop_preview_requested.emit()
+
+    def _load_camera_rotation_degrees(self) -> int:
+        return normalize_camera_rotation_degrees(
+            self.settings.value(CAMERA_ROTATION_SETTINGS_KEY, 0)
+        )
+
+    def _set_camera_rotation_degrees(self, rotation_degrees: int) -> None:
+        normalized_degrees = normalize_camera_rotation_degrees(rotation_degrees)
+        self._camera_rotation_degrees = normalized_degrees
+        self.settings.setValue(CAMERA_ROTATION_SETTINGS_KEY, normalized_degrees)
+        self.settings.sync()
+        self.view.set_camera_rotation_degrees(normalized_degrees)
+        self._camera_rotation_changed.emit(normalized_degrees)
 
     def _sync_camera_actions(self) -> None:
         state = self._camera_workflow_state

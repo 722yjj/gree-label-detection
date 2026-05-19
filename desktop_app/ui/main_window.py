@@ -34,6 +34,11 @@ from desktop_app.models import DetectionJobResult, HistoryRecord, TemplateRecord
 class ScaledImageLabel(QLabel):
     """QLabel that keeps the source pixmap and rescales on its own resize."""
 
+    _preferred_width = 420
+    _preferred_height = 260
+    _minimum_width = 120
+    _minimum_height = 220
+
     def __init__(
         self,
         placeholder: str,
@@ -110,6 +115,7 @@ class MainWindow(QMainWindow):
     simulate_scan_requested = Signal()
     browse_target_requested = Signal()
     capture_camera_requested = Signal()
+    camera_rotation_requested = Signal()
     next_target_requested = Signal()
     run_detection_requested = Signal()
     template_selection_changed = Signal()
@@ -129,6 +135,7 @@ class MainWindow(QMainWindow):
         self.camera_backend_value.setObjectName("cameraBackend")
         self.camera_quality_value = QLabel("画面：-")
         self.camera_quality_value.setObjectName("cameraQuality")
+        self.rotation_button = QPushButton("方向：0°")
         self.browse_button = QPushButton("选择图片")
         self.capture_button = QPushButton("拍照保存")
         self.next_button = QPushButton("下一张")
@@ -204,6 +211,7 @@ class MainWindow(QMainWindow):
         toolbar_layout.addWidget(self._build_section_title("目标图"))
         toolbar_layout.addWidget(self.camera_backend_value)
         toolbar_layout.addWidget(self.camera_quality_value)
+        toolbar_layout.addWidget(self.rotation_button)
         self.target_path_input.setPlaceholderText("尚未选择目标图片")
         toolbar_layout.addWidget(self.target_path_input, 1)
         toolbar_layout.addWidget(self.browse_button)
@@ -524,12 +532,25 @@ class MainWindow(QMainWindow):
         self.setWindowFlags(flags)
 
     def _connect_signals(self) -> None:
-        self.query_button.clicked.connect(self.manual_query_requested)
+        self.query_button.clicked.connect(
+            lambda _checked=False: self.manual_query_requested.emit()
+        )
         self.code_input.returnPressed.connect(self.simulate_scan_requested)
-        self.browse_button.clicked.connect(self.browse_target_requested)
-        self.capture_button.clicked.connect(self.capture_camera_requested)
-        self.next_button.clicked.connect(self.next_target_requested)
-        self.run_button.clicked.connect(self.run_detection_requested)
+        self.browse_button.clicked.connect(
+            lambda _checked=False: self.browse_target_requested.emit()
+        )
+        self.capture_button.clicked.connect(
+            lambda _checked=False: self.capture_camera_requested.emit()
+        )
+        self.rotation_button.clicked.connect(
+            lambda _checked=False: self.camera_rotation_requested.emit()
+        )
+        self.next_button.clicked.connect(
+            lambda _checked=False: self.next_target_requested.emit()
+        )
+        self.run_button.clicked.connect(
+            lambda _checked=False: self.run_detection_requested.emit()
+        )
         self.template_list.currentItemChanged.connect(
             self._handle_template_selection_changed
         )
@@ -664,6 +685,9 @@ class MainWindow(QMainWindow):
                 "border-radius: 8px; color: #334e68; font-weight: 700; "
                 "padding: 6px 10px;"
             )
+
+    def set_camera_rotation_degrees(self, rotation_degrees: int) -> None:
+        self.rotation_button.setText(f"方向：{rotation_degrees}°")
 
     def set_capture_action(self, text: str, enabled: bool) -> None:
         self.capture_button.setText(text)

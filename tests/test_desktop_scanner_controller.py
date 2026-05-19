@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QEvent, QSettings, Qt
 from PySide6.QtGui import QColor, QImage, QKeyEvent, QPixmap
 from PySide6.QtWidgets import QApplication, QScrollArea
 
@@ -21,8 +21,10 @@ from desktop_app.devices.scanner.mock import MockScannerAdapter
 from desktop_app.models import DetectionJobResult, TemplateRecord
 from desktop_app.ui.main_window import MainWindow, ScaledImageLabel
 from desktop_app.workers.camera_preview_worker import (
+    CameraPreviewWorker,
     enhance_frame_for_detection,
     measure_frame_brightness,
+    rotate_camera_frame_bgr,
 )
 
 
@@ -171,12 +173,22 @@ def send_keyboard_scan(
         qapp.processEvents()
 
 
+def make_test_settings(tmp_path: Path) -> QSettings:
+    settings = QSettings(
+        str(tmp_path / "settings.ini"),
+        QSettings.Format.IniFormat,
+    )
+    settings.clear()
+    return settings
+
+
 def build_controller(
     tmp_path: Path,
     qapp: QApplication,
     *,
     camera_adapter=None,
     scanner_adapter=None,
+    settings: QSettings | None = None,
 ) -> tuple[MainWindow, AppController, FakeTemplateRepository]:
     code = "600004075219"
     window = MainWindow()
@@ -191,6 +203,7 @@ def build_controller(
         camera_adapter=camera_adapter or FakeCameraAdapter(),
         scanner_adapter=scanner_adapter,
         auto_start_camera_preview=False,
+        settings=settings or make_test_settings(tmp_path),
     )
     controller._resolve_template_preview_path = lambda template: None
     return window, controller, repository
@@ -394,6 +407,69 @@ def test_main_window_displays_camera_quality(qapp):
         window.close()
 
 
+def test_main_window_displays_camera_rotation(qapp):
+    window = MainWindow()
+    window.show()
+    qapp.processEvents()
+
+    try:
+        window.set_camera_rotation_degrees(90)
+
+        assert window.rotation_button.text() == "方向：90°"
+    finally:
+        window.close()
+
+
+def test_camera_rotation_button_cycles_and_persists_to_settings(tmp_path, qapp):
+    settings = make_test_settings(tmp_path)
+    window, controller, _repository = build_controller(
+        tmp_path,
+        qapp,
+        settings=settings,
+    )
+
+    try:
+        assert window.rotation_button.text() == "方向：0°"
+
+        window.rotation_button.click()
+        qapp.processEvents()
+
+        assert window.rotation_button.text() == "方向：90°"
+        assert (
+            settings.value(app_controller_module.CAMERA_ROTATION_SETTINGS_KEY, type=int)
+            == 90
+        )
+
+        window.rotation_button.click()
+        window.rotation_button.click()
+        window.rotation_button.click()
+        qapp.processEvents()
+
+        assert window.rotation_button.text() == "方向：0°"
+        assert (
+            settings.value(app_controller_module.CAMERA_ROTATION_SETTINGS_KEY, type=int)
+            == 0
+        )
+    finally:
+        window.close()
+
+
+def test_camera_rotation_loads_previous_setting(tmp_path, qapp):
+    settings = make_test_settings(tmp_path)
+    settings.setValue(app_controller_module.CAMERA_ROTATION_SETTINGS_KEY, 270)
+    settings.sync()
+    window, _controller, _repository = build_controller(
+        tmp_path,
+        qapp,
+        settings=settings,
+    )
+
+    try:
+        assert window.rotation_button.text() == "方向：270°"
+    finally:
+        window.close()
+
+
 def test_run_detection_uses_output_mode_toggle(tmp_path, qapp):
     window, controller, _repository = build_controller(tmp_path, qapp)
     captured_requests = []
@@ -526,6 +602,76 @@ def test_enhance_frame_for_detection_scales_dark_frame_to_readable_range():
     assert brightness.is_enhanced is True
     assert brightness.enhancement_factor > 1.0
     assert float(enhanced.mean()) > 120.0
+
+
+def test_rotate_camera_frame_bgr_supports_right_angle_orientations():
+    values = np.array(
+        [
+            [1, 2, 3],
+            [4, 5, 6],
+        ],
+        dtype=np.uint8,
+    )
+    frame = np.repeat(values[:, :, None], 3, axis=2)
+
+    rotated_0 = rotate_camera_frame_bgr(frame, 0)
+    rotated_90 = rotate_camera_frame_bgr(frame, 90)
+    rotated_180 = rotate_camera_frame_bgr(frame, 180)
+    rotated_270 = rotate_camera_frame_bgr(frame, 270)
+
+    np.testing.assert_array_equal(rotated_0[:, :, 0], values)
+    np.testing.assert_array_equal(
+        rotated_90[:, :, 0],
+        np.array([[4, 1], [5, 2], [6, 3]], dtype=np.uint8),
+    )
+    np.testing.assert_array_equal(
+        rotated_180[:, :, 0],
+        np.array([[6, 5, 4], [3, 2, 1]], dtype=np.uint8),
+    )
+    np.testing.assert_array_equal(
+        rotated_270[:, :, 0],
+        np.array([[3, 6], [2, 5], [1, 4]], dtype=np.uint8),
+    )
+
+
+def test_camera_preview_rotation_applies_to_preview_and_saved_frame(tmp_path, qapp):
+    values = np.array(
+        [
+            [30, 80, 130],
+            [180, 220, 250],
+        ],
+        dtype=np.uint8,
+    )
+    frame = np.repeat(values[:, :, None], 3, axis=2)
+    camera_adapter = FakePreviewCameraAdapter(tmp_path, frame=frame)
+    worker = CameraPreviewWorker(
+        camera_adapter,
+        interval_ms=60_000,
+        auto_enhance=False,
+        rotation_degrees=180,
+    )
+    preview_images: list[QImage] = []
+    worker.frame_ready.connect(preview_images.append)
+
+    try:
+        worker.start()
+        qapp.processEvents()
+
+        assert preview_images
+        preview_image = preview_images[-1]
+        assert preview_image.width() == 3
+        assert preview_image.height() == 2
+        assert QColor(preview_image.pixel(0, 0)).red() == 250
+        assert QColor(preview_image.pixel(2, 1)).red() == 30
+
+        worker.save_current_frame("rotated")
+        saved = cv2.imread(str(tmp_path / "rotated.jpg"))
+
+        assert saved is not None
+        assert saved.shape[:2] == (2, 3)
+        assert int(saved[0, 0, 0]) > int(saved[1, 2, 0])
+    finally:
+        worker.stop_preview()
 
 
 def test_detection_result_keeps_locked_image_until_next_target(tmp_path, qapp):

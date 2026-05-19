@@ -15,6 +15,8 @@ from PySide6.QtGui import QImage
 
 from desktop_app.devices.camera.base import CameraAdapter
 
+CAMERA_ROTATION_DEGREES = (0, 90, 180, 270)
+
 
 @dataclass(frozen=True)
 class CameraFrameBrightness:
@@ -50,6 +52,7 @@ class CameraPreviewWorker(QObject):
         interval_ms: int = 100,
         brightness_interval_s: float = 1.0,
         auto_enhance: bool | None = None,
+        rotation_degrees: int = 0,
     ) -> None:
         super().__init__()
         self.camera_adapter = camera_adapter
@@ -66,6 +69,7 @@ class CameraPreviewWorker(QObject):
         self._stopped = False
         self._last_brightness_level: str | None = None
         self._last_brightness_emit_at = 0.0
+        self._rotation_degrees = normalize_camera_rotation_degrees(rotation_degrees)
 
     @Slot()
     def start(self) -> None:
@@ -129,6 +133,10 @@ class CameraPreviewWorker(QObject):
 
         self.photo_saved.emit(Path(saved_path))
 
+    @Slot(int)
+    def set_rotation_degrees(self, rotation_degrees: int) -> None:
+        self._rotation_degrees = normalize_camera_rotation_degrees(rotation_degrees)
+
     @Slot()
     def _poll_frame(self) -> None:
         if self._session is None:
@@ -141,6 +149,7 @@ class CameraPreviewWorker(QObject):
             self.stop_preview()
             return
 
+        frame = rotate_camera_frame_bgr(frame, self._rotation_degrees)
         brightness = measure_frame_brightness(frame)
         if self.auto_enhance:
             frame, brightness = enhance_frame_for_detection(frame, brightness)
@@ -161,6 +170,26 @@ class CameraPreviewWorker(QObject):
         self._last_brightness_level = brightness.level
         self._last_brightness_emit_at = now
         self.frame_brightness_changed.emit(brightness)
+
+
+def normalize_camera_rotation_degrees(value: object) -> int:
+    try:
+        rotation_degrees = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return rotation_degrees if rotation_degrees in CAMERA_ROTATION_DEGREES else 0
+
+
+def rotate_camera_frame_bgr(frame, rotation_degrees: int):
+    if rotation_degrees not in CAMERA_ROTATION_DEGREES:
+        raise ValueError("rotation_degrees must be one of 0, 90, 180, 270")
+    if rotation_degrees == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if rotation_degrees == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if rotation_degrees == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
 
 
 def enhance_frame_for_detection(
@@ -235,8 +264,11 @@ def _get_env_bool(name: str, default: bool) -> bool:
 
 
 __all__ = [
+    "CAMERA_ROTATION_DEGREES",
     "CameraFrameBrightness",
     "CameraPreviewWorker",
     "enhance_frame_for_detection",
     "measure_frame_brightness",
+    "normalize_camera_rotation_degrees",
+    "rotate_camera_frame_bgr",
 ]
