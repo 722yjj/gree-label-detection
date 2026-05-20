@@ -18,11 +18,11 @@ import cv2
 import numpy as np
 
 from desktop_app.devices.camera.base import CameraAdapter, CameraConnectionStatus
-from label_detection.core.config import PROJECT_ROOT
+from label_detection.core.config import RESULTS_ROOT
 
 
 _DEFAULT_MVS_ROOT = Path("/opt/MVS")
-_DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "results" / "desktop_app" / "captures"
+_DEFAULT_OUTPUT_ROOT = RESULTS_ROOT / "desktop_app" / "captures"
 _SAFE_FILENAME_RE = re.compile(r"[^0-9A-Za-z._-]+")
 _MVS_LOCK = threading.Lock()
 

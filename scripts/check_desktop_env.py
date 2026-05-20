@@ -17,7 +17,13 @@ from urllib.request import Request, urlopen
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-VENV_PYTHON = PROJECT_ROOT / ".venv" / "bin" / "python"
+DEPLOY_ROOT = Path(os.getenv("DEPLOY_ROOT", str(PROJECT_ROOT))).resolve()
+APP_PYTHON = Path(
+    os.getenv("APP_PYTHON")
+    or os.getenv("PYTHON")
+    or str(PROJECT_ROOT / ".venv" / "bin" / "python")
+)
+VENV_PYTHON = APP_PYTHON
 
 
 @dataclass
@@ -124,11 +130,12 @@ def run_checks(strict_services: bool = False) -> list[CheckResult]:
     results: list[CheckResult] = []
 
     _add(results, "项目目录", PROJECT_ROOT.exists(), str(PROJECT_ROOT), required=True)
+    _add(results, "部署目录", DEPLOY_ROOT.exists(), str(DEPLOY_ROOT), required=True)
     _add(
         results,
         "虚拟环境",
         VENV_PYTHON.exists(),
-        str(VENV_PYTHON) if VENV_PYTHON.exists() else "缺少 .venv/bin/python，请先运行 uv sync --extra desktop",
+        str(VENV_PYTHON) if VENV_PYTHON.exists() else "缺少项目 Python，请先运行 uv sync --extra desktop 或检查部署包 venvs/app",
         required=True,
     )
     _add(
@@ -186,7 +193,7 @@ def run_checks(strict_services: bool = False) -> list[CheckResult]:
                     warn=True,
                 )
 
-    results_dir = PROJECT_ROOT / "results" / "desktop_app"
+    results_dir = Path(os.getenv("RESULTS_ROOT", str(PROJECT_ROOT / "results"))) / "desktop_app"
     try:
         results_dir.mkdir(parents=True, exist_ok=True)
         writable = os.access(results_dir, os.W_OK)

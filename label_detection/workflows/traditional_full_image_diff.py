@@ -24,7 +24,7 @@ from label_detection.core.config import (  # noqa: E402
     OPENAI_COMPATIBLE_API_BASE,
     OPENAI_COMPATIBLE_API_KEY,
     OPENAI_COMPATIBLE_MODEL,
-    PROJECT_ROOT as REPO_ROOT,
+    RESULTS_ROOT,
     VLM_TIMEOUT,
 )
 from label_detection.extraction.pdf import (  # noqa: E402
@@ -33,6 +33,7 @@ from label_detection.extraction.pdf import (  # noqa: E402
 )
 from label_detection.preprocessing.border import find_template_crop_rect  # noqa: E402
 from label_detection.services.openai_compatible_client import OpenAICompatibleHTTPClient  # noqa: E402
+from label_detection.license import require_valid_license  # noqa: E402
 from scripts.experiment_vlm_diff_localization import (  # noqa: E402
     align_target_to_template,
     extract_json_object,
@@ -44,7 +45,7 @@ from scripts.experiment_vlm_diff_localization import (  # noqa: E402
 )
 
 
-DEFAULT_OUTPUT_ROOT = REPO_ROOT / "results" / "traditional_full_image_diff"
+DEFAULT_OUTPUT_ROOT = RESULTS_ROOT / "traditional_full_image_diff"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -2521,6 +2522,11 @@ def run_traditional_full_image_diff(
 
 def main() -> int:
     args = build_arg_parser().parse_args()
+    try:
+        require_valid_license()
+    except Exception as exc:  # noqa: BLE001
+        print(str(exc), file=sys.stderr)
+        return 1
     _run_from_args(args)
     return 0
 

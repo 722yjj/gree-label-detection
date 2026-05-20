@@ -11,7 +11,7 @@ from desktop_app.devices.camera.hikrobot_mvs import (
     build_capture_output_path,
     capture_hikrobot_image,
 )
-from label_detection.core.config import PROJECT_ROOT
+from label_detection.core.config import RESULTS_ROOT
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,7 +53,7 @@ def main() -> int:
         Path(args.output)
         if args.output
         else build_capture_output_path(
-            PROJECT_ROOT / "results" / "manual_camera_capture",
+            RESULTS_ROOT / "manual_camera_capture",
             args.code,
         )
     )

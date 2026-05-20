@@ -1,12 +1,80 @@
 """Project-wide configuration."""
 
+import os
 from pathlib import Path
 from urllib.parse import urlparse
-import os
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SAMPLES_DIR = PROJECT_ROOT / "samples"
+
+
+def _candidate_deploy_roots(project_root: Path) -> list[Path]:
+    roots = []
+    for value in (
+        os.getenv("LABEL_DETECTION_DEPLOY_ROOT"),
+        os.getenv("DEPLOY_ROOT"),
+    ):
+        if value:
+            roots.append(Path(value).expanduser())
+
+    if (project_root.parent / "config" / "deploy.env").exists():
+        roots.append(project_root.parent)
+    roots.append(project_root)
+    return roots
+
+
+def _parse_env_value(value: str) -> str:
+    value = value.strip()
+    if (
+        len(value) >= 2
+        and value[0] == value[-1]
+        and value[0] in {"'", '"'}
+    ):
+        value = value[1:-1]
+    return os.path.expandvars(value)
+
+
+def _load_deploy_env(project_root: Path) -> tuple[Path, Path | None]:
+    deploy_root = _candidate_deploy_roots(project_root)[0].resolve()
+    os.environ.setdefault("DEPLOY_ROOT", str(deploy_root))
+    os.environ.setdefault("LABEL_DETECTION_DEPLOY_ROOT", str(deploy_root))
+    os.environ.setdefault("APP_ROOT", str(project_root))
+    os.environ.setdefault("PROJECT_ROOT", str(project_root))
+
+    for root in _candidate_deploy_roots(project_root):
+        config_path = root / "config" / "deploy.env"
+        if not config_path.exists():
+            continue
+        deploy_root = root.resolve()
+        os.environ["DEPLOY_ROOT"] = str(deploy_root)
+        os.environ["LABEL_DETECTION_DEPLOY_ROOT"] = str(deploy_root)
+        os.environ.setdefault("APP_ROOT", str(project_root))
+        os.environ.setdefault("PROJECT_ROOT", str(project_root))
+        with config_path.open("r", encoding="utf-8") as file:
+            for line in file:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or "=" not in stripped:
+                    continue
+                key, raw_value = stripped.split("=", 1)
+                key = key.strip()
+                if not key or key.startswith("export "):
+                    key = key.removeprefix("export ").strip()
+                if not key or key in os.environ:
+                    continue
+                os.environ[key] = _parse_env_value(raw_value)
+        return deploy_root, config_path
+
+    return deploy_root, None
+
+
+DEPLOY_ROOT, DEPLOY_CONFIG_PATH = _load_deploy_env(PROJECT_ROOT)
+SAMPLES_DIR = Path(os.getenv("SAMPLES_DIR", str(PROJECT_ROOT / "samples")))
+RESULTS_ROOT = Path(
+    os.getenv(
+        "RESULTS_ROOT",
+        str((DEPLOY_ROOT if DEPLOY_ROOT != PROJECT_ROOT else PROJECT_ROOT) / "results"),
+    )
+)
 
 
 def _env_flag(name: str, default: str) -> bool:
@@ -118,7 +186,7 @@ LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "3"))
 # ==================== 输出目录 ====================
 DEFAULT_OUTPUT_DIR = os.getenv(
     "DEFAULT_OUTPUT_DIR",
-    str(PROJECT_ROOT / "results" / "unified"),
+    str(RESULTS_ROOT / "unified"),
 )
 
 # ==================== 图形比对配置 ====================

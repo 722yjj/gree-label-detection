@@ -83,6 +83,7 @@ from label_detection.preprocessing.pipeline import preprocess_target
 from label_detection.services.openai_compatible_client import OpenAICompatibleHTTPClient
 from label_detection.services.ollama_client import OllamaHTTPClient
 from label_detection.services.ocr_service import get_ocr_backend_name, get_ocr_with_boxes
+from label_detection.license import require_valid_license
 
 _llm = None
 
@@ -3781,6 +3782,12 @@ def build_arg_parser():
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
+
+    try:
+        require_valid_license()
+    except Exception as exc:  # noqa: BLE001
+        print(str(exc))
+        return 1
 
     print("运行模式: VLM")
     result = run_unified_detection(

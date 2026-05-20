@@ -15,9 +15,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     from desktop_app.app import build_main_window
+    from label_detection.license import verify_license
 
     app = QApplication(argv or sys.argv)
-    window = build_main_window()
+    license_status = verify_license()
+    window = build_main_window(license_status=license_status)
     window.show()
     return app.exec()
 

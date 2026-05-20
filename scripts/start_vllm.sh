@@ -3,11 +3,27 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DEPLOY_ROOT="${DEPLOY_ROOT:-${PROJECT_ROOT}}"
+DEPLOY_ENV="${DEPLOY_ENV:-${DEPLOY_ROOT}/config/deploy.env}"
+if [[ -f "${DEPLOY_ENV}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${DEPLOY_ENV}"
+  set +a
+fi
 
-VLLM_VENV="${VLLM_VENV:-/home/jnu/venvs/vllm}"
+APP_ROOT="${APP_ROOT:-${PROJECT_ROOT}}"
+RESULTS_ROOT="${RESULTS_ROOT:-${DEPLOY_ROOT}/results}"
+VLLM_VENV="${VLLM_VENV:-${DEPLOY_ROOT}/venvs/vllm}"
+if [[ ! -d "${VLLM_VENV}" && -d /home/jnu/venvs/vllm ]]; then
+  VLLM_VENV="/home/jnu/venvs/vllm"
+fi
 VLLM_PYTHON="${VLLM_PYTHON:-${VLLM_VENV}/bin/python}"
 VLLM_BIN="${VLLM_BIN:-${VLLM_VENV}/bin/vllm}"
-VLLM_MODEL_PATH="${VLLM_MODEL_PATH:-/home/jnu/models/Qwen3.6-27B-int4-AutoRound}"
+VLLM_MODEL_PATH="${VLLM_MODEL_PATH:-${DEPLOY_ROOT}/models/Qwen3.6-27B-int4-AutoRound}"
+if [[ ! -d "${VLLM_MODEL_PATH}" && -d /home/jnu/models/Qwen3.6-27B-int4-AutoRound ]]; then
+  VLLM_MODEL_PATH="/home/jnu/models/Qwen3.6-27B-int4-AutoRound"
+fi
 VLLM_SERVED_MODEL_NAME="${VLLM_SERVED_MODEL_NAME:-qwen3.6-27b-int4}"
 VLLM_HOST="${VLLM_HOST:-0.0.0.0}"
 VLLM_PORT="${VLLM_PORT:-8000}"
@@ -19,13 +35,14 @@ VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-1}"
 VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-12288}"
 VLLM_KV_CACHE_DTYPE="${VLLM_KV_CACHE_DTYPE:-fp8}"
 VLLM_TRUST_REMOTE_CODE="${VLLM_TRUST_REMOTE_CODE:-1}"
-VLLM_SPECULATIVE_CONFIG="${VLLM_SPECULATIVE_CONFIG:-{\"method\": \"mtp\", \"num_speculative_tokens\": 1}}"
+DEFAULT_VLLM_SPECULATIVE_CONFIG='{"method": "mtp", "num_speculative_tokens": 1}'
+VLLM_SPECULATIVE_CONFIG="${VLLM_SPECULATIVE_CONFIG:-${DEFAULT_VLLM_SPECULATIVE_CONFIG}}"
 VLLM_START_TIMEOUT="${VLLM_START_TIMEOUT:-300}"
 VLLM_API_KEY="${VLLM_API_KEY:-EMPTY}"
 VLLM_MANAGED_MODEL_PATH="${VLLM_MANAGED_MODEL_PATH:-${VLLM_MODEL_PATH}}"
 VLLM_MANAGED_MODEL_NAME="${VLLM_MANAGED_MODEL_NAME:-${VLLM_SERVED_MODEL_NAME}}"
 
-LOG_DIR="${PROJECT_ROOT}/results/vllm"
+LOG_DIR="${RESULTS_ROOT}/vllm"
 VLLM_STATE_DIR="${VLLM_STATE_DIR:-${LOG_DIR}}"
 VLLM_LOG_FILE="${VLLM_LOG_FILE:-${LOG_DIR}/server.log}"
 VLLM_PID_FILE="${VLLM_PID_FILE:-${LOG_DIR}/server.pid}"
@@ -57,8 +74,9 @@ Options:
   -h, --help    Show this help.
 
 Important environment overrides:
-  VLLM_VENV=/home/jnu/venvs/vllm
-  VLLM_MODEL_PATH=/home/jnu/models/Qwen3.6-27B-int4-AutoRound
+  DEPLOY_ROOT=/opt/gree-label-detection
+  VLLM_VENV=/opt/gree-label-detection/venvs/vllm
+  VLLM_MODEL_PATH=/opt/gree-label-detection/models/Qwen3.6-27B-int4-AutoRound
   VLLM_SERVED_MODEL_NAME=qwen3.6-27b-int4
   VLLM_PORT=8000
   VLLM_MAX_MODEL_LEN=49152
@@ -127,6 +145,23 @@ model_is_expected() {
   done <<<"${models}"
 
   return 1
+}
+
+validate_speculative_config() {
+  if [[ -z "${VLLM_SPECULATIVE_CONFIG}" ]]; then
+    return 0
+  fi
+
+  "${VLLM_PYTHON}" - "${VLLM_SPECULATIVE_CONFIG}" <<'PY'
+import json
+import sys
+
+try:
+    json.loads(sys.argv[1])
+except json.JSONDecodeError as exc:
+    print(f"Invalid VLLM_SPECULATIVE_CONFIG: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PY
 }
 
 port_listeners() {
@@ -198,6 +233,8 @@ is_managed_vllm_pid() {
 }
 
 build_serve_args() {
+  validate_speculative_config
+
   SERVE_ARGS=(
     serve "${VLLM_MODEL_PATH}"
     --host "${VLLM_HOST}"
@@ -239,6 +276,9 @@ export VLLM_MODEL=${VLLM_SERVED_MODEL_NAME}
 export OPENAI_COMPATIBLE_MODEL=${VLLM_SERVED_MODEL_NAME}
 export TEXT_LLM_MODEL=${VLLM_SERVED_MODEL_NAME}
 export GRAPHIC_VLM_MODEL=${VLLM_SERVED_MODEL_NAME}
+export DEPLOY_ROOT=${DEPLOY_ROOT}
+export APP_ROOT=${APP_ROOT}
+export RESULTS_ROOT=${RESULTS_ROOT}
 EOF
 }
 
@@ -329,6 +369,7 @@ PY
 
 run_check() {
   echo "Project root: ${PROJECT_ROOT}"
+  echo "Deploy root: ${DEPLOY_ROOT}"
   echo "vLLM venv: ${VLLM_VENV}"
   echo "Model path: ${VLLM_MODEL_PATH}"
   echo "Served model name: ${VLLM_SERVED_MODEL_NAME}"

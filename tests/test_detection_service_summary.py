@@ -73,6 +73,7 @@ def test_summarize_result_counts_label_text_difference():
 def test_detection_service_passes_output_mode_to_workflow(tmp_path, monkeypatch):
     from desktop_app.models import DetectionJobRequest, TemplateRecord
 
+    monkeypatch.setenv("LABEL_DETECTION_LICENSE_BYPASS", "1")
     monkeypatch.setenv("DESKTOP_DETECTION_PIPELINE", "unified")
     template_path = tmp_path / "template.png"
     target_path = tmp_path / "target.jpg"
@@ -132,6 +133,7 @@ def test_detection_service_passes_output_mode_to_workflow(tmp_path, monkeypatch)
 def test_detection_service_defaults_to_traditional_full_image_diff(tmp_path, monkeypatch):
     from desktop_app.models import DetectionJobRequest, TemplateRecord
 
+    monkeypatch.setenv("LABEL_DETECTION_LICENSE_BYPASS", "1")
     monkeypatch.setenv("DESKTOP_TRADITIONAL_DIFF_MODEL", "test-model")
     template_path = tmp_path / "template.png"
     target_path = tmp_path / "target.jpg"

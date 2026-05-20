@@ -13,14 +13,15 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 from uuid import uuid4
 
-from label_detection.core.config import PROJECT_ROOT, SAMPLES_DIR
+from label_detection.core.config import PROJECT_ROOT, RESULTS_ROOT, SAMPLES_DIR
 from label_detection.extraction.template_source import SUPPORTED_TEMPLATE_IMAGE_SUFFIXES
+from label_detection.license import require_valid_license
 from label_detection.matching.ocr import text_field_values_match
 
 
 DEFAULT_TEMPLATE_ROOTS = (SAMPLES_DIR / "pdfs",)
 DEFAULT_TARGET_ROOTS = (SAMPLES_DIR / "images" / "produce",)
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "results" / "batch_samples"
+DEFAULT_OUTPUT_DIR = RESULTS_ROOT / "batch_samples"
 TARGET_IMAGE_SUFFIXES = tuple(sorted(SUPPORTED_TEMPLATE_IMAGE_SUFFIXES))
 TEMPLATE_SUFFIXES = (".pdf",) + TARGET_IMAGE_SUFFIXES
 
@@ -637,6 +638,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.dry_run:
         return 0
+
+    try:
+        require_valid_license()
+    except Exception as exc:  # noqa: BLE001
+        print(str(exc))
+        return 1
 
     output_dir.mkdir(parents=True, exist_ok=True)
     records: List[CaseRunRecord] = []

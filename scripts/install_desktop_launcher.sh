@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DEPLOY_ROOT="${DEPLOY_ROOT:-${PROJECT_ROOT}}"
 TEMPLATE="${PROJECT_ROOT}/packaging/linux/label-detection.desktop.template"
 APP_DIR="${HOME}/.local/share/applications"
 APP_FILE="${APP_DIR}/label-detection.desktop"
@@ -17,7 +18,10 @@ if [[ ! -f "${TEMPLATE}" ]]; then
 fi
 
 mkdir -p "${APP_DIR}"
-sed "s|@PROJECT_ROOT@|${PROJECT_ROOT}|g" "${TEMPLATE}" > "${APP_FILE}"
+sed \
+  -e "s|@PROJECT_ROOT@|${PROJECT_ROOT}|g" \
+  -e "s|@DEPLOY_ROOT@|${DEPLOY_ROOT}|g" \
+  "${TEMPLATE}" > "${APP_FILE}"
 chmod +x "${APP_FILE}"
 rm -f "${LEGACY_APP_FILE}"
 
@@ -36,4 +40,4 @@ if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database "${APP_DIR}" >/dev/null 2>&1 || true
 fi
 
-echo "可先运行检查: ${PROJECT_ROOT}/scripts/start_desktop.sh --check"
+echo "可先运行检查: ${DEPLOY_ROOT}/bin/check.sh"

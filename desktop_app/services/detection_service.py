@@ -17,9 +17,10 @@ from label_detection.core.config import (
     GRAPHIC_VLM_MODEL,
     OPENAI_COMPATIBLE_API_BASE,
     OPENAI_COMPATIBLE_API_KEY,
-    PROJECT_ROOT,
+    RESULTS_ROOT,
     VLM_TIMEOUT,
 )
+from label_detection.license import require_valid_license
 from label_detection.matching.ocr import text_field_values_match
 
 
@@ -70,9 +71,10 @@ class DetectionService:
     """Run the existing workflow and normalize the result for the UI."""
 
     def __init__(self, output_root: Path | None = None) -> None:
-        self.output_root = Path(output_root or PROJECT_ROOT / "results" / "desktop_app")
+        self.output_root = Path(output_root or RESULTS_ROOT / "desktop_app")
 
     def run(self, request: DetectionJobRequest) -> DetectionJobResult:
+        require_valid_license()
         pipeline = os.getenv(
             "DESKTOP_DETECTION_PIPELINE",
             "traditional_full_image_diff",

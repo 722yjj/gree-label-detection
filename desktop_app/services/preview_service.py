@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from desktop_app.models import TemplateRecord
-from label_detection.core.config import PROJECT_ROOT
+from label_detection.core.config import RESULTS_ROOT
 from label_detection.extraction.template_source import resolve_template_input
 
 
@@ -15,7 +15,7 @@ class PreviewService:
     def __init__(self, cache_root: Path | None = None) -> None:
         self.cache_root = Path(
             cache_root
-            or PROJECT_ROOT / "results" / "desktop_app" / "template_preview_cache"
+            or RESULTS_ROOT / "desktop_app" / "template_preview_cache"
         )
         self._cache: dict[Path, tuple[int, Path | None]] = {}
 

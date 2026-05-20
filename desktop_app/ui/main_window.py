@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from desktop_app.models import DetectionJobResult, HistoryRecord, TemplateRecord
+from label_detection.license import LicenseStatus
 
 
 class ScaledImageLabel(QLabel):
@@ -159,6 +160,14 @@ class MainWindow(QMainWindow):
         self.graphic_stats_value = QLabel("-")
         self.summary_value = QLabel("请先选择模板和目标图片")
         self.summary_value.setWordWrap(True)
+        self.license_machine_value = QLineEdit()
+        self.license_machine_value.setReadOnly(True)
+        self.license_status_value = QLabel("-")
+        self.license_expiry_value = QLabel("-")
+        self.license_path_value = QLineEdit()
+        self.license_path_value.setReadOnly(True)
+        self.license_reason_value = QLabel("-")
+        self.license_reason_value.setWordWrap(True)
         self.output_dir_value = QLineEdit()
         self.output_dir_value.setReadOnly(True)
         self.history_output_dir_value = QLineEdit()
@@ -192,6 +201,7 @@ class MainWindow(QMainWindow):
         self._camera_busy = False
         self._capture_action_enabled = True
         self._next_enabled = False
+        self._license_allows_detection = True
 
         self._build_layout()
         self._apply_styles()
@@ -328,6 +338,22 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Maximum,
         )
 
+        license_group = QGroupBox("授权状态")
+        license_layout = QFormLayout()
+        license_layout.setContentsMargins(12, 12, 12, 12)
+        license_layout.setVerticalSpacing(8)
+        license_layout.addRow("机器码", self.license_machine_value)
+        license_layout.addRow("授权状态", self.license_status_value)
+        license_layout.addRow("到期时间", self.license_expiry_value)
+        license_layout.addRow("授权文件", self.license_path_value)
+        license_layout.addRow("失败原因", self.license_reason_value)
+        license_group.setLayout(license_layout)
+        license_group.setMaximumHeight(190)
+        license_group.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Maximum,
+        )
+
         history_group = QGroupBox("历史记录")
         history_outer_layout = QVBoxLayout()
         history_outer_layout.setContentsMargins(12, 12, 12, 12)
@@ -390,6 +416,7 @@ class MainWindow(QMainWindow):
         right_lower_layout.setContentsMargins(0, 0, 0, 0)
         right_lower_layout.setSpacing(12)
         right_lower_layout.addWidget(result_group)
+        right_lower_layout.addWidget(license_group)
         right_lower_layout.addWidget(history_group)
         right_lower_layout.addStretch(1)
 
@@ -728,6 +755,28 @@ class MainWindow(QMainWindow):
             "检测完成后显示画框结果图",
         )
 
+    def set_license_status(self, status: LicenseStatus) -> None:
+        self._license_allows_detection = status.ok
+        self.license_machine_value.setText(status.machine_fingerprint)
+        self.license_status_value.setText("有效" if status.ok else "无效")
+        self.license_expiry_value.setText(status.expires_at or "-")
+        self.license_path_value.setText(status.license_path)
+        self.license_reason_value.setText(status.reason or "-")
+        if status.ok:
+            self.license_status_value.setStyleSheet("color: #1f7a4f; font-weight: 700;")
+            self.set_status("授权有效")
+        else:
+            self.license_status_value.setStyleSheet("color: #c0392b; font-weight: 700;")
+            self.set_status("授权失败")
+            self.set_summary_text(status.reason)
+            self.set_verdict("授权失败")
+            self.set_busy(True)
+            self.code_input.setReadOnly(True)
+            self.query_button.setDisabled(True)
+            self.template_list.setDisabled(True)
+            self.detailed_output_checkbox.setDisabled(True)
+        self._sync_run_button()
+
     def clear_result_image(self) -> None:
         self._result_preview_path = None
         self._render_image(
@@ -919,7 +968,10 @@ class MainWindow(QMainWindow):
 
     def _sync_run_button(self) -> None:
         self.run_button.setDisabled(
-            self._busy or self._camera_busy or not self._detection_enabled
+            self._busy
+            or self._camera_busy
+            or not self._detection_enabled
+            or not self._license_allows_detection
         )
 
     def _sync_capture_controls(self) -> None:

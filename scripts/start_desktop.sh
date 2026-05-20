@@ -3,17 +3,28 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-PYTHON="${PROJECT_ROOT}/.venv/bin/python"
-LOG_DIR="${PROJECT_ROOT}/results/desktop_app"
+DEPLOY_ROOT="${DEPLOY_ROOT:-${PROJECT_ROOT}}"
+DEPLOY_ENV="${DEPLOY_ENV:-${DEPLOY_ROOT}/config/deploy.env}"
+if [[ -f "${DEPLOY_ENV}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${DEPLOY_ENV}"
+  set +a
+fi
+
+APP_ROOT="${APP_ROOT:-${PROJECT_ROOT}}"
+PYTHON="${APP_PYTHON:-${PYTHON:-${APP_ROOT}/.venv/bin/python}}"
+RESULTS_ROOT="${RESULTS_ROOT:-${DEPLOY_ROOT}/results}"
+LOG_DIR="${RESULTS_ROOT}/desktop_app"
 LOG_FILE="${LOG_DIR}/startup.log"
 OLLAMA_LOG_FILE="${LOG_DIR}/ollama.log"
 LLM_PROVIDER_VALUE="${LLM_PROVIDER:-ollama}"
 OLLAMA_API_BASE_VALUE="${OLLAMA_API_BASE:-http://localhost:11434}"
 OLLAMA_AUTOSTART_VALUE="${OLLAMA_AUTOSTART:-1}"
 OLLAMA_START_TIMEOUT_VALUE="${OLLAMA_START_TIMEOUT:-20}"
-VLLM_START_SCRIPT="${VLLM_START_SCRIPT:-${PROJECT_ROOT}/scripts/start_vllm.sh}"
+VLLM_START_SCRIPT="${VLLM_START_SCRIPT:-${APP_ROOT}/scripts/start_vllm.sh}"
 VLLM_AUTOSTART_VALUE="${VLLM_AUTOSTART:-1}"
-VLLM_STATE_DIR="${VLLM_STATE_DIR:-${PROJECT_ROOT}/results/vllm}"
+VLLM_STATE_DIR="${VLLM_STATE_DIR:-${RESULTS_ROOT}/vllm}"
 VLLM_PID_FILE="${VLLM_PID_FILE:-${VLLM_STATE_DIR}/server.pid}"
 VLLM_DESKTOP_SESSION_FILE="${VLLM_DESKTOP_SESSION_FILE:-${VLLM_STATE_DIR}/desktop-session.token}"
 VLLM_DESKTOP_WATCHDOG_PID_FILE="${VLLM_DESKTOP_WATCHDOG_PID_FILE:-${VLLM_STATE_DIR}/desktop-watchdog.pid}"
@@ -21,6 +32,7 @@ VLLM_DESKTOP_SHUTDOWN_DELAY_VALUE="${VLLM_DESKTOP_SHUTDOWN_DELAY:-1800}"
 VLLM_WAS_MANAGED=0
 VLLM_MANAGED_MODEL_PATH="${VLLM_MANAGED_MODEL_PATH:-}"
 VLLM_MANAGED_MODEL_NAME="${VLLM_MANAGED_MODEL_NAME:-}"
+LICENSE_VALID=1
 
 usage() {
   cat <<'EOF'
@@ -35,6 +47,7 @@ Environment:
   LLM_PROVIDER=vllm          Use project vLLM; desktop launcher sets this by default.
   VLLM_AUTOSTART=0           Disable automatic vLLM startup.
   VLLM_START_SCRIPT=path     Override the vLLM startup script.
+  LABEL_DETECTION_LICENSE=path Override the offline license path.
   VLLM_DESKTOP_SHUTDOWN_DELAY=1800  Seconds to wait after desktop exit before stopping vLLM.
   OLLAMA_AUTOSTART=0         Disable automatic local Ollama startup.
   OLLAMA_BIN=/path/ollama   Override the Ollama executable path.
@@ -339,7 +352,7 @@ for arg in "$@"; do
   esac
 done
 
-cd "${PROJECT_ROOT}"
+cd "${APP_ROOT}"
 mkdir -p "${LOG_DIR}"
 
 if [[ ! -x "${PYTHON}" ]]; then
@@ -353,13 +366,31 @@ if [[ ! -x "${PYTHON}" ]]; then
 fi
 
 echo "准备启动标签检测桌面端..." | tee "${LOG_FILE}"
-start_vllm_if_needed
-if [[ "${LLM_PROVIDER_VALUE}" == "vllm" ]]; then
-  if is_project_managed_vllm_pid; then
-    VLLM_WAS_MANAGED=1
+echo "部署目录: ${DEPLOY_ROOT}" | tee -a "${LOG_FILE}"
+echo "应用目录: ${APP_ROOT}" | tee -a "${LOG_FILE}"
+
+echo "检查离线授权..." | tee -a "${LOG_FILE}"
+if ! "${PYTHON}" -m label_detection.license verify \
+  --license "${LABEL_DETECTION_LICENSE:-${DEPLOY_ROOT}/licenses/license.json}" \
+  2>&1 | tee -a "${LOG_FILE}"; then
+  LICENSE_VALID=0
+  if [[ "${CHECK_ONLY}" == "1" ]]; then
+    echo "授权检查失败。" | tee -a "${LOG_FILE}"
+    exit 1
   fi
+  echo "授权无效，桌面端将只显示机器码和授权状态。" | tee -a "${LOG_FILE}"
 fi
-start_ollama_if_needed
+if [[ "${LICENSE_VALID}" == "1" ]]; then
+  start_vllm_if_needed
+  if [[ "${LLM_PROVIDER_VALUE}" == "vllm" ]]; then
+    if is_project_managed_vllm_pid; then
+      VLLM_WAS_MANAGED=1
+    fi
+  fi
+  start_ollama_if_needed
+else
+  echo "跳过模型服务自动启动: 授权无效" | tee -a "${LOG_FILE}"
+fi
 
 CHECK_ARGS=()
 if [[ "${STRICT_SERVICES}" == "1" ]]; then
@@ -367,7 +398,7 @@ if [[ "${STRICT_SERVICES}" == "1" ]]; then
 fi
 
 echo "运行桌面端启动检查..." | tee -a "${LOG_FILE}"
-if ! "${PYTHON}" "${PROJECT_ROOT}/scripts/check_desktop_env.py" "${CHECK_ARGS[@]}" 2>&1 | tee -a "${LOG_FILE}"; then
+if ! "${PYTHON}" "${APP_ROOT}/scripts/check_desktop_env.py" "${CHECK_ARGS[@]}" 2>&1 | tee -a "${LOG_FILE}"; then
   echo "启动检查失败，详情见: ${LOG_FILE}" | tee -a "${LOG_FILE}"
   exit 1
 fi
