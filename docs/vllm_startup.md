@@ -14,7 +14,8 @@
 | `VLLM_API_BASE` | `http://127.0.0.1:8000/v1` |
 | `VLLM_HOST` / `VLLM_PORT` | `0.0.0.0` / `8000` |
 | `VLLM_MAX_MODEL_LEN` | `49152` |
-| `VLLM_GPU_MEMORY_UTILIZATION` | `0.30` |
+| `VLLM_KV_CACHE_MEMORY_BYTES` | `3G` |
+| `VLLM_GPU_MEMORY_UTILIZATION` | `0.30`，仅在未设置 `VLLM_KV_CACHE_MEMORY_BYTES` 时生效 |
 | `VLLM_MAX_NUM_SEQS` | `1` |
 | `VLLM_MAX_NUM_BATCHED_TOKENS` | `12288` |
 | `VLLM_KV_CACHE_DTYPE` | `fp8` |
@@ -30,10 +31,10 @@
   --served-model-name qwen3.6-27b-int4 \
   --dtype auto \
   --max-model-len 49152 \
-  --gpu-memory-utilization 0.30 \
   --max-num-seqs 1 \
   --max-num-batched-tokens 12288 \
   --kv-cache-dtype fp8 \
+  --kv-cache-memory-bytes 3G \
   --trust-remote-code \
   --speculative-config '{"method": "mtp", "num_speculative_tokens": 1}'
 ```
@@ -156,30 +157,31 @@ eval "$(scripts/start_vllm.sh --print-env)"
 
 ## 临时覆盖默认参数
 
-更省显存，降低上下文到 32768：
+更省显存，降低上下文到 32768，并临时回退为显存比例模式：
 
 ```bash
+VLLM_KV_CACHE_MEMORY_BYTES= \
 VLLM_MAX_MODEL_LEN=32768 \
 VLLM_GPU_MEMORY_UTILIZATION=0.30 \
 scripts/start_vllm.sh restart
 ```
 
-只临时把显存比例改为 0.40：
+只临时把 KV cache 改为 4G：
 
 ```bash
-VLLM_GPU_MEMORY_UTILIZATION=0.40 scripts/start_vllm.sh restart
+VLLM_KV_CACHE_MEMORY_BYTES=4G scripts/start_vllm.sh restart
 ```
 
-如果 `0.30 + 49152` 启动时提示 KV cache 或上下文容量不足，优先尝试：
+如果 `3G + 49152` 启动时提示 KV cache 或上下文容量不足，优先尝试：
 
 ```bash
 VLLM_MAX_MODEL_LEN=32768 scripts/start_vllm.sh restart
 ```
 
-再考虑提高：
+再考虑提高 KV cache：
 
 ```bash
-VLLM_GPU_MEMORY_UTILIZATION=0.35 scripts/start_vllm.sh restart
+VLLM_KV_CACHE_MEMORY_BYTES=4G scripts/start_vllm.sh restart
 ```
 
 ## 直接测试接口
