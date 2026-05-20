@@ -31,6 +31,7 @@ VLLM_API_BASE="${VLLM_API_BASE:-http://127.0.0.1:${VLLM_PORT}/v1}"
 VLLM_DTYPE="${VLLM_DTYPE:-auto}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-49152}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.30}"
+VLLM_KV_CACHE_MEMORY_BYTES="${VLLM_KV_CACHE_MEMORY_BYTES:-}"
 VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-1}"
 VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-12288}"
 VLLM_KV_CACHE_DTYPE="${VLLM_KV_CACHE_DTYPE:-fp8}"
@@ -81,6 +82,7 @@ Important environment overrides:
   VLLM_PORT=8000
   VLLM_MAX_MODEL_LEN=49152
   VLLM_GPU_MEMORY_UTILIZATION=0.30
+  VLLM_KV_CACHE_MEMORY_BYTES=12G
   VLLM_KV_CACHE_DTYPE=fp8
   VLLM_DESKTOP_SHUTDOWN_DELAY=1800
 EOF
@@ -242,11 +244,16 @@ build_serve_args() {
     --served-model-name "${VLLM_SERVED_MODEL_NAME}"
     --dtype "${VLLM_DTYPE}"
     --max-model-len "${VLLM_MAX_MODEL_LEN}"
-    --gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION}"
     --max-num-seqs "${VLLM_MAX_NUM_SEQS}"
     --max-num-batched-tokens "${VLLM_MAX_NUM_BATCHED_TOKENS}"
     --kv-cache-dtype "${VLLM_KV_CACHE_DTYPE}"
   )
+
+  if [[ -n "${VLLM_KV_CACHE_MEMORY_BYTES}" ]]; then
+    SERVE_ARGS+=(--kv-cache-memory-bytes "${VLLM_KV_CACHE_MEMORY_BYTES}")
+  else
+    SERVE_ARGS+=(--gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION}")
+  fi
 
   if enabled "${VLLM_TRUST_REMOTE_CODE}"; then
     SERVE_ARGS+=(--trust-remote-code)
