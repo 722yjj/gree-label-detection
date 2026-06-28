@@ -2316,10 +2316,15 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
     merged_candidate_boxes_final = scale_boxes(merged_boxes, scale=panel_scale, shape=aligned_target.shape[:2])
     final_result = draw_boxes(aligned_target, aligned_boxes, box_key="display_box")
 
+    annotation_base_path = output_dir / "annotation_base.jpg"
     final_result_path = output_dir / "final_result.jpg"
+    imwrite(annotation_base_path, aligned_target)
     imwrite(final_result_path, final_result)
 
-    artifacts: Dict[str, str] = {"final_result": str(final_result_path)}
+    artifacts: Dict[str, str] = {
+        "annotation_base": str(annotation_base_path),
+        "final_result": str(final_result_path),
+    }
     if args.save_debug:
         debug_paths = {
             "template_foreground_mask": output_dir / "template_foreground_mask.png",
@@ -2374,7 +2379,10 @@ def _run_from_args(args: argparse.Namespace) -> Dict[str, Any]:
             "scale_from_aligned_images": panel_scale,
             "comparison_shape": list(template_panel.shape[:2]),
             "final_result_shape": list(final_result.shape[:2]),
+            "annotation_base_shape": list(aligned_target.shape[:2]),
         },
+        "annotation_image": str(annotation_base_path),
+        "annotation_coordinate_space": "aligned_label_image",
         "parameters": {
             "diff_tolerance": args.diff_tolerance,
             "merge_radius": args.merge_radius,

@@ -1,3 +1,5 @@
+import json
+
 from desktop_app.services.detection_service import DetectionService
 
 
@@ -153,8 +155,10 @@ def test_detection_service_defaults_to_traditional_full_image_diff(tmp_path, mon
         case_dir = tmp_path / "desktop-results" / "600004075219" / run_name
         case_dir.mkdir(parents=True, exist_ok=True)
         final_image = case_dir / "final_result.jpg"
+        annotation_base = case_dir / "annotation_base.jpg"
         result_json = case_dir / "result.json"
         final_image.write_bytes(b"image")
+        annotation_base.write_bytes(b"base")
         result_json.write_text("{}", encoding="utf-8")
         captured["template"] = template
         captured["target"] = target
@@ -170,7 +174,12 @@ def test_detection_service_defaults_to_traditional_full_image_diff(tmp_path, mon
             "merged_candidate_box_count": 1,
             "final_boxes": [{"box": [1, 2, 3, 4]}],
             "vlm_filter_results": [{"vlm_decision": "keep"}],
-            "artifacts": {"final_result": str(final_image)},
+            "annotation_image": str(annotation_base),
+            "annotation_coordinate_space": "aligned_label_image",
+            "artifacts": {
+                "annotation_base": str(annotation_base),
+                "final_result": str(final_image),
+            },
         }
 
     monkeypatch.setattr(
@@ -200,9 +209,13 @@ def test_detection_service_defaults_to_traditional_full_image_diff(tmp_path, mon
     assert result.graphic_mismatch_count == 1
     assert result.visualization_path == result.output_dir / "visualization_diff.jpg"
     assert sorted(path.name for path in result.output_dir.iterdir()) == [
+        "annotation_base.jpg",
         "final_result.json",
         "visualization_diff.jpg",
     ]
+    payload = json.loads((result.output_dir / "final_result.json").read_text(encoding="utf-8"))
+    assert payload["annotation_image"] == str(result.output_dir / "annotation_base.jpg")
+    assert payload["annotation_coordinate_space"] == "aligned_label_image"
 
 
 def test_traditional_diff_model_resolves_single_vllm_served_name(monkeypatch):

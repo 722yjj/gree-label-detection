@@ -12,6 +12,7 @@ from desktop_app.devices.camera.base import CameraAdapter
 from desktop_app.devices.scanner.base import ScannerAdapter
 from desktop_app.devices.scanner_input import KeyboardWedgeScannerInput
 from desktop_app.models import DetectionJobRequest, DetectionJobResult, HistoryRecord
+from desktop_app.repositories.annotation_repository import AnnotationRepository
 from desktop_app.repositories.history_repository import HistoryRepository
 from desktop_app.repositories.template_repository import TemplateRepository
 from desktop_app.services.detection_service import DetectionService
@@ -72,6 +73,7 @@ class AppController(QObject):
         scanner_adapter: ScannerAdapter | None = None,
         preview_service: PreviewService | None = None,
         history_repository: HistoryRepository | None = None,
+        annotation_repository: AnnotationRepository | None = None,
         auto_start_camera_preview: bool = True,
         settings: QSettings | None = None,
     ) -> None:
@@ -83,6 +85,7 @@ class AppController(QObject):
         self.scanner_adapter = scanner_adapter
         self.preview_service = preview_service
         self.history_repository = history_repository
+        self.annotation_repository = annotation_repository
         self._thread: QThread | None = None
         self._worker: DetectionWorker | None = None
         self._camera_preview_thread: QThread | None = None
@@ -117,6 +120,8 @@ class AppController(QObject):
         self.view.camera_rotation_requested.connect(self.rotate_camera_clockwise)
         self.view.next_target_requested.connect(self.prepare_next_target)
         self.view.run_detection_requested.connect(self.run_detection)
+        self.view.save_annotation_requested.connect(self.save_current_annotation)
+        self.view.history_selection_changed.connect(self.load_history_annotation)
         self.view.template_selection_changed.connect(self.refresh_template_preview)
         self.view.destroyed.connect(self._stop_camera_preview)
 
@@ -535,6 +540,10 @@ class AppController(QObject):
         self.view.set_busy(False)
         self.view.set_status("检测完成")
         self.view.show_detection_result(result)
+        if self.annotation_repository is not None:
+            annotation = self.annotation_repository.build_from_detection_result(result)
+            annotation["detection_duration_seconds"] = duration_seconds
+            self.view.show_annotation(annotation)
         self.view.set_detection_duration_seconds(duration_seconds)
         record = HistoryRecord(
             created_at=datetime.now().isoformat(timespec="seconds"),
@@ -558,6 +567,34 @@ class AppController(QObject):
         self._sync_camera_actions()
         self._restore_code_focus(select_all=True)
         self._refresh_detection_ready_state()
+
+    def save_current_annotation(self) -> None:
+        if self.annotation_repository is None:
+            self.view.set_status("标注存储未启用")
+            return
+
+        annotation = self.view.current_annotation_payload()
+        if annotation is None:
+            self.view.set_status("没有可保存的标注")
+            return
+
+        try:
+            path = self.annotation_repository.save(annotation)
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            self.view.show_error(f"保存标注失败: {exc}")
+            return
+
+        self.view.set_annotation_saved_path(path)
+        self.view.set_status("人工标注已保存")
+
+    def load_history_annotation(self, record: object) -> None:
+        if self.annotation_repository is None:
+            return
+        if not isinstance(record, HistoryRecord):
+            self.view.clear_annotation()
+            return
+        annotation = self.annotation_repository.build_from_history_record(record)
+        self.view.show_annotation(annotation)
 
     def _handle_detection_failed(self, message: str) -> None:
         duration_seconds = self._finish_detection_timer()

@@ -295,6 +295,11 @@ class DetectionService:
             shutil.copy2(source_image, visualization_path)
 
         artifacts = dict(payload.get("artifacts") or {})
+        annotation_image = output_dir / "annotation_base.jpg"
+        if annotation_image.exists():
+            artifacts["annotation_base"] = str(annotation_image)
+            payload["annotation_image"] = str(annotation_image)
+            payload["annotation_coordinate_space"] = "aligned_label_image"
         if visualization_path.exists():
             artifacts["visualization_diff"] = str(visualization_path)
             artifacts["final_result"] = str(visualization_path)
@@ -329,6 +334,7 @@ class DetectionService:
                 if transient_path.exists() and transient_path not in {
                     final_json_path,
                     visualization_path,
+                    annotation_image,
                 }:
                     transient_path.unlink()
 

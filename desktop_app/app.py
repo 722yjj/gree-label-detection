@@ -9,6 +9,7 @@ from desktop_app.controllers.app_controller import AppController
 from desktop_app.devices.camera.factory import build_camera_adapter
 from desktop_app.devices.scanner.base import ScannerAdapter
 from desktop_app.devices.scanner.keyboard_wedge_adapter import KeyboardWedgeScannerAdapter
+from desktop_app.repositories.annotation_repository import AnnotationRepository
 from desktop_app.repositories.history_repository import HistoryRepository
 from desktop_app.repositories.template_repository import TemplateRepository
 from desktop_app.services.detection_service import DetectionService
@@ -36,6 +37,7 @@ def build_main_window(
             history_repository=HistoryRepository(
                 RESULTS_ROOT / "desktop_app" / "history.json"
             ),
+            annotation_repository=AnnotationRepository(),
         )
     window._controller = controller
     if license_status is not None:

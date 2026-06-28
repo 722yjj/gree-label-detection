@@ -4,8 +4,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QGuiApplication, QImage, QPixmap
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, QUrl, Signal
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QGuiApplication,
+    QImage,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QCheckBox,
     QFileDialog,
@@ -18,6 +26,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -109,6 +118,238 @@ class ScaledImageLabel(QLabel):
         self.setText("")
         super().setPixmap(scaled)
 
+
+class AnnotationImageLabel(ScaledImageLabel):
+    """Interactive image label for reviewing predicted boxes and drawing misses."""
+
+    box_selected = Signal(str, str)
+    manual_box_created = Signal(list)
+
+    def __init__(self, placeholder: str) -> None:
+        super().__init__(
+            placeholder,
+            preferred_width=520,
+            preferred_height=420,
+            minimum_width=240,
+            minimum_height=260,
+        )
+        self._predicted_boxes: list[dict] = []
+        self._manual_boxes: list[dict] = []
+        self._selected_kind: str | None = None
+        self._selected_id: str | None = None
+        self._draw_start_image_point: QPoint | None = None
+        self._draw_current_image_point: QPoint | None = None
+        self._dragging_manual_box = False
+        self.setMouseTracking(True)
+
+    def set_annotation_boxes(
+        self,
+        predicted_boxes: list[dict],
+        manual_boxes: list[dict],
+        *,
+        selected_kind: str | None = None,
+        selected_id: str | None = None,
+    ) -> None:
+        self._predicted_boxes = [dict(item) for item in predicted_boxes]
+        self._manual_boxes = [dict(item) for item in manual_boxes]
+        self._selected_kind = selected_kind
+        self._selected_id = selected_id
+        self._sync_pixmap()
+
+    def clear_preview(self, text: str | None = None) -> None:
+        self._predicted_boxes = []
+        self._manual_boxes = []
+        self._selected_kind = None
+        self._selected_id = None
+        self._draw_start_image_point = None
+        self._draw_current_image_point = None
+        self._dragging_manual_box = False
+        super().clear_preview(text)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton or self._source_pixmap is None:
+            super().mousePressEvent(event)
+            return
+        image_point = self._widget_to_image_point(event.position().toPoint())
+        if image_point is None:
+            super().mousePressEvent(event)
+            return
+        hit = self._hit_test(image_point)
+        if hit is not None:
+            self._selected_kind, self._selected_id = hit
+            self.box_selected.emit(self._selected_kind, self._selected_id)
+            self._sync_pixmap()
+            return
+        self._dragging_manual_box = True
+        self._draw_start_image_point = image_point
+        self._draw_current_image_point = image_point
+        self._sync_pixmap()
+
+    def mouseMoveEvent(self, event) -> None:
+        if not self._dragging_manual_box:
+            super().mouseMoveEvent(event)
+            return
+        image_point = self._widget_to_image_point(event.position().toPoint())
+        if image_point is None:
+            return
+        self._draw_current_image_point = image_point
+        self._sync_pixmap()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton or not self._dragging_manual_box:
+            super().mouseReleaseEvent(event)
+            return
+        start = self._draw_start_image_point
+        end = self._widget_to_image_point(event.position().toPoint())
+        self._dragging_manual_box = False
+        self._draw_start_image_point = None
+        self._draw_current_image_point = None
+        if start is None or end is None:
+            self._sync_pixmap()
+            return
+        bbox = self._points_to_bbox(start, end)
+        if bbox is not None:
+            self.manual_box_created.emit(bbox)
+        self._sync_pixmap()
+
+    def _sync_pixmap(self) -> None:
+        if self._source_pixmap is None or self._source_pixmap.isNull():
+            super()._sync_pixmap()
+            return
+
+        target_size = self.contentsRect().size()
+        if target_size.width() <= 0 or target_size.height() <= 0:
+            return
+
+        scaled = self._source_pixmap.scaled(
+            target_size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        composed = QPixmap(scaled)
+        painter = QPainter(composed)
+        scale_x = scaled.width() / self._source_pixmap.width()
+        scale_y = scaled.height() / self._source_pixmap.height()
+        for item in self._predicted_boxes:
+            self._draw_box(painter, item, scale_x, scale_y, kind="predicted")
+        for item in self._manual_boxes:
+            self._draw_box(painter, item, scale_x, scale_y, kind="manual")
+        if self._draw_start_image_point is not None and self._draw_current_image_point is not None:
+            preview_box = self._points_to_bbox(
+                self._draw_start_image_point,
+                self._draw_current_image_point,
+            )
+            if preview_box is not None:
+                self._draw_rect(
+                    painter,
+                    preview_box,
+                    scale_x,
+                    scale_y,
+                    QColor("#2f80ed"),
+                    selected=True,
+                )
+        painter.end()
+        self.setText("")
+        QLabel.setPixmap(self, composed)
+
+    def _draw_box(
+        self,
+        painter: QPainter,
+        item: dict,
+        scale_x: float,
+        scale_y: float,
+        *,
+        kind: str,
+    ) -> None:
+        bbox = self._normalized_bbox(item.get("bbox"))
+        if bbox is None:
+            return
+        decision = str(item.get("decision") or "unreviewed")
+        if kind == "manual":
+            color = QColor("#2f80ed")
+        elif decision == "true_positive":
+            color = QColor("#1f9d55")
+        elif decision == "false_positive":
+            color = QColor("#d64545")
+        else:
+            color = QColor("#f59f00")
+        selected = self._selected_kind == kind and self._selected_id == str(item.get("box_id"))
+        self._draw_rect(painter, bbox, scale_x, scale_y, color, selected=selected)
+
+    @staticmethod
+    def _draw_rect(
+        painter: QPainter,
+        bbox: list[int],
+        scale_x: float,
+        scale_y: float,
+        color: QColor,
+        *,
+        selected: bool,
+    ) -> None:
+        x1, y1, x2, y2 = bbox
+        pen = QPen(color)
+        pen.setWidth(2 if selected else 1)
+        painter.setPen(pen)
+        painter.drawRect(
+            QRect(
+                int(round(x1 * scale_x)),
+                int(round(y1 * scale_y)),
+                int(round((x2 - x1) * scale_x)),
+                int(round((y2 - y1) * scale_y)),
+            )
+        )
+
+    def _widget_to_image_point(self, point: QPoint) -> QPoint | None:
+        if self._source_pixmap is None or self._source_pixmap.isNull():
+            return None
+        displayed = self.pixmap()
+        if displayed is None or displayed.isNull():
+            return None
+        rect = self.contentsRect()
+        offset_x = rect.x() + max(0, (rect.width() - displayed.width()) // 2)
+        offset_y = rect.y() + max(0, (rect.height() - displayed.height()) // 2)
+        local_x = point.x() - offset_x
+        local_y = point.y() - offset_y
+        if local_x < 0 or local_y < 0 or local_x > displayed.width() or local_y > displayed.height():
+            return None
+        image_x = int(round(local_x * self._source_pixmap.width() / displayed.width()))
+        image_y = int(round(local_y * self._source_pixmap.height() / displayed.height()))
+        image_x = max(0, min(self._source_pixmap.width(), image_x))
+        image_y = max(0, min(self._source_pixmap.height(), image_y))
+        return QPoint(image_x, image_y)
+
+    def _hit_test(self, image_point: QPoint) -> tuple[str, str] | None:
+        candidates: list[tuple[str, dict]] = [
+            *[("manual", item) for item in self._manual_boxes],
+            *[("predicted", item) for item in self._predicted_boxes],
+        ]
+        for kind, item in reversed(candidates):
+            bbox = self._normalized_bbox(item.get("bbox"))
+            if bbox is None:
+                continue
+            x1, y1, x2, y2 = bbox
+            if x1 <= image_point.x() <= x2 and y1 <= image_point.y() <= y2:
+                return kind, str(item.get("box_id"))
+        return None
+
+    @staticmethod
+    def _points_to_bbox(start: QPoint, end: QPoint) -> list[int] | None:
+        x1, x2 = sorted([start.x(), end.x()])
+        y1, y2 = sorted([start.y(), end.y()])
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            return None
+        return [x1, y1, x2, y2]
+
+    @staticmethod
+    def _normalized_bbox(value: object) -> list[int] | None:
+        if not isinstance(value, (list, tuple)) or len(value) != 4:
+            return None
+        try:
+            x1, y1, x2, y2 = [int(round(float(item))) for item in value]
+        except (TypeError, ValueError):
+            return None
+        return [x1, y1, x2, y2]
+
 class MainWindow(QMainWindow):
     """Desktop UI shell for code lookup and detection runs."""
 
@@ -119,7 +360,9 @@ class MainWindow(QMainWindow):
     camera_rotation_requested = Signal()
     next_target_requested = Signal()
     run_detection_requested = Signal()
+    save_annotation_requested = Signal()
     template_selection_changed = Signal()
+    history_selection_changed = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -148,6 +391,16 @@ class MainWindow(QMainWindow):
         self.copy_output_dir_button = QPushButton("复制路径")
         self.open_history_dir_button = QPushButton("打开目录")
         self.copy_history_path_button = QPushButton("复制路径")
+        self.annotation_box_list = QTreeWidget()
+        self.annotation_selection_value = QLabel("未选中")
+        self.annotation_mark_tp_button = QPushButton("正确")
+        self.annotation_mark_fp_button = QPushButton("错误")
+        self.annotation_delete_manual_box_button = QPushButton("删除漏检框")
+        self.annotation_save_button = QPushButton("保存标注")
+        self.annotation_path_value = QLineEdit()
+        self.annotation_path_value.setReadOnly(True)
+        self.annotation_notes_edit = QPlainTextEdit()
+        self.annotation_notes_edit.setMaximumHeight(66)
 
         self.template_list = QTreeWidget()
         self.current_template_value = QLineEdit()
@@ -181,11 +434,7 @@ class MainWindow(QMainWindow):
             "请选择或采集目标图片",
             preferred_height=300,
         )
-        self.result_preview_label = self._build_image_label(
-            "检测完成后显示画框结果图",
-            preferred_width=520,
-            preferred_height=420,
-        )
+        self.result_preview_label = AnnotationImageLabel("检测完成后显示画框结果图")
         self.right_lower_scroll_area = QScrollArea()
         self.result_scroll_area = QScrollArea()
         self.history_scroll_area = QScrollArea()
@@ -195,6 +444,9 @@ class MainWindow(QMainWindow):
         self._template_preview_path: Path | None = None
         self._target_preview_path: Path | None = None
         self._result_preview_path: Path | None = None
+        self._annotation_payload: dict | None = None
+        self._selected_annotation_kind: str | None = None
+        self._selected_annotation_id: str | None = None
         self._did_auto_focus_code_input = False
         self._detection_enabled = False
         self._busy = False
@@ -208,6 +460,7 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._sync_current_template_label()
         self._sync_history_buttons()
+        self._sync_annotation_controls()
         self._sync_template_buttons()
         self._sync_output_buttons()
         self._sync_capture_controls()
@@ -396,6 +649,38 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Maximum,
         )
 
+        annotation_group = QGroupBox("人工复核标注")
+        annotation_layout = QVBoxLayout()
+        annotation_layout.setContentsMargins(12, 12, 12, 12)
+        annotation_layout.setSpacing(8)
+        self.annotation_box_list.setRootIsDecorated(False)
+        self.annotation_box_list.setItemsExpandable(False)
+        self.annotation_box_list.setAlternatingRowColors(True)
+        self.annotation_box_list.setColumnCount(3)
+        self.annotation_box_list.setHeaderLabels(["框", "判定", "位置"])
+        annotation_header = self.annotation_box_list.header()
+        annotation_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        annotation_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        annotation_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        annotation_layout.addWidget(self.annotation_box_list)
+        self.annotation_selection_value.setWordWrap(True)
+        annotation_layout.addWidget(self.annotation_selection_value)
+        annotation_button_row = QHBoxLayout()
+        annotation_button_row.addWidget(self.annotation_mark_tp_button)
+        annotation_button_row.addWidget(self.annotation_mark_fp_button)
+        annotation_button_row.addWidget(self.annotation_delete_manual_box_button)
+        annotation_button_row.addWidget(self.annotation_save_button)
+        annotation_layout.addLayout(annotation_button_row)
+        self.annotation_notes_edit.setPlaceholderText("人工备注")
+        annotation_layout.addWidget(self.annotation_notes_edit)
+        annotation_layout.addWidget(QLabel("标注文件"))
+        annotation_layout.addWidget(self.annotation_path_value)
+        annotation_group.setLayout(annotation_layout)
+        annotation_group.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Preferred,
+        )
+
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -416,6 +701,7 @@ class MainWindow(QMainWindow):
         right_lower_layout.setContentsMargins(0, 0, 0, 0)
         right_lower_layout.setSpacing(12)
         right_lower_layout.addWidget(result_group)
+        right_lower_layout.addWidget(annotation_group)
         right_lower_layout.addWidget(license_group)
         right_lower_layout.addWidget(history_group)
         right_lower_layout.addStretch(1)
@@ -582,12 +868,29 @@ class MainWindow(QMainWindow):
             self._handle_template_selection_changed
         )
         self.history_list.currentItemChanged.connect(self._handle_history_selection_changed)
+        self.annotation_box_list.currentItemChanged.connect(
+            self._handle_annotation_list_selection_changed
+        )
+        self.result_preview_label.box_selected.connect(self._select_annotation_box)
+        self.result_preview_label.manual_box_created.connect(self._add_manual_gt_box)
         self.open_template_button.clicked.connect(self._open_current_template)
         self.copy_template_button.clicked.connect(self._copy_current_template_path)
         self.open_output_dir_button.clicked.connect(self._open_output_dir)
         self.copy_output_dir_button.clicked.connect(self._copy_output_dir)
         self.open_history_dir_button.clicked.connect(self._open_history_output_dir)
         self.copy_history_path_button.clicked.connect(self._copy_history_output_dir)
+        self.annotation_mark_tp_button.clicked.connect(
+            lambda _checked=False: self._mark_selected_annotation_box("true_positive")
+        )
+        self.annotation_mark_fp_button.clicked.connect(
+            lambda _checked=False: self._mark_selected_annotation_box("false_positive")
+        )
+        self.annotation_delete_manual_box_button.clicked.connect(
+            lambda _checked=False: self._delete_selected_manual_box()
+        )
+        self.annotation_save_button.clicked.connect(
+            lambda _checked=False: self.save_annotation_requested.emit()
+        )
 
     def code_text(self) -> str:
         return self.code_input.text().strip()
@@ -754,6 +1057,7 @@ class MainWindow(QMainWindow):
             self._result_preview_path,
             "检测完成后显示画框结果图",
         )
+        self._sync_annotation_image()
 
     def set_license_status(self, status: LicenseStatus) -> None:
         self._license_allows_detection = status.ok
@@ -836,6 +1140,7 @@ class MainWindow(QMainWindow):
         self.graphic_stats_value.setText("-")
         self.set_output_dir("")
         self.clear_result_image()
+        self.clear_annotation()
 
     def show_running_result(self) -> None:
         self.result_state_value.setText("检测中")
@@ -846,6 +1151,7 @@ class MainWindow(QMainWindow):
         self.graphic_stats_value.setText("-")
         self.set_output_dir("")
         self.clear_result_image()
+        self.clear_annotation()
 
     def show_failure_result(self, message: str) -> None:
         self.result_state_value.setText("检测失败")
@@ -856,6 +1162,7 @@ class MainWindow(QMainWindow):
         self.graphic_stats_value.setText("-")
         self.set_output_dir("")
         self.clear_result_image()
+        self.clear_annotation()
 
     def show_detection_result(self, result: DetectionJobResult) -> None:
         self.result_state_value.setText("检测完成")
@@ -871,6 +1178,260 @@ class MainWindow(QMainWindow):
         )
         self.set_output_dir(str(result.output_dir))
         self.set_result_image_path(result.visualization_path)
+
+    def clear_annotation(self) -> None:
+        self._annotation_payload = None
+        self._selected_annotation_kind = None
+        self._selected_annotation_id = None
+        self.annotation_box_list.clear()
+        self.result_preview_label.set_annotation_boxes([], [])
+        self.annotation_selection_value.setText("未选中")
+        self.annotation_notes_edit.setPlainText("")
+        self.annotation_path_value.setText("")
+        self._sync_annotation_controls()
+
+    def show_annotation(self, annotation: dict) -> None:
+        self._annotation_payload = dict(annotation)
+        self._selected_annotation_kind = None
+        self._selected_annotation_id = None
+        self.annotation_box_list.clear()
+        self.annotation_notes_edit.setPlainText(str(annotation.get("notes") or ""))
+        image_path = (annotation.get("image") or {}).get("path") if isinstance(annotation.get("image"), dict) else None
+        if image_path:
+            self.set_result_image_path(image_path)
+        run_dir = annotation.get("run_dir")
+        self.annotation_path_value.setText(
+            str(Path(str(run_dir)) / "manual_annotation.json") if run_dir else ""
+        )
+        predicted_boxes = []
+        for item in annotation.get("predicted_boxes") or []:
+            if not isinstance(item, dict):
+                continue
+            predicted_boxes.append(dict(item))
+            bbox = item.get("bbox") or []
+            bbox_text = ",".join(str(value) for value in bbox)
+            tree_item = QTreeWidgetItem(
+                [
+                    str(item.get("box_id") or ""),
+                    self._annotation_decision_label(str(item.get("decision") or "unreviewed")),
+                    bbox_text,
+                ]
+            )
+            tree_payload = dict(item)
+            tree_payload["annotation_kind"] = "predicted"
+            tree_item.setData(0, Qt.ItemDataRole.UserRole, tree_payload)
+            self.annotation_box_list.addTopLevelItem(tree_item)
+        manual_boxes = self._manual_boxes_with_ids(annotation.get("manual_gt_boxes") or [])
+        self._annotation_payload["manual_gt_boxes"] = manual_boxes
+        for item in manual_boxes:
+            bbox = item.get("bbox") or []
+            bbox_text = ",".join(str(value) for value in bbox)
+            tree_item = QTreeWidgetItem(
+                [
+                    str(item.get("box_id") or ""),
+                    "漏检框",
+                    bbox_text,
+                ]
+            )
+            tree_payload = dict(item)
+            tree_payload["annotation_kind"] = "manual"
+            tree_item.setData(0, Qt.ItemDataRole.UserRole, tree_payload)
+            self.annotation_box_list.addTopLevelItem(tree_item)
+        self._sync_annotation_image()
+        if self.annotation_box_list.topLevelItemCount():
+            self.annotation_box_list.setCurrentItem(self.annotation_box_list.topLevelItem(0))
+        else:
+            self.annotation_selection_value.setText("未选中")
+        self._sync_annotation_controls()
+
+    def current_annotation_payload(self) -> dict | None:
+        if self._annotation_payload is None:
+            return None
+        payload = dict(self._annotation_payload)
+        payload["notes"] = self.annotation_notes_edit.toPlainText().strip()
+        boxes = []
+        manual_boxes = []
+        for index in range(self.annotation_box_list.topLevelItemCount()):
+            tree_item = self.annotation_box_list.topLevelItem(index)
+            item = tree_item.data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(item, dict):
+                payload_item = dict(item)
+                kind = payload_item.pop("annotation_kind", "predicted")
+                if kind == "manual":
+                    manual_boxes.append(payload_item)
+                else:
+                    boxes.append(payload_item)
+        payload["predicted_boxes"] = boxes
+        payload["manual_gt_boxes"] = manual_boxes
+        return payload
+
+    def set_annotation_saved_path(self, path: str | Path) -> None:
+        self.annotation_path_value.setText(str(path))
+
+    @staticmethod
+    def _annotation_decision_label(value: str) -> str:
+        return {
+            "true_positive": "正确",
+            "false_positive": "错误",
+            "unreviewed": "未复核",
+        }.get(value, value or "未复核")
+
+    def _mark_selected_annotation_box(self, decision: str) -> None:
+        item = self.annotation_box_list.currentItem()
+        if item is None:
+            return
+        payload = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(payload, dict):
+            return
+        if payload.get("annotation_kind") == "manual":
+            return
+        payload["decision"] = decision
+        item.setData(0, Qt.ItemDataRole.UserRole, payload)
+        item.setText(1, self._annotation_decision_label(decision))
+        self._selected_annotation_kind = "predicted"
+        self._selected_annotation_id = str(payload.get("box_id"))
+        self._sync_annotation_image()
+        self._sync_annotation_controls()
+
+    def _add_manual_gt_box(self, bbox: list[int]) -> None:
+        if self._annotation_payload is None:
+            return
+        manual_boxes = list(self._annotation_payload.get("manual_gt_boxes") or [])
+        box_id = self._next_manual_box_id(manual_boxes)
+        manual_box = {
+            "box_id": box_id,
+            "bbox": bbox,
+            "kind": "manual_missing",
+            "source": "manual_draw",
+            "note": "",
+        }
+        manual_boxes.append(manual_box)
+        self._annotation_payload["manual_gt_boxes"] = manual_boxes
+        tree_item = QTreeWidgetItem(
+            [
+                box_id,
+                "漏检框",
+                ",".join(str(value) for value in bbox),
+            ]
+        )
+        tree_payload = dict(manual_box)
+        tree_payload["annotation_kind"] = "manual"
+        tree_item.setData(0, Qt.ItemDataRole.UserRole, tree_payload)
+        self.annotation_box_list.addTopLevelItem(tree_item)
+        self.annotation_box_list.setCurrentItem(tree_item)
+        self._selected_annotation_kind = "manual"
+        self._selected_annotation_id = box_id
+        self.set_status(f"已添加漏检框 {len(manual_boxes)} 个，保存后生效")
+        self._sync_annotation_image()
+        self._sync_annotation_controls()
+
+    def _delete_selected_manual_box(self) -> None:
+        item = self.annotation_box_list.currentItem()
+        if item is None:
+            return
+        payload = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(payload, dict) or payload.get("annotation_kind") != "manual":
+            return
+        box_id = str(payload.get("box_id"))
+        index = self.annotation_box_list.indexOfTopLevelItem(item)
+        if index >= 0:
+            self.annotation_box_list.takeTopLevelItem(index)
+        if self._annotation_payload is not None:
+            manual_boxes = [
+                dict(box)
+                for box in self._annotation_payload.get("manual_gt_boxes") or []
+                if str(box.get("box_id")) != box_id
+            ]
+            self._annotation_payload["manual_gt_boxes"] = manual_boxes
+        self._selected_annotation_kind = None
+        self._selected_annotation_id = None
+        self._sync_annotation_image()
+        self._sync_annotation_controls()
+
+    def _handle_annotation_list_selection_changed(self, current: QTreeWidgetItem | None, *_args) -> None:
+        if current is None:
+            self._selected_annotation_kind = None
+            self._selected_annotation_id = None
+            self.annotation_selection_value.setText("未选中")
+            self._sync_annotation_image()
+            self._sync_annotation_controls()
+            return
+        payload = current.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(payload, dict):
+            return
+        self._selected_annotation_kind = str(payload.get("annotation_kind") or "predicted")
+        self._selected_annotation_id = str(payload.get("box_id") or "")
+        self._update_annotation_selection_text(payload)
+        self._sync_annotation_image()
+        self._sync_annotation_controls()
+
+    def _select_annotation_box(self, kind: str, box_id: str) -> None:
+        for index in range(self.annotation_box_list.topLevelItemCount()):
+            item = self.annotation_box_list.topLevelItem(index)
+            payload = item.data(0, Qt.ItemDataRole.UserRole)
+            if not isinstance(payload, dict):
+                continue
+            if str(payload.get("annotation_kind")) == kind and str(payload.get("box_id")) == box_id:
+                self.annotation_box_list.setCurrentItem(item)
+                return
+        self._selected_annotation_kind = kind
+        self._selected_annotation_id = box_id
+        self._sync_annotation_controls()
+
+    def _sync_annotation_image(self) -> None:
+        if self._annotation_payload is None:
+            self.result_preview_label.set_annotation_boxes([], [])
+            return
+        predicted_boxes = []
+        manual_boxes = []
+        for index in range(self.annotation_box_list.topLevelItemCount()):
+            tree_item = self.annotation_box_list.topLevelItem(index)
+            item = tree_item.data(0, Qt.ItemDataRole.UserRole)
+            if not isinstance(item, dict):
+                continue
+            payload = dict(item)
+            kind = payload.pop("annotation_kind", "predicted")
+            if kind == "manual":
+                manual_boxes.append(payload)
+            else:
+                predicted_boxes.append(payload)
+        self.result_preview_label.set_annotation_boxes(
+            predicted_boxes,
+            manual_boxes,
+            selected_kind=self._selected_annotation_kind,
+            selected_id=self._selected_annotation_id,
+        )
+
+    def _update_annotation_selection_text(self, payload: dict) -> None:
+        kind = str(payload.get("annotation_kind") or "predicted")
+        bbox = payload.get("bbox") or []
+        bbox_text = ",".join(str(value) for value in bbox)
+        if kind == "manual":
+            self.annotation_selection_value.setText(f"当前：漏检框 {payload.get('box_id')}  {bbox_text}")
+            return
+        decision = self._annotation_decision_label(str(payload.get("decision") or "unreviewed"))
+        self.annotation_selection_value.setText(
+            f"当前：检测框 {payload.get('box_id')}  {decision}  {bbox_text}"
+        )
+
+    @staticmethod
+    def _manual_boxes_with_ids(values: object) -> list[dict]:
+        boxes = []
+        for index, item in enumerate(values if isinstance(values, list) else []):
+            if not isinstance(item, dict):
+                continue
+            payload = dict(item)
+            payload.setdefault("box_id", f"miss_{index}")
+            boxes.append(payload)
+        return boxes
+
+    @staticmethod
+    def _next_manual_box_id(manual_boxes: list[dict]) -> str:
+        existing = {str(item.get("box_id")) for item in manual_boxes if isinstance(item, dict)}
+        index = 0
+        while f"miss_{index}" in existing:
+            index += 1
+        return f"miss_{index}"
 
     @staticmethod
     def _format_detection_duration(seconds: float | None) -> str:
@@ -916,6 +1477,7 @@ class MainWindow(QMainWindow):
         record = self.selected_history_record()
         self.history_output_dir_value.setText(str(record.output_dir) if record else "")
         self._sync_history_buttons()
+        self.history_selection_changed.emit(record)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -994,6 +1556,29 @@ class MainWindow(QMainWindow):
         has_history = self.selected_history_record() is not None
         self.open_history_dir_button.setDisabled(not has_history)
         self.copy_history_path_button.setDisabled(not has_history)
+
+    def _sync_annotation_controls(self) -> None:
+        has_annotation = self._annotation_payload is not None
+        has_box = self.annotation_box_list.currentItem() is not None
+        self.annotation_notes_edit.setDisabled(not has_annotation)
+        current = self.annotation_box_list.currentItem()
+        current_payload = (
+            current.data(0, Qt.ItemDataRole.UserRole)
+            if current is not None
+            else None
+        )
+        selected_predicted = (
+            isinstance(current_payload, dict)
+            and current_payload.get("annotation_kind") != "manual"
+        )
+        selected_manual = (
+            isinstance(current_payload, dict)
+            and current_payload.get("annotation_kind") == "manual"
+        )
+        self.annotation_mark_tp_button.setDisabled(not has_box or not selected_predicted)
+        self.annotation_mark_fp_button.setDisabled(not has_box or not selected_predicted)
+        self.annotation_delete_manual_box_button.setDisabled(not has_box or not selected_manual)
+        self.annotation_save_button.setDisabled(not has_annotation)
 
     def _open_current_template(self) -> None:
         template = self.selected_template()
