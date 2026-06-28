@@ -14,6 +14,7 @@ from desktop_app.devices.scanner_input import KeyboardWedgeScannerInput
 from desktop_app.models import DetectionJobRequest, DetectionJobResult, HistoryRecord
 from desktop_app.repositories.annotation_repository import AnnotationRepository
 from desktop_app.repositories.history_repository import HistoryRepository
+from desktop_app.repositories.result_repository import DetectionResultRepository
 from desktop_app.repositories.template_repository import TemplateRepository
 from desktop_app.services.detection_service import DetectionService
 from desktop_app.services.preview_service import PreviewService
@@ -74,6 +75,7 @@ class AppController(QObject):
         preview_service: PreviewService | None = None,
         history_repository: HistoryRepository | None = None,
         annotation_repository: AnnotationRepository | None = None,
+        result_repository: DetectionResultRepository | None = None,
         auto_start_camera_preview: bool = True,
         settings: QSettings | None = None,
     ) -> None:
@@ -86,6 +88,7 @@ class AppController(QObject):
         self.preview_service = preview_service
         self.history_repository = history_repository
         self.annotation_repository = annotation_repository
+        self.result_repository = result_repository or DetectionResultRepository()
         self._thread: QThread | None = None
         self._worker: DetectionWorker | None = None
         self._camera_preview_thread: QThread | None = None
@@ -121,7 +124,7 @@ class AppController(QObject):
         self.view.next_target_requested.connect(self.prepare_next_target)
         self.view.run_detection_requested.connect(self.run_detection)
         self.view.save_annotation_requested.connect(self.save_current_annotation)
-        self.view.history_selection_changed.connect(self.load_history_annotation)
+        self.view.history_selection_changed.connect(self.load_history_result)
         self.view.template_selection_changed.connect(self.refresh_template_preview)
         self.view.destroyed.connect(self._stop_camera_preview)
 
@@ -587,14 +590,41 @@ class AppController(QObject):
         self.view.set_annotation_saved_path(path)
         self.view.set_status("人工标注已保存")
 
-    def load_history_annotation(self, record: object) -> None:
-        if self.annotation_repository is None:
-            return
+    def load_history_result(self, record: object) -> None:
         if not isinstance(record, HistoryRecord):
             self.view.clear_annotation()
             return
-        annotation = self.annotation_repository.build_from_history_record(record)
-        self.view.show_annotation(annotation)
+        if not record.output_dir.exists():
+            self.view.set_status(f"历史结果目录不存在: {record.output_dir}")
+            self.view.clear_annotation()
+            return
+
+        restored = self.result_repository.build_from_history_record(record)
+        if restored is None:
+            self.view.set_status(f"历史结果文件不存在: {record.output_dir}")
+            self.view.clear_annotation()
+            return
+
+        result, duration_seconds = restored
+        self.view.set_code_text(record.code)
+        if record.target_image_path.exists():
+            self.view.set_target_image_path(record.target_image_path)
+        else:
+            self.view.target_path_input.setText(str(record.target_image_path))
+        self.view.show_detection_result(result)
+        self.view.set_detection_duration_seconds(duration_seconds)
+        if self.annotation_repository is not None:
+            annotation = self.annotation_repository.build_from_history_record(record)
+            if duration_seconds is not None:
+                annotation["detection_duration_seconds"] = duration_seconds
+            self.view.show_annotation(annotation)
+        self.view.set_status("已加载历史结果")
+        self._camera_workflow_state = CAMERA_RESULT_READY
+        self._sync_camera_actions()
+        self._refresh_detection_ready_state()
+
+    def load_history_annotation(self, record: object) -> None:
+        self.load_history_result(record)
 
     def _handle_detection_failed(self, message: str) -> None:
         duration_seconds = self._finish_detection_timer()

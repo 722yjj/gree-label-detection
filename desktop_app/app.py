@@ -11,6 +11,7 @@ from desktop_app.devices.scanner.base import ScannerAdapter
 from desktop_app.devices.scanner.keyboard_wedge_adapter import KeyboardWedgeScannerAdapter
 from desktop_app.repositories.annotation_repository import AnnotationRepository
 from desktop_app.repositories.history_repository import HistoryRepository
+from desktop_app.repositories.result_repository import DetectionResultRepository
 from desktop_app.repositories.template_repository import TemplateRepository
 from desktop_app.services.detection_service import DetectionService
 from desktop_app.services.preview_service import PreviewService
@@ -38,6 +39,7 @@ def build_main_window(
                 RESULTS_ROOT / "desktop_app" / "history.json"
             ),
             annotation_repository=AnnotationRepository(),
+            result_repository=DetectionResultRepository(),
         )
     window._controller = controller
     if license_status is not None:

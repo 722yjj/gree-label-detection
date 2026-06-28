@@ -1,3 +1,4 @@
+import json
 import os
 import time
 from pathlib import Path
@@ -18,7 +19,9 @@ from desktop_app.controllers.app_controller import AppController
 from desktop_app.controllers import app_controller as app_controller_module
 from desktop_app.devices.scanner.keyboard_wedge_adapter import KeyboardWedgeScannerAdapter
 from desktop_app.devices.scanner.mock import MockScannerAdapter
-from desktop_app.models import DetectionJobResult, TemplateRecord
+from desktop_app.models import DetectionJobResult, HistoryRecord, TemplateRecord
+from desktop_app.repositories.annotation_repository import AnnotationRepository
+from desktop_app.repositories.result_repository import DetectionResultRepository
 from desktop_app.ui.main_window import MainWindow, ScaledImageLabel
 from desktop_app.workers.camera_preview_worker import (
     CameraPreviewWorker,
@@ -889,5 +892,90 @@ def test_detection_failed_displays_elapsed_duration(tmp_path, qapp, monkeypatch)
         controller._handle_detection_failed("服务不可用")
 
         assert window.detection_duration_value.text() == "1.50 秒"
+    finally:
+        window.close()
+
+
+def test_load_history_result_restores_detection_view(tmp_path, qapp):
+    window, controller, _repository = build_controller(tmp_path, qapp)
+    controller.annotation_repository = AnnotationRepository()
+    controller.result_repository = DetectionResultRepository()
+    run_dir = tmp_path / "desktop_app" / "600004075219" / "run_default"
+    run_dir.mkdir(parents=True)
+    target_path = tmp_path / "target.jpg"
+    target_image = np.full((80, 120, 3), 220, dtype=np.uint8)
+    assert cv2.imwrite(str(target_path), target_image)
+    visualization = run_dir / "visualization_diff.jpg"
+    annotation_base = run_dir / "annotation_base.jpg"
+    assert cv2.imwrite(str(visualization), target_image)
+    assert cv2.imwrite(str(annotation_base), target_image)
+    final_result = {
+        "success": True,
+        "pipeline": "traditional_full_image_diff",
+        "verdict": "不一致",
+        "final_box_count": 1,
+        "raw_candidate_box_count": 1,
+        "merged_candidate_box_count": 1,
+        "vlm_filter_results": [{"vlm_decision": "keep"}],
+        "final_boxes": [
+            {
+                "box": [10, 12, 30, 32],
+                "display_box": [8, 10, 34, 36],
+            }
+        ],
+        "visualization_diff": str(visualization),
+        "annotation_image": str(annotation_base),
+        "annotation_coordinate_space": "aligned_label_image",
+        "artifacts": {
+            "annotation_base": str(annotation_base),
+            "visualization_diff": str(visualization),
+        },
+    }
+    (run_dir / "final_result.json").write_text(
+        json.dumps(final_result, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    annotation = {
+        "version": "real_photo_annotation_v1",
+        "run_dir": str(run_dir),
+        "image": {"path": str(annotation_base)},
+        "detection_duration_seconds": 3.21,
+        "predicted_boxes": [
+            {
+                "box_id": "pred_0",
+                "bbox": [8, 10, 34, 36],
+                "decision": "true_positive",
+            }
+        ],
+        "manual_gt_boxes": [],
+    }
+    (run_dir / "manual_annotation.json").write_text(
+        json.dumps(annotation, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    record = HistoryRecord(
+        created_at="2026-06-28T10:00:00",
+        code="600004075219",
+        template_name="600004075219",
+        verdict="不一致",
+        output_dir=run_dir,
+        target_image_path=target_path,
+        visualization_path=visualization,
+        summary_text="history summary",
+    )
+
+    try:
+        controller.load_history_result(record)
+        qapp.processEvents()
+
+        assert window.code_text() == "600004075219"
+        assert window.target_image_path() == str(target_path)
+        assert window.result_state_value.text() == "检测完成"
+        assert window.output_dir_value.text() == str(run_dir)
+        assert window.summary_value.text() == "history summary"
+        assert window.detection_duration_value.text() == "3.21 秒"
+        assert window.annotation_box_list.topLevelItemCount() == 1
+        assert window.annotation_box_list.topLevelItem(0).text(1) == "正确"
+        assert window.status_value.text() == "已加载历史结果"
     finally:
         window.close()
