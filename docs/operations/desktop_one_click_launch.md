@@ -18,7 +18,7 @@ scripts/start_vllm.sh
 
 这样会自动检查并启动当前项目约定的本机 vLLM 服务，然后把 `LLM_PROVIDER`、`VLLM_API_BASE`、
 `OPENAI_COMPATIBLE_MODEL` 等变量导入桌面端进程。vLLM 的默认参数和常用命令见
-`docs/vllm_startup.md`。
+`docs/operations/vllm_startup.md`。
 
 关闭桌面端后，脚本会先等待桌面主进程退出，再延迟 30 分钟停止本机 vLLM。
 如果这段时间内重新打开桌面端，旧的延迟停止计划会被取消并重新计时。

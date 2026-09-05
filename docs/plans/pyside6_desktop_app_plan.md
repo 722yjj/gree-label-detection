@@ -111,7 +111,7 @@ desktop_app/
 
 新增文档与依赖文件：
 
-- `docs/pyside6_desktop_app_plan.md`
+- `docs/plans/pyside6_desktop_app_plan.md`
 - `.python-version`
 - `pyproject.toml`
 - `uv.lock`

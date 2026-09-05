@@ -17,12 +17,28 @@ models/
 *.pdiparams
 
 # 结果与中间文件
+# results/ 是批处理输出与可视化，几十 GB 且都能由脚本重生，不进版本库。
 results/
 output/
 *.jpg
 *.png
+
+# 图片例外：样例输入和文档插图要跟代码一起版本化
 !samples/
 !samples/**
+!docs/report_assets/
+!docs/report_assets/**
+
+# samples/ 例外之后仍要排除的：缓存，以及脚本可重生的大中间数据集
+samples/**/__pycache__/
+samples/real50_normal_crops_v1/
+samples/real50_photo_reference_pairs_v1/
+
+# 论文 PDF 体积大且有版权，本地留存不入库
+docs/literature/papers/
+
+# docx 由 scripts/export_docs_to_docx.py 从 md 重新生成，不入库
+docs/exports/
 
 # Excel 结果
 llm-results*.xlsx
@@ -31,6 +47,8 @@ llm-results*.xlsx
 .env
 .venv/
 licenses/license.json
+# 离线授权签名密钥对。私钥绝不能入库；公钥已内嵌在 label_detection/license.py
+licenses/*.pem
 
 # IDE
 .vscode/

@@ -239,7 +239,7 @@ datetime.now().strftime("%Y%m%d-%H%M%S-%f")
 
 建议新增或更新：
 
-- `docs/hikrobot_mvs_camera_runbook.md`
+- `docs/operations/hikrobot_mvs_camera_runbook.md`
 - 或在 `README.md` 增加“海康相机接入”章节。
 
 内容至少包含：
@@ -295,7 +295,7 @@ sudo nmcli dev connect enp4s0
 - `desktop_app/devices/camera/base.py`
 - `desktop_app/devices/camera/factory.py`
 - `desktop_app/devices/camera/hikrobot_mvs.py`
-- `README.md` 或 `docs/hikrobot_mvs_camera_runbook.md`
+- `README.md` 或 `docs/operations/hikrobot_mvs_camera_runbook.md`
 
 ## 验证命令
 

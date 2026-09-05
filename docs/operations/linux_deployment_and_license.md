@@ -218,4 +218,4 @@ gree-label-detection-deploy/
 
 闭源商业交付前需要确认第三方许可证路径，尤其是 PySide6/Qt 的 LGPLv3 动态链接合规或商业授权。还需随包保留 Qwen、vLLM、PaddlePaddle 等依赖的许可证清单。
 
-详细清单见 `docs/third_party_license_checklist.md`。
+详细清单见 `docs/operations/third_party_license_checklist.md`。
